@@ -28,10 +28,10 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.0",
-    "@xmldom/xmldom": "^0.8.13",
+    "@xmldom/xmldom": "^0.8.15",
     "aws4fetch": "^1.0.20",
     "drizzle-orm": "^0.45.2",
-    "hono": "^4.13.1",
+    "hono": "^4.13.5",
     "jose": "^5.9.0",
     "xml-crypto": "^6.1.2"
   },
