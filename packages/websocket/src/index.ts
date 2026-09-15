@@ -22,6 +22,7 @@ const INTERNAL_IDENTITY_HEADERS = [
 	'x-sa-session-user',
 	'x-sa-session-org',
 	'x-sa-session-role',
+	'x-sa-session-config',
 ];
 
 /** Browser clients that authenticate with a user JWT rather than an API key. */
@@ -187,6 +188,14 @@ export default {
 				forwardedHeaders.set('x-sa-session-user', session.userId);
 				forwardedHeaders.set('x-sa-session-role', session.role);
 				if (session.orgId) forwardedHeaders.set('x-sa-session-org', session.orgId);
+				// base64 so a label with a non-ASCII character cannot break the header.
+				// Headers are byte strings; JSON straight in would corrupt or throw.
+				if (session.config != null) {
+					forwardedHeaders.set(
+						'x-sa-session-config',
+						btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(session.config)))),
+					);
+				}
 			}
 
 			const forwardedRequest = new Request(request, { headers: forwardedHeaders });

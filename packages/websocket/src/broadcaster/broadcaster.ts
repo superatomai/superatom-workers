@@ -12,6 +12,24 @@ type DailyRequestsMap = Record<string, number>;
 // Per-project data-source registry, KEYED BY Data Source ID.
 type DataSourcesMap = Record<string, DataSourceRecord>;
 
+/**
+ * Decode the base64 config header the worker set from the verified session.
+ *
+ * Returns null on anything unexpected rather than throwing: a malformed header
+ * must not take the socket down, and null reads downstream as "no policy
+ * resolved", which the data seam already handles.
+ */
+function decodeSessionConfig(header: string | null): unknown {
+	if (!header) return null;
+	try {
+		const bytes = Uint8Array.from(atob(header), (c) => c.charCodeAt(0));
+		return JSON.parse(new TextDecoder().decode(bytes));
+	} catch {
+		console.warn('[broadcaster] could not decode x-sa-session-config; treating as no config');
+		return null;
+	}
+}
+
 export class Broadcaster implements DurableObject {
 	private state: DurableObjectState;
 	private env: Env;
@@ -331,6 +349,10 @@ export class Broadcaster implements DurableObject {
 				userId: request.headers.get('x-sa-session-user') || null,
 				orgId: request.headers.get('x-sa-session-org') || null,
 				role: request.headers.get('x-sa-session-role') || null,
+				// The verified data-access config, decoded from the base64 header the
+				// worker set. Stored on the attachment (not this.clients) so it
+				// survives hibernation, exactly like userId/role.
+				config: decodeSessionConfig(request.headers.get('x-sa-session-config')),
 				userAgent: request.headers.get('User-Agent') || 'unknown',
 				origin: request.headers.get('Origin') || 'unknown'
 			};
@@ -522,7 +544,19 @@ export class Broadcaster implements DurableObject {
 	/**
 	 * Extract client metadata from WebSocket attachment
 	 */
-	private getClientInfoFromWebSocket(ws: WebSocket): { clientId: string; type: string } | null {
+	/**
+	 * Sender identity, read from the socket ATTACHMENT rather than from
+	 * `this.clients`.
+	 *
+	 * This distinction is load-bearing: `syncClientsFromWebSockets()` rebuilds
+	 * that map after hibernation and deliberately keeps only display metadata
+	 * (userAgent/origin), so identity read from it would be present on a fresh
+	 * connection and missing after a hibernation cycle — intermittent, and
+	 * failing open. The attachment is what survives hibernation.
+	 */
+	private getClientInfoFromWebSocket(
+		ws: WebSocket,
+	): { clientId: string; type: string; userId?: string; orgId?: string; role?: string; config?: unknown; authenticated?: boolean } | null {
 		const metadata = (ws as any).deserializeAttachment();
 		if (!metadata || typeof metadata !== 'object') {
 			return null;
@@ -531,7 +565,17 @@ export class Broadcaster implements DurableObject {
 		const clientId = metadata.clientId;
 		const type = metadata.type;
 
-		return clientId && type ? { clientId, type } : null;
+		return clientId && type
+			? {
+					clientId,
+					type,
+					userId: metadata.userId ?? undefined,
+					orgId: metadata.orgId ?? undefined,
+					role: metadata.role ?? undefined,
+					config: metadata.config ?? undefined,
+					authenticated: metadata.authenticated === true,
+				}
+			: null;
 	}
 
 	/**
@@ -617,6 +661,37 @@ export class Broadcaster implements DurableObject {
 		// Adding the clientid as from.id
 		if (ws_json_message.from && typeof ws_json_message.from === 'object') {
 			ws_json_message.from.id = senderId;
+		}
+
+		// Stamp the sender's verified identity onto the relayed message.
+		//
+		// The worker (src/index.ts) verifies the sa-api session JWT at handshake
+		// and the attachment records the result; this is the one hop that was
+		// missing, and it is what lets the data plane tell WHOSE data a query is
+		// for. Read from the attachment, not `this.clients` — see
+		// getClientInfoFromWebSocket().
+		//
+		// Only set when the session was actually verified. A socket with no
+		// session (a server component, or a browser on a deployment with
+		// WS_AUTH_ENFORCE off) leaves the field absent, and consumers must read
+		// absence as "unknown" rather than "trusted".
+		//
+		// Deleted UNCONDITIONALLY before we set our own, the same discipline
+		// index.ts applies to INTERNAL_IDENTITY_HEADERS. A verified sender's
+		// forgery was already overwritten below, but an UNVERIFIED sender's own
+		// authContext used to pass straight through. That was tolerable while the
+		// field carried identity alone and payload.userId was equally trusted. It
+		// is not tolerable now that it carries `config`: a forged authContext
+		// would be a forged authorization policy.
+		delete ws_json_message.authContext;
+
+		if (clientInfo.authenticated && clientInfo.userId) {
+			ws_json_message.authContext = {
+				userId: clientInfo.userId,
+				...(clientInfo.orgId ? { orgId: clientInfo.orgId } : {}),
+				...(clientInfo.role ? { role: clientInfo.role } : {}),
+				...(clientInfo.config != null ? { config: clientInfo.config } : {}),
+			};
 		}
 
 		const targetType = ws_json_message.to?.type;

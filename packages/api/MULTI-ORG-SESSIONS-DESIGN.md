@@ -1,9 +1,10 @@
 # Multi-Org Concurrent Sessions — Design
 
-Status: **implemented, not yet deployed** (2026-08-04). Author: platform. Reviewers: TBD.
-Changes are on `dev`-side working trees for `sa-api`, `runtime-react`, `sa-platform-ui`,
-`sa-analytics`; all typecheck and build clean. Deploy only after the WS enforcement incident is
-stabilized (see §7).
+Status: **deployed to dev + prod** (2026-08-04). Author: platform. Reviewers: TBD.
+Rollout done UIs-first per §6: dev UIs → `sa-api-dev` (`42c9bced`), then prod UIs (all three
+confirmed serving the new bundle) → prod `sa-api` (`c202a8cb`). Endpoint smoke tests green on both.
+Still to do: run the §6 manual matrix on prod; the WS `WS_AUTH_ENFORCE` stale-tab incident (§7) is
+independent and still open.
 
 Lets one browser hold **several org sessions at once** — a Superatom staffer who is
 `org_admin` in multiple orgs can have `bluelinx.superatom.ai` and another org open in

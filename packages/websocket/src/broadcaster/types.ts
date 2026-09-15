@@ -1,3 +1,19 @@
+/**
+ * Identity of the sender, stamped by the DO from the session token the worker
+ * verified at handshake — never from anything the client put in the message.
+ *
+ * Present only when the sender's socket carries a verified session, so a
+ * deployment with WS_AUTH_ENFORCE off simply never sees it. Consumers must
+ * treat its ABSENCE as "unknown", never as "trusted".
+ */
+export interface MessageAuthContext {
+	userId: string;
+	orgId?: string;
+	role?: string;
+	/** Verified data-access config from the users table — see VerifiedSession.config. */
+	config?: unknown;
+}
+
 export interface BroadcastMessage {
     id:string
 	type: string;
@@ -10,6 +26,7 @@ export interface BroadcastMessage {
 		type?:'runtime' | 'data-agent' | 'db-bridge' | 'admin' | 'system';
 		id?: string;
 	};
+	authContext?: MessageAuthContext;
 }
 
 export interface Env {

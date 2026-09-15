@@ -9,7 +9,7 @@ ignoredBuiltDependencies:
   - sharp
   - workerd
 minimumReleaseAgeExclude:
-  - hono@4.13.1
+  - hono@4.13.5
 # pnpm 10+ reads dependency overrides from here (the "pnpm.overrides" field in
 # package.json is ignored). These pin transitive deps pulled in by wrangler's
 # local dev toolchain (miniflare/unenv/drizzle-kit/tsx) past known CVEs.
@@ -18,5 +18,5 @@ overrides:
   undici: ^6.28.0
   ws: ^8.21.0
   defu: ^6.1.5
-  sharp: ^0.35.0
+  sharp: ^0.35.4
   shell-quote: ^1.8.5

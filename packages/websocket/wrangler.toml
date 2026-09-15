@@ -33,7 +33,7 @@ enabled = true
 # "false" = verify and log the outcome, but still allow the connection through.
 # "true"  = reject unauthenticated / cross-org browser connections.
 # Deploy with "false", confirm the logs are clean, then flip to "true".
-WS_AUTH_ENFORCE = "false"
+WS_AUTH_ENFORCE = "true"
 
 # Optional: KV namespaces (if you need them later)
 # [[kv_namespaces]]

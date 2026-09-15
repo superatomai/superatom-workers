@@ -29,6 +29,17 @@ export interface VerifiedSession {
 	userId: string;
 	orgId: string | null;
 	role: UserRole;
+	/**
+	 * The user's data-access config, verbatim from the users table.
+	 *
+	 * Resolved HERE for the same reason role is: the data plane needs to know
+	 * what a caller may see, and the only trustworthy answer comes from the
+	 * database, not from anything the browser sends. Stamped onto every relayed
+	 * message so a DATA_REQ (dashboard hydration) carries the same policy a
+	 * USER_PROMPT does — they arrive in either order, and one of them used to
+	 * arrive with no policy at all.
+	 */
+	config: unknown;
 }
 
 export type SessionResult =
@@ -107,9 +118,10 @@ export async function verifyBrowserSession(
 			role: UserRole;
 			is_active: boolean;
 			tokens_valid_after: string | null;
+			config: unknown;
 		}>(
 			databaseUrl,
-			'SELECT org_id, role, is_active, tokens_valid_after FROM users WHERE id = $1',
+			'SELECT org_id, role, is_active, tokens_valid_after, config FROM users WHERE id = $1',
 			[userId]
 		);
 
@@ -139,7 +151,7 @@ export async function verifyBrowserSession(
 			return { ok: false, status: 401, reason: 'invalid_account_state' };
 		}
 
-		session = { userId, orgId: account.org_id, role: account.role };
+		session = { userId, orgId: account.org_id, role: account.role, config: account.config ?? null };
 	} catch (error: any) {
 		console.error('[auth] account lookup failed:', error?.message);
 		return { ok: false, status: 500, reason: 'account_lookup_failed' };
