@@ -15,6 +15,16 @@ new_sqlite_classes = ["Broadcaster"]
 [observability.logs]
 enabled = true
 
+# Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
+# MUST be the same namespace in sa-api-dev and sa-websocket-dev: sa-api-dev signs
+# with it, sa-websocket-dev verifies with it. Keys: org:<orgId>, org:__global.
+# Create ONCE, from packages/api (not here — that would make a second store):
+#   npx wrangler kv namespace create JWT_SECRETS --config wrangler.dev.toml
+# then paste the same id into this file and the other worker's wrangler.dev.toml.
+[[kv_namespaces]]
+binding = "JWT_SECRETS"
+id = "9c9a0b9db2e346b98150dc0f2f9a27df"
+
 [vars]
 # Rollout gate for browser (runtime/admin) session auth.
 # "false" = verify and log the outcome, but still allow the connection through.
@@ -25,16 +35,14 @@ WS_AUTH_ENFORCE = "false"
 # Secrets (set via wrangler, not in this file):
 #   wrangler secret put DATABASE_URL --config wrangler.dev.toml
 #   wrangler secret put SUPERATOM_SERVICE_KEY --config wrangler.dev.toml
-#   wrangler secret put JWT_SECRET --config wrangler.dev.toml
 #
 # DATABASE_URL: same dev Neon Postgres connection string used by sa-api-dev
 #   (this worker reads/writes the api_keys table that packages/api owns —
 #   they must point at the same database or API key validation breaks)
 # SUPERATOM_SERVICE_KEY: a fresh dev-only value (different from prod's),
 #   guards the admin api-key management endpoints
-# JWT_SECRET: MUST be byte-identical to sa-api-dev's JWT_SECRET — sa-api-dev
-#   signs browser session tokens, this worker verifies them. A mismatch
-#   rejects every browser connection once WS_AUTH_ENFORCE is "true".
+# Browser session tokens are verified with the JWT_SECRETS KV namespace above
+#   (shared with sa-api-dev) — this worker no longer needs JWT_SECRET.
 #
 # Deploy:
 #   wrangler deploy --config wrangler.dev.toml

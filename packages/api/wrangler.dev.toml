@@ -15,6 +15,16 @@ bucket_name = "sa-assets-dev"
 binding = "R2_SOURCE_FILES"
 bucket_name = "sa-source-files-dev"
 
+# Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
+# MUST be the same namespace in sa-api-dev and sa-websocket-dev: sa-api-dev signs
+# with it, sa-websocket-dev verifies with it. Keys: org:<orgId>, org:__global.
+# Create ONCE, from packages/api (not here — that would make a second store):
+#   npx wrangler kv namespace create JWT_SECRETS --config wrangler.dev.toml
+# then paste the same id into this file and the other worker's wrangler.dev.toml.
+[[kv_namespaces]]
+binding = "JWT_SECRETS"
+id = "9c9a0b9db2e346b98150dc0f2f9a27df"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
@@ -36,7 +46,8 @@ simple = { limit = 20, period = 60 }
 #   pnpm wrangler secret put OPENROUTER_API_KEY --config wrangler.dev.toml
 #
 # DATABASE_URL: Dev Neon PostgreSQL connection string
-# JWT_SECRET: A fresh random secret (different from prod)
+# JWT_SECRET: A fresh random secret (different from prod). Signs only SSO/SAML
+#   state tokens; access tokens are signed with the per-org JWT_SECRETS (KV above).
 # R2_ACCOUNT_ID: Cloudflare account id, used to derive R2 S3 endpoint
 # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY: R2 API token scoped to sa-assets-dev
 #   and sa-source-files-dev only (not prod's buckets) — used to presign multipart URLs

@@ -8,6 +8,7 @@
  */
 
 import { SignJWT } from "jose";
+import { getOrgSecret, MissingOrgSecretError } from "./org-secrets";
 
 /**
  * 15 minutes. Short because the token is a bearer credential that travels in
@@ -17,11 +18,18 @@ import { SignJWT } from "jose";
  */
 export const ACCESS_TOKEN_TTL = "15m";
 
+/**
+ * Signed with the user's org secret from the JWT_SECRETS KV namespace
+ * (super_admin: the __global secret) — see lib/org-secrets.ts. Throws
+ * MissingOrgSecretError if the org has none; callers must report that as a
+ * server fault (503), not as bad credentials.
+ */
 export async function mintAccessToken(
   user: { id: string; orgId: string | null; role: string },
-  jwtSecret: string
+  jwtSecrets: KVNamespace
 ): Promise<string> {
-  const secret = new TextEncoder().encode(jwtSecret);
+  const secret = await getOrgSecret(jwtSecrets, user.orgId);
+  if (!secret) throw new MissingOrgSecretError(user.orgId);
 
   return new SignJWT({
     userId: user.id,

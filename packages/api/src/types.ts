@@ -2,7 +2,11 @@ import type { Database } from "./db";
 
 export type Env = {
   DATABASE_URL: string;
+  // Signs only the SSO/SAML state tokens now. Access tokens use JWT_SECRETS.
   JWT_SECRET: string;
+  // Per-org access-token signing secrets (org:<orgId>, org:__global), shared
+  // with sa-websocket. See lib/org-secrets.ts.
+  JWT_SECRETS: KVNamespace;
   PLATFORM_UI_URL: string;
   /**
    * Optional comma-separated extra CORS origins, for front-ends not served from

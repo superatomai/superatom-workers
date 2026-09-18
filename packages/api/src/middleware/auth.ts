@@ -1,12 +1,25 @@
 import { createMiddleware } from "hono/factory";
-import { jwtVerify } from "jose";
+import type { Context } from "hono";
+import { decodeJwt, jwtVerify } from "jose";
 import { eq } from "drizzle-orm";
 import { users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
+import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from "../lib/org-secrets";
+
+type AuthContext = Context<{ Bindings: Env; Variables: AppVariables }>;
+
+export type AuthResult =
+  | {
+      ok: true;
+      userId: string;
+      orgId: string | null;
+      role: AppVariables["userRole"];
+    }
+  | { ok: false; status: 401 | 503; error: string };
 
 /**
- * JWT auth middleware — verifies the token, then resolves the caller's role and
- * account status FROM THE DATABASE on every request.
+ * Authenticate the request's access token — verifies it, then resolves the
+ * caller's role and account status FROM THE DATABASE on every request.
  *
  * The token's `role` and `orgId` claims are deliberately ignored for
  * authorization. They are a snapshot from login, and with a long token lifetime
@@ -14,33 +27,59 @@ import type { Env, AppVariables } from "../types";
  * downgraded admin kept full access, could re-escalate themselves, and a
  * deactivated account could still act. The signature proves *who* is calling;
  * the database decides *what they may do*.
+ *
+ * The one use of the `orgId` claim is choosing which org's secret verifies the
+ * signature (see lib/org-secrets.ts) — and it is then checked against the
+ * user's real org before anything is trusted.
+ *
+ * Exported for routes that accept either a user token or a service token and
+ * so cannot mount authMiddleware directly (routes/source-upload.ts).
  */
-export const authMiddleware = createMiddleware<{
-  Bindings: Env;
-  Variables: AppVariables;
-}>(async (c, next) => {
+export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
   const authHeader = c.req.header("Authorization");
   const token = authHeader?.startsWith("Bearer ")
     ? authHeader.slice(7)
     : c.req.query("token");
 
   if (!token) {
-    return c.json({ error: "Missing authorization token" }, 401);
+    return { ok: false, status: 401, error: "Missing authorization token" };
+  }
+
+  // The unverified orgId claim picks the secret. It is not trusted beyond that:
+  // the binding check below compares it with the user's org in the database.
+  let claimedOrgId: string | null;
+  try {
+    claimedOrgId = (decodeJwt(token).orgId as string | null | undefined) ?? null;
+  } catch {
+    return { ok: false, status: 401, error: "Invalid or expired token" };
+  }
+
+  let secret: Uint8Array | null;
+  try {
+    secret = await getOrgSecret(c.env.JWT_SECRETS, claimedOrgId);
+  } catch (error) {
+    // A KV fault is ours, not the caller's — 503 so clients do not sign out.
+    console.error("[auth] signing secret lookup failed:", error);
+    return { ok: false, status: 503, error: "Authorization service unavailable" };
+  }
+  if (!secret) {
+    console.warn(`[auth] no signing secret for ${secretKeyFor(claimedOrgId)}`);
+    return { ok: false, status: 401, error: "Invalid or expired token" };
   }
 
   let userId: string;
   let issuedAt: number | undefined;
   try {
-    const secret = new TextEncoder().encode(c.env.JWT_SECRET);
-    const { payload } = await jwtVerify(token, secret);
+    // Pin the algorithm so the token header cannot choose how it is verified.
+    const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
 
     userId = payload.userId as string;
     issuedAt = payload.iat;
     if (!userId) {
-      return c.json({ error: "Invalid token payload" }, 401);
+      return { ok: false, status: 401, error: "Invalid token payload" };
     }
   } catch {
-    return c.json({ error: "Invalid or expired token" }, 401);
+    return { ok: false, status: 401, error: "Invalid or expired token" };
   }
 
   // Authoritative lookup. Kept outside the try above so a database fault cannot
@@ -69,16 +108,26 @@ export const authMiddleware = createMiddleware<{
     // Fail closed, but as 503 rather than 401: a transient DB fault must not
     // look like an expired session, or every client signs the user out.
     console.error("[auth] role lookup failed:", error);
-    return c.json({ error: "Authorization service unavailable" }, 503);
+    return { ok: false, status: 503, error: "Authorization service unavailable" };
   }
 
   if (!user) {
-    return c.json({ error: "Invalid or expired token" }, 401);
+    return { ok: false, status: 401, error: "Invalid or expired token" };
+  }
+
+  // The secret that verified the token must be the user's own org's. Otherwise a
+  // holder of one org's secret could sign a token naming another org's user.
+  if (!isSecretBoundToUser(claimedOrgId, user.orgId)) {
+    console.warn(
+      `[auth] token org does not match user org: user=${userId} ` +
+        `token=${secretKeyFor(claimedOrgId)} actual=${secretKeyFor(user.orgId)}`
+    );
+    return { ok: false, status: 401, error: "Invalid or expired token" };
   }
 
   // Deactivation takes effect immediately, without waiting for token expiry.
   if (!user.isActive) {
-    return c.json({ error: "Account is deactivated" }, 401);
+    return { ok: false, status: 401, error: "Account is deactivated" };
   }
 
   // Session revocation: logout stamps a cutoff, so tokens minted before it are
@@ -88,18 +137,31 @@ export const authMiddleware = createMiddleware<{
   if (user.tokensValidAfter) {
     const cutoffSeconds = Math.floor(user.tokensValidAfter.getTime() / 1000);
     if (issuedAt === undefined || issuedAt < cutoffSeconds) {
-      return c.json({ error: "Session has been revoked, please sign in again" }, 401);
+      return { ok: false, status: 401, error: "Session has been revoked, please sign in again" };
     }
   }
 
   // orgId is required for non-super_admin users
   if (user.role !== "super_admin" && !user.orgId) {
-    return c.json({ error: "Invalid account state" }, 401);
+    return { ok: false, status: 401, error: "Invalid account state" };
   }
 
-  c.set("userId", userId);
-  c.set("orgId", user.orgId);
-  c.set("userRole", user.role);
+  return { ok: true, userId, orgId: user.orgId, role: user.role };
+}
+
+/** JWT auth middleware — see authenticateRequest. */
+export const authMiddleware = createMiddleware<{
+  Bindings: Env;
+  Variables: AppVariables;
+}>(async (c, next) => {
+  const result = await authenticateRequest(c);
+  if (!result.ok) {
+    return c.json({ error: result.error }, result.status);
+  }
+
+  c.set("userId", result.userId);
+  c.set("orgId", result.orgId);
+  c.set("userRole", result.role);
 
   await next();
 });
