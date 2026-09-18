@@ -150,7 +150,9 @@ auth.post("/login", async (c) => {
 
     // Short-lived access token (15m) plus a rotating refresh token held in an
     // httpOnly cookie — see lib/access-token.ts and lib/refresh-cookie.ts.
-    const token = await mintAccessToken(user, c.env.JWT_SECRET);
+    // Minted before the refresh row so a missing org secret fails the login
+    // cleanly (503 below) instead of leaving an orphan refresh token.
+    const token = await mintAccessToken(user, c.env.JWT_SECRETS);
 
     const refresh = await issueRefreshToken(db, user.id, {
       userAgent: c.req.header("User-Agent"),
@@ -328,7 +330,17 @@ auth.post("/refresh", async (c) => {
     clearRefreshCookie(c);
   }
 
-  const token = await mintAccessToken(user, c.env.JWT_SECRET);
+  // The refresh token has already rotated and its cookie is set on this
+  // response, so a signing fault must still return THIS response (503, cookie
+  // included). Throwing instead would drop the new cookie, leave the browser on
+  // the consumed token, and trip reuse detection on its next refresh.
+  let token: string;
+  try {
+    token = await mintAccessToken(user, c.env.JWT_SECRETS);
+  } catch (error) {
+    console.error("[auth] refresh: access token signing failed:", error);
+    return c.json({ error: "Authorization service unavailable" }, 503);
+  }
 
   return c.json({ token });
 });

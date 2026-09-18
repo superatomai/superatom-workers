@@ -6,8 +6,11 @@ export interface Env {
 	BROADCASTER: DurableObjectNamespace;
 	DATABASE_URL: string;
 	SUPERATOM_SERVICE_KEY: string;
-	/** Shared with sa-api; verifies browser session tokens. */
-	JWT_SECRET: string;
+	/**
+	 * Per-org signing secrets (org:<orgId>, org:__global), the same KV namespace
+	 * sa-api signs with; verifies browser session tokens. See auth/org-secrets.ts.
+	 */
+	JWT_SECRETS: KVNamespace;
 	/** "true" enforces browser auth; anything else logs violations only. */
 	WS_AUTH_ENFORCE: string;
 }
@@ -139,7 +142,7 @@ export default {
 			const result = await verifyBrowserSession({
 				token: extractToken(request, url),
 				projectId,
-				jwtSecret: env.JWT_SECRET,
+				jwtSecrets: env.JWT_SECRETS,
 				databaseUrl: env.DATABASE_URL,
 			});
 

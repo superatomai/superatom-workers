@@ -10,7 +10,7 @@ import {
   deflateAndEncode,
 } from "../lib/saml";
 import { isAllowedRedirect } from "../lib/origins";
-import { ACCESS_TOKEN_TTL } from "../lib/access-token";
+import { mintAccessToken } from "../lib/access-token";
 import { issueRefreshToken } from "../lib/refresh-tokens";
 import { setRefreshCookie } from "../lib/refresh-cookie";
 
@@ -424,17 +424,8 @@ sso.get("/callback", async (c) => {
       return respondError("Account is deactivated");
     }
 
-    // Issue SA-API JWT
-    const secret = new TextEncoder().encode(c.env.JWT_SECRET);
-    const saToken = await new SignJWT({
-      userId: user.id,
-      orgId: user.orgId,
-      role: user.role,
-    })
-      .setProtectedHeader({ alg: "HS256" })
-      .setIssuedAt()
-      .setExpirationTime(ACCESS_TOKEN_TTL)
-      .sign(secret);
+    // Issue SA-API JWT, signed with the user's org secret (lib/org-secrets.ts)
+    const saToken = await mintAccessToken(user, c.env.JWT_SECRETS);
 
     // The refresh token goes in an httpOnly cookie; only the 15-minute access
     // token travels in the URL. That bounds the damage if this redirect leaks

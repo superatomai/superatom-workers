@@ -20,8 +20,9 @@
  * constitutes a valid session.
  */
 
-import { jwtVerify } from 'jose';
+import { decodeJwt, jwtVerify } from 'jose';
 import { executeQuery } from '../api-keys/service';
+import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from './org-secrets';
 
 export type UserRole = 'super_admin' | 'org_admin' | 'member';
 
@@ -50,7 +51,8 @@ export interface VerifyBrowserSessionOptions {
 	/** Raw JWT from ?token= or the Authorization header. */
 	token: string | null;
 	projectId: string;
-	jwtSecret: string | undefined;
+	/** JWT_SECRETS KV namespace — per-org signing secrets, see org-secrets.ts. */
+	jwtSecrets: KVNamespace | undefined;
 	databaseUrl: string | undefined;
 }
 
@@ -73,24 +75,46 @@ export function extractToken(request: Request, url: URL): string | null {
 export async function verifyBrowserSession(
 	options: VerifyBrowserSessionOptions
 ): Promise<SessionResult> {
-	const { token, projectId, jwtSecret, databaseUrl } = options;
+	const { token, projectId, jwtSecrets, databaseUrl } = options;
 
 	if (!token) {
 		return { ok: false, status: 401, reason: 'missing_token' };
 	}
 
-	// Fail closed on misconfiguration: without the secret we cannot verify
+	// Fail closed on misconfiguration: without the secrets we cannot verify
 	// anything, and treating that as "authenticated" would defeat the check.
-	if (!jwtSecret) {
-		console.error('[auth] JWT_SECRET is not configured on this worker');
-		return { ok: false, status: 500, reason: 'jwt_secret_not_configured' };
+	if (!jwtSecrets) {
+		console.error('[auth] JWT_SECRETS KV binding is not configured on this worker');
+		return { ok: false, status: 500, reason: 'jwt_secrets_not_configured' };
+	}
+
+	// The unverified orgId claim picks the org's secret. It is not trusted beyond
+	// that: the binding check after the users query compares it with the
+	// account's real org.
+	let claimedOrgId: string | null;
+	try {
+		claimedOrgId = (decodeJwt(token).orgId as string | null | undefined) ?? null;
+	} catch {
+		return { ok: false, status: 401, reason: 'invalid_or_expired_token' };
+	}
+
+	let secret: Uint8Array | null;
+	try {
+		secret = await getOrgSecret(jwtSecrets, claimedOrgId);
+	} catch (error: any) {
+		console.error('[auth] signing secret lookup failed:', error?.message);
+		return { ok: false, status: 500, reason: 'signing_secret_lookup_failed' };
+	}
+	if (!secret) {
+		console.warn(`[auth] no signing secret for ${secretKeyFor(claimedOrgId)}`);
+		return { ok: false, status: 401, reason: 'unknown_signing_org' };
 	}
 
 	let userId: string;
 	let issuedAt: number | undefined;
 	try {
-		const secret = new TextEncoder().encode(jwtSecret);
-		const { payload } = await jwtVerify(token, secret);
+		// Pin the algorithm so the token header cannot choose how it is verified.
+		const { payload } = await jwtVerify(token, secret, { algorithms: ['HS256'] });
 
 		userId = payload.userId as string;
 		issuedAt = payload.iat;
@@ -130,6 +154,13 @@ export async function verifyBrowserSession(
 		}
 
 		const account = rows[0];
+
+		// The secret that verified the token must be the account's own org's.
+		// Otherwise a holder of one org's secret could sign a token naming another
+		// org's user. Mirrors authenticateRequest in sa-api.
+		if (!isSecretBoundToUser(claimedOrgId, account.org_id)) {
+			return { ok: false, status: 401, reason: 'token_org_mismatch' };
+		}
 
 		if (!account.is_active) {
 			return { ok: false, status: 401, reason: 'account_deactivated' };
