@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createDb } from "./db";
 import { isAllowedOrigin } from "./lib/origins";
+import { serveUi } from "./lib/serve-ui";
+import superadminApp from "./superadmin/app";
 import type { Env, AppVariables } from "./types";
 
 import authRoutes from "./routes/auth";
@@ -111,4 +113,17 @@ app.onError((err, c) => {
   return c.json({ error: "Internal server error" }, 500);
 });
 
-export default app;
+// ─── Host dispatch ───────────────────────────────────────
+// The super-admin host gets its own app, so sa-api's credentialed *.superatom.ai
+// CORS and routes never apply there. Everything else is sa-api, unchanged.
+export default {
+  fetch(request, env, ctx) {
+    const { hostname, pathname } = new URL(request.url);
+    if (env.SUPERADMIN_HOST && hostname === env.SUPERADMIN_HOST) {
+      return pathname === "/api" || pathname.startsWith("/api/")
+        ? superadminApp.fetch(request, env, ctx)
+        : serveUi(env.FRONTEND_BUILDS, "superadmin", request);
+    }
+    return app.fetch(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;

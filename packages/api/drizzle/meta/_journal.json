@@ -71,6 +71,13 @@
       "when": 1787042060756,
       "tag": "0009_familiar_toad_men",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789741409383,
+      "tag": "0010_super_admins",
+      "breakpoints": true
     }
   ]
 }

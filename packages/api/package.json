@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:superadmin": "wrangler dev --var SUPERADMIN_HOST:superadmin.localhost --var SUPERADMIN_JWT_SECRET:$(openssl rand -hex 32)",
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --config wrangler.dev.toml",
     "deploy:prod": "wrangler deploy --config wrangler.toml",
@@ -16,7 +17,8 @@
     "db:migrate:dev": "DATABASE_URL=$(grep -E '^DATABASE_URL=' .dev.vars | cut -d= -f2-) drizzle-kit migrate",
     "db:migrate:prod": "DATABASE_URL=$(grep -E '^DATABASE_URL=' .env | cut -d= -f2-) drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "superadmin": "tsx scripts/super-admins.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",

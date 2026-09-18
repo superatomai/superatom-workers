@@ -4,7 +4,7 @@ import { projects, apps } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 
-const DEFAULT_DESIGN_SYSTEM = {
+export const DEFAULT_DESIGN_SYSTEM = {
   colors: {
     primary: "#009193",
     secondary: "#FFFFFF",

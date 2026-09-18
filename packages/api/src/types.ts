@@ -42,6 +42,13 @@ export type Env = {
   // doc). Leave unset until live testing shows the recognizer-side biasing
   // (provider.options.google.prompt) is not honored.
   SPEECH_CORRECT_TERMS?: string;
+  // Built front-end apps, served by hostname: <app>/releases/<buildId>/… + <app>/current.json.
+  FRONTEND_BUILDS: R2Bucket;
+  // Hostname that serves the super-admin console (UI + /api/*) instead of sa-api.
+  SUPERADMIN_HOST: string;
+  // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).
+  SUPERADMIN_JWT_SECRET: string;
+  SUPERADMIN_LOGIN_LIMITER: RateLimit;
 };
 
 export type AppVariables = {

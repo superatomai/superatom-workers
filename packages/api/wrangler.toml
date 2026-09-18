@@ -23,9 +23,16 @@ bucket_name = "sa-source-files"
 # bucket. Remove before pushing.
 # preview_bucket_name = "sa-source-files"
 
+# Private bucket for built front-end apps (super-admin console now; platform/runtime later).
+# Create with: wrangler r2 bucket create sa-frontend-builds
+[[r2_buckets]]
+binding = "FRONTEND_BUILDS"
+bucket_name = "sa-frontend-builds"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files"
+SUPERADMIN_HOST = "superadmin.superatom.ai"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
@@ -33,6 +40,13 @@ name = "SPEECH_RATE_LIMITER"
 type = "ratelimit"
 namespace_id = "2001"
 simple = { limit = 20, period = 60 }
+
+# Super-admin console login throttle, per IP and per IP+email.
+[[unsafe.bindings]]
+name = "SUPERADMIN_LOGIN_LIMITER"
+type = "ratelimit"
+namespace_id = "2002"
+simple = { limit = 10, period = 60 }
 
 # Environment variables (set via wrangler secret or dashboard)
 # These should be set as secrets, not in this file:
@@ -43,6 +57,7 @@ simple = { limit = 20, period = 60 }
 #   wrangler secret put R2_SECRET_ACCESS_KEY     # R2 API token secret
 #   wrangler secret put SA_INTERNAL_SERVICE_TOKEN # shared secret for backend → worker calls (e.g. /signed-get)
 #   wrangler secret put OPENROUTER_API_KEY       # voice transcription
+#   wrangler secret put SUPERADMIN_JWT_SECRET    # super-admin console sessions; ≥32 chars, NOT the same as JWT_SECRET
 #
 # DATABASE_URL: Prod Neon PostgreSQL connection string
 # JWT_SECRET: Secret key for signing/verifying JWTs

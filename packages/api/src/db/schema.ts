@@ -487,3 +487,24 @@ export const productFeedback = pgTable("product_feedback", {
   index("product_feedback_category_idx").on(table.category),
   index("product_feedback_created_at_idx").on(table.createdAt),
 ]);
+
+// ─── Super Admins ────────────────────────────────────────
+// Superatom staff who use the super-admin console. Kept out of `users` so they
+// never collide with a client-org account and sa-api's login can't load them.
+
+export const superAdmins = pgTable(
+  "super_admins",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    email: varchar("email", { length: 255 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    /** PBKDF2-SHA256, formatted `pbkdf2_sha256$<iterations>$<salt>$<hash>`. */
+    passwordHash: varchar("password_hash", { length: 255 }).notNull(),
+    isActive: boolean("is_active").default(true).notNull(),
+    /** Sessions issued before this instant are rejected (logout, reset, deactivate). */
+    tokensValidAfter: timestamp("tokens_valid_after", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("super_admins_email_idx").on(sql`lower(${table.email})`)]
+);

@@ -25,9 +25,15 @@ bucket_name = "sa-source-files-dev"
 binding = "JWT_SECRETS"
 id = "9c9a0b9db2e346b98150dc0f2f9a27df"
 
+# Built front-end apps — isolated from prod.
+[[r2_buckets]]
+binding = "FRONTEND_BUILDS"
+bucket_name = "sa-frontend-builds-dev"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
+SUPERADMIN_HOST = "dev.superadmin.superatom.ai"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
@@ -35,6 +41,13 @@ name = "SPEECH_RATE_LIMITER"
 type = "ratelimit"
 namespace_id = "2001"
 simple = { limit = 20, period = 60 }
+
+# Super-admin console login throttle, per IP and per IP+email.
+[[unsafe.bindings]]
+name = "SUPERADMIN_LOGIN_LIMITER"
+type = "ratelimit"
+namespace_id = "2003"
+simple = { limit = 10, period = 60 }
 
 # Secrets (set once, then managed via Cloudflare dashboard or wrangler):
 #   pnpm wrangler secret put DATABASE_URL --config wrangler.dev.toml
@@ -44,6 +57,7 @@ simple = { limit = 20, period = 60 }
 #   pnpm wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.dev.toml
 #   pnpm wrangler secret put SA_INTERNAL_SERVICE_TOKEN --config wrangler.dev.toml
 #   pnpm wrangler secret put OPENROUTER_API_KEY --config wrangler.dev.toml
+#   pnpm wrangler secret put SUPERADMIN_JWT_SECRET --config wrangler.dev.toml
 #
 # DATABASE_URL: Dev Neon PostgreSQL connection string
 # JWT_SECRET: A fresh random secret (different from prod). Signs only SSO/SAML
