@@ -4,6 +4,7 @@ import { organizations, projects, users } from "../../db/schema";
 import type { Env } from "../../types";
 import type { SuperAdminVariables } from "../types";
 import { validatePassword } from "../../lib/password-policy";
+import { createOrgSecret } from "../../lib/org-secrets";
 import {
   cleanEmail,
   cleanName,
@@ -62,7 +63,15 @@ orgs.post("/", async (c) => {
     .limit(1);
   if (taken) return c.json({ error: `The slug "${slug}" is already used by another organization.` }, 409);
 
+  // An org can't log in without its signing secret, so store it before the row exists
+  // (same order as sa-api's POST /orgs): a failed insert leaves only an unused KV entry.
   const orgId = crypto.randomUUID();
+  try {
+    await createOrgSecret(c.env.JWT_SECRETS, orgId);
+  } catch (err) {
+    console.error("[superadmin] could not store the new org's signing secret:", err);
+    return c.json({ error: "Could not create organization, please try again." }, 503);
+  }
   const insertOrg = db.insert(organizations).values({ id: orgId, name, slug }).returning();
   try {
     if (!admin) {

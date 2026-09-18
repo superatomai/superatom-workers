@@ -5,7 +5,7 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "dev:superadmin": "wrangler dev --var SUPERADMIN_HOST:superadmin.localhost --var SUPERADMIN_JWT_SECRET:$(openssl rand -hex 32)",
+    "dev:superadmin": "wrangler dev --config wrangler.dev.toml --var SUPERADMIN_HOST:superadmin.localhost --var SUPERADMIN_JWT_SECRET:$(openssl rand -hex 32)",
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --config wrangler.dev.toml",
     "deploy:prod": "wrangler deploy --config wrangler.toml",
