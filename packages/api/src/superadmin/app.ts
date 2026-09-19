@@ -7,6 +7,7 @@ import authRoutes from "./routes/auth";
 import orgRoutes from "./routes/orgs";
 import orgAdminRoutes from "./routes/org-admins";
 import orgProjectRoutes from "./routes/projects";
+import overviewRoutes from "./routes/overview";
 
 /**
  * Super-admin console API, served only on SUPERADMIN_HOST under /api.
@@ -26,6 +27,8 @@ superadmin.route("/auth", authRoutes);
 // Everything except /auth needs a signed-in super admin.
 superadmin.use("/orgs", requireSuperAdmin);
 superadmin.use("/orgs/*", requireSuperAdmin);
+superadmin.use("/overview", requireSuperAdmin);
+superadmin.route("/overview", overviewRoutes);
 superadmin.route("/orgs", orgRoutes);
 superadmin.route("/orgs/:orgId/admins", orgAdminRoutes);
 superadmin.route("/orgs/:orgId/projects", orgProjectRoutes);
