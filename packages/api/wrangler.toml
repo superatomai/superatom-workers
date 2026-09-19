@@ -29,6 +29,13 @@ bucket_name = "sa-source-files"
 binding = "FRONTEND_BUILDS"
 bucket_name = "sa-frontend-builds"
 
+# Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
+# MUST be the same namespace in sa-api and sa-websocket: sa-api signs with it,
+# sa-websocket verifies with it. Keys: org:<orgId>, org:__global.
+[[kv_namespaces]]
+binding = "JWT_SECRETS"
+id = "1669d6442bf34757a223bd7d6548d14c"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files"
