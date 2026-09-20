@@ -114,12 +114,14 @@ auth.post("/login", async (c) => {
       );
       if (found) matchedUsers = [found];
     } else {
-      // No org context — find all active users with this email across orgs
+      // No org context — find all active users with this email across orgs.
+      // Ordered so a super_admin row wins ties on validUsers[0] below.
       matchedUsers = await withDbRetry("login:users-by-email", () =>
         db
           .select()
           .from(users)
           .where(and(sql`lower(${users.email}) = ${normalizedEmail}`, eq(users.isActive, true)))
+          .orderBy(sql`case when ${users.role} = 'super_admin' then 0 else 1 end`)
       );
     }
 
