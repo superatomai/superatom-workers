@@ -24,6 +24,8 @@ import { decodeJwt, jwtVerify } from 'jose';
 import { executeQuery } from '../api-keys/service';
 import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from './org-secrets';
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export type UserRole = 'super_admin' | 'org_admin' | 'member';
 
 export interface VerifiedSession {
@@ -112,6 +114,7 @@ export async function verifyBrowserSession(
 
 	let userId: string;
 	let issuedAt: number | undefined;
+	let sessionId: string | null;
 	try {
 		// Pin the algorithm so the token header cannot choose how it is verified.
 		const { payload } = await jwtVerify(token, secret, { algorithms: ['HS256'] });
@@ -119,6 +122,12 @@ export async function verifyBrowserSession(
 		userId = payload.userId as string;
 		issuedAt = payload.iat;
 		if (!userId) {
+			return { ok: false, status: 401, reason: 'invalid_token_payload' };
+		}
+		// `sid` is the login session (refresh-token family). Absent on tokens from
+		// before it existed; malformed means a bad token. Mirrors sa-api.
+		sessionId = typeof payload.sid === 'string' ? payload.sid : null;
+		if (payload.sid !== undefined && (!sessionId || !UUID.test(sessionId))) {
 			return { ok: false, status: 401, reason: 'invalid_token_payload' };
 		}
 	} catch {
@@ -143,10 +152,17 @@ export async function verifyBrowserSession(
 			is_active: boolean;
 			tokens_valid_after: string | null;
 			config: unknown;
+			session_active: boolean;
 		}>(
 			databaseUrl,
-			'SELECT org_id, role, is_active, tokens_valid_after, config FROM users WHERE id = $1',
-			[userId]
+			// session_active: a logged-out session (its refresh family revoked) must not
+			// open a socket, while the user's other sessions still can.
+			`SELECT org_id, role, is_active, tokens_valid_after, config,
+			        ($2::uuid IS NULL OR EXISTS (
+			          SELECT 1 FROM refresh_tokens WHERE family_id = $2::uuid AND revoked_at IS NULL
+			        )) AS session_active
+			   FROM users WHERE id = $1`,
+			[userId, sessionId]
 		);
 
 		if (rows.length === 0) {
@@ -164,6 +180,10 @@ export async function verifyBrowserSession(
 
 		if (!account.is_active) {
 			return { ok: false, status: 401, reason: 'account_deactivated' };
+		}
+
+		if (!account.session_active) {
+			return { ok: false, status: 401, reason: 'session_ended' };
 		}
 
 		// Logout stamps a revocation cutoff; a token minted before it is dead even

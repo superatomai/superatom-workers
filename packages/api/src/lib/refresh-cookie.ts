@@ -12,17 +12,20 @@
  * and SameSite=Lax applies. Lax also blocks cross-site POSTs, which is the CSRF
  * control for /auth/refresh.
  *
- * Per-org cookies (multi-org sessions). One `.superatom.ai`-scoped cookie is
- * shared by every subdomain, so a single fixed name means one session per
- * browser: logging into org B overwrites org A. We suffix the name with the
- * org id (`sa_refresh_<orgId>`) so several org sessions coexist in one browser.
- * super_admin has no org and gets the unsuffixed base name, which also doubles
- * as the read fallback for sessions issued before this change. See
- * MULTI-ORG-SESSIONS-DESIGN.md.
+ * One cookie per APP and org: `<base>_<app>_<orgId>`. A `.superatom.ai` cookie
+ * is shared by every subdomain, so a name without the app made runtime and the
+ * platform UI share one session: logging into one as another user switched the
+ * other to that user, and logging in or out in one changed the other. With the
+ * app in the name each app keeps its own session; the org suffix lets several
+ * orgs coexist within one app. super_admin has no org and uses the unsuffixed
+ * base name. See AUTH-AND-SDK-DESIGN.md §3.6.
  */
 
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { REFRESH_TOKEN_TTL_MS } from "./refresh-tokens";
+
+/** The front-end a session belongs to. */
+export type AppKey = "runtime" | "platform" | "analytics" | "local";
 
 /**
  * Base cookie name, scoped per environment.
@@ -47,16 +50,55 @@ function refreshCookieBase(requestUrl: string): string {
 }
 
 /**
- * Full cookie name for an org. `orgId` omitted → the unsuffixed base, used by
- * super_admin (no org) and as the legacy read fallback.
+ * The super-admin apps. Their refresh uses the base (super_admin) cookie only —
+ * never an org cookie, even for someone who is also an org member.
+ * (superadmin.superatom.ai has its own session and never calls /auth/refresh.)
  */
-export function refreshCookieName(requestUrl: string, orgId?: string | null): string {
-  const base = refreshCookieBase(requestUrl);
-  return orgId ? `${base}_${orgId}` : base;
+const SUPER_ADMIN_APP_HOSTS = new Set(["analytics.superatom.ai", "dev.analytics.superatom.ai"]);
+
+function appFromHost(host: string): AppKey {
+  if (SUPER_ADMIN_APP_HOSTS.has(host)) return "analytics";
+  if (host === "platform.superatom.ai" || host.endsWith(".platform.superatom.ai")) return "platform";
+  if (host === "localhost" || host === "127.0.0.1") return "local";
+  // live., dev.live., and client subdomains (bluelinx.superatom.ai …).
+  return "runtime";
 }
 
-/** Legacy fixed name, kept so existing prod cookies keep working. */
-export const REFRESH_COOKIE_NAME = "sa_refresh";
+/**
+ * Which app a request comes from, by its Origin header — set by the browser, not
+ * by page script. Requests without one (server-to-server) count as runtime.
+ */
+export function appFromOrigin(origin: string | null | undefined): AppKey {
+  if (!origin) return "runtime";
+  try {
+    return appFromHost(new URL(origin).hostname);
+  } catch {
+    return "runtime";
+  }
+}
+
+/**
+ * Which app a front-end URL belongs to. Used by the SSO/SAML callbacks: there the
+ * browser arrives from the identity provider, so Origin names the IdP (or is
+ * absent), and the app is the verified front-end the user is being sent back to.
+ */
+export function appFromUrl(url: string | null | undefined): AppKey {
+  if (!url) return "runtime";
+  try {
+    return appFromHost(new URL(url).hostname);
+  } catch {
+    return "runtime";
+  }
+}
+
+/**
+ * Cookie name for a session: `<base>_<app>_<orgId>`, or the bare base for
+ * super_admin (no org).
+ */
+export function refreshCookieName(requestUrl: string, app: AppKey, orgId?: string | null): string {
+  const base = refreshCookieBase(requestUrl);
+  return orgId ? `${base}_${app}_${orgId}` : base;
+}
 
 /**
  * Restricting the path means the cookie is only attached to auth endpoints —
@@ -90,57 +132,59 @@ function isSecureContext(requestUrl: string): boolean {
 }
 
 /**
- * Set the refresh cookie for a specific org (omit `orgId` for super_admin /
- * the global session).
+ * Attributes shared by set and delete. They must match, or the browser keeps the
+ * original cookie and a logout silently fails to clear it.
  */
-export function setRefreshCookie(c: any, token: string, orgId?: string | null): void {
-  const name = refreshCookieName(c.req.url, orgId);
-
-  setCookie(c, name, token, {
-    httpOnly: true,
-    secure: isSecureContext(c.req.url),
-    sameSite: "Lax",
+function cookieOptions(requestUrl: string) {
+  return {
     path: COOKIE_PATH,
-    domain: cookieDomain(c.req.url),
+    domain: cookieDomain(requestUrl),
+    secure: isSecureContext(requestUrl),
+    sameSite: "Lax" as const,
+  };
+}
+
+/** Set the refresh cookie for an app's session in an org (no org → super_admin). */
+export function setRefreshCookie(c: any, token: string, app: AppKey, orgId?: string | null): void {
+  setCookie(c, refreshCookieName(c.req.url, app, orgId), token, {
+    ...cookieOptions(c.req.url),
+    httpOnly: true,
     maxAge: Math.floor(REFRESH_TOKEN_TTL_MS / 1000),
   });
 
   // A browser that previously talked to the OTHER environment still holds its
-  // cookie on the shared .superatom.ai domain. Drop the same-org cookie from the
+  // cookie on the shared .superatom.ai domain. Drop the matching cookie from the
   // other environment on the way in, so a stale cross-environment token cannot be
   // presented on a later request.
   const otherBase = refreshCookieBase(c.req.url) === "sa_refresh" ? "sa_refresh_dev" : "sa_refresh";
-  const stale = orgId ? `${otherBase}_${orgId}` : otherBase;
-  deleteCookie(c, stale, {
-    path: COOKIE_PATH,
-    domain: cookieDomain(c.req.url),
-    secure: isSecureContext(c.req.url),
-    sameSite: "Lax",
-  });
+  deleteCookie(c, orgId ? `${otherBase}_${app}_${orgId}` : otherBase, cookieOptions(c.req.url));
+
+  // Tidy the pre-per-app, app-less org cookie (`<base>_<orgId>`). Nothing reads it
+  // any more; drop it so it does not sit in the browser for another 30 days.
+  if (orgId) deleteCookie(c, `${refreshCookieBase(c.req.url)}_${orgId}`, cookieOptions(c.req.url));
 }
 
-/** Read the refresh cookie for a specific org (omit `orgId` for the base cookie). */
-export function readRefreshCookie(c: any, orgId?: string | null): string | undefined {
-  return getCookie(c, refreshCookieName(c.req.url, orgId));
+/** Read a refresh cookie by its full name. */
+export function readCookie(c: any, name: string): string | undefined {
+  return getCookie(c, name);
 }
+
+/** Clear a refresh cookie by its full name. */
+export function clearCookie(c: any, name: string): void {
+  deleteCookie(c, name, cookieOptions(c.req.url));
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Read the unsuffixed base cookie — the super_admin/global session, and the
- * back-compat path for sessions issued before per-org cookies. Drop the fallback
- * one release after every session has rotated onto a suffixed cookie.
+ * Org ids of every refresh cookie of `app` this environment's browser sent.
+ * Exact `<base>_<app>_<uuid>` match, so on prod (`sa_refresh`) dev cookies
+ * (`sa_refresh_dev_…`) are not included.
  */
-export function readLegacyRefreshCookie(c: any): string | undefined {
-  return getCookie(c, refreshCookieBase(c.req.url));
-}
-
-/** Clear the refresh cookie for a specific org (omit `orgId` for the base cookie). */
-export function clearRefreshCookie(c: any, orgId?: string | null): void {
-  // Attributes must match the ones used to set it, or the browser keeps the
-  // original cookie and logout silently fails to clear it.
-  deleteCookie(c, refreshCookieName(c.req.url, orgId), {
-    path: COOKIE_PATH,
-    domain: cookieDomain(c.req.url),
-    secure: isSecureContext(c.req.url),
-    sameSite: "Lax",
-  });
+export function listAppOrgCookies(c: any, app: AppKey): string[] {
+  const prefix = `${refreshCookieBase(c.req.url)}_${app}_`;
+  return Object.keys(getCookie(c))
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => name.slice(prefix.length))
+    .filter((orgId) => UUID.test(orgId));
 }

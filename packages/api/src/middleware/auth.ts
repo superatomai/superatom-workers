@@ -1,8 +1,8 @@
 import { createMiddleware } from "hono/factory";
 import type { Context } from "hono";
 import { decodeJwt, jwtVerify } from "jose";
-import { eq } from "drizzle-orm";
-import { users } from "../db/schema";
+import { eq, sql } from "drizzle-orm";
+import { users, refreshTokens } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from "../lib/org-secrets";
 
@@ -14,8 +14,12 @@ export type AuthResult =
       userId: string;
       orgId: string | null;
       role: AppVariables["userRole"];
+      /** The login session (refresh-token family) the token belongs to; null for pre-`sid` tokens. */
+      sessionId: string | null;
     }
   | { ok: false; status: 401 | 503; error: string };
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Authenticate the request's access token — verifies it, then resolves the
@@ -69,6 +73,7 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
 
   let userId: string;
   let issuedAt: number | undefined;
+  let sessionId: string | null;
   try {
     // Pin the algorithm so the token header cannot choose how it is verified.
     const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
@@ -76,6 +81,12 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     userId = payload.userId as string;
     issuedAt = payload.iat;
     if (!userId) {
+      return { ok: false, status: 401, error: "Invalid token payload" };
+    }
+    // `sid` is the login session. Absent on tokens minted before it existed
+    // (those expire within 15 minutes); malformed means a bad token.
+    sessionId = typeof payload.sid === "string" ? payload.sid : null;
+    if (payload.sid !== undefined && (!sessionId || !UUID.test(sessionId))) {
       return { ok: false, status: 401, error: "Invalid token payload" };
     }
   } catch {
@@ -90,6 +101,7 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
         role: AppVariables["userRole"];
         isActive: boolean;
         tokensValidAfter: Date | null;
+        sessionActive: boolean;
       }
     | undefined;
   try {
@@ -100,6 +112,11 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
         role: users.role,
         isActive: users.isActive,
         tokensValidAfter: users.tokensValidAfter,
+        // Folded into the same query so ending one session costs no extra round
+        // trip: a session is active while any token of its family is unrevoked.
+        sessionActive: sessionId
+          ? sql<boolean>`exists (select 1 from ${refreshTokens} where ${refreshTokens.familyId} = ${sessionId} and ${refreshTokens.revokedAt} is null)`
+          : sql<boolean>`true`,
       })
       .from(users)
       .where(eq(users.id, userId))
@@ -141,12 +158,19 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     }
   }
 
+  // Logout ends one session by revoking its refresh-token family; tokens that
+  // belong to it stop working here at once, while the user's other sessions
+  // (other apps, browsers, devices) carry on.
+  if (!user.sessionActive) {
+    return { ok: false, status: 401, error: "Session has ended, please sign in again" };
+  }
+
   // orgId is required for non-super_admin users
   if (user.role !== "super_admin" && !user.orgId) {
     return { ok: false, status: 401, error: "Invalid account state" };
   }
 
-  return { ok: true, userId, orgId: user.orgId, role: user.role };
+  return { ok: true, userId, orgId: user.orgId, role: user.role, sessionId };
 }
 
 /** JWT auth middleware — see authenticateRequest. */
@@ -162,6 +186,7 @@ export const authMiddleware = createMiddleware<{
   c.set("userId", result.userId);
   c.set("orgId", result.orgId);
   c.set("userRole", result.role);
+  c.set("sessionId", result.sessionId);
 
   await next();
 });

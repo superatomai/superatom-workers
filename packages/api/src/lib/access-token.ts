@@ -23,10 +23,16 @@ export const ACCESS_TOKEN_TTL = "15m";
  * (super_admin: the __global secret) — see lib/org-secrets.ts. Throws
  * MissingOrgSecretError if the org has none; callers must report that as a
  * server fault (503), not as bad credentials.
+ *
+ * `sessionId` is the refresh-token family the token belongs to, carried as the
+ * `sid` claim. It lets logout end one session: verifiers reject a token whose
+ * family has been revoked (see sessionAliveSql). Every login and refresh passes
+ * one; the parameter is optional only for type-compatibility.
  */
 export async function mintAccessToken(
   user: { id: string; orgId: string | null; role: string },
-  jwtSecrets: KVNamespace
+  jwtSecrets: KVNamespace,
+  sessionId?: string
 ): Promise<string> {
   const secret = await getOrgSecret(jwtSecrets, user.orgId);
   if (!secret) throw new MissingOrgSecretError(user.orgId);
@@ -35,6 +41,7 @@ export async function mintAccessToken(
     userId: user.id,
     orgId: user.orgId,
     role: user.role,
+    ...(sessionId ? { sid: sessionId } : {}),
   })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()

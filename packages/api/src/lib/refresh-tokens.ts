@@ -10,7 +10,7 @@
  * is stored, so a database leak yields no usable tokens.
  */
 
-import { eq, and, isNull } from "drizzle-orm";
+import { eq, and, isNull, gt, ne } from "drizzle-orm";
 import { refreshTokens } from "../db/schema";
 
 /** 30 days. Long-lived by design — the ACCESS token is the short one. */
@@ -28,7 +28,7 @@ export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const ROTATION_GRACE_MS = 60 * 1000;
 
 export type RotateResult =
-  | { ok: true; userId: string; token: string }
+  | { ok: true; userId: string; token: string; familyId: string }
   | { ok: false; reason: "invalid" | "expired" | "revoked" | "reuse_detected" };
 
 async function sha256Hex(value: string): Promise<string> {
@@ -80,7 +80,11 @@ export async function issueRefreshToken(
   return { token: `${row.id}.${secret}`, id: row.id, familyId };
 }
 
-/** Revoke every unrevoked token in a family — used on reuse detection. */
+/**
+ * Revoke every unrevoked token in a family — one session. Used on reuse
+ * detection and on logout. Access tokens carrying that family as `sid` stop
+ * verifying at once (see middleware/auth.ts and the relay's session check).
+ */
 export async function revokeFamily(db: any, familyId: string): Promise<void> {
   await db
     .update(refreshTokens)
@@ -97,12 +101,56 @@ export async function revokeAllForUser(db: any, userId: string): Promise<void> {
 }
 
 /**
+ * Decide what an already-rotated token presented past the grace window means.
+ *
+ * Two very different events look identical at first: the browser never got the
+ * replacement (a refresh response lost to sleep, a closed lid, a network drop)
+ * and replays the old token; or a second party holds a copy. Treating every
+ * replay as theft signed users out of every app whenever a refresh response
+ * went missing — the most common cause of "logged out after my laptop slept".
+ *
+ * It is a lost response only when BOTH hold:
+ *  - nothing in the family has been used since this token was rotated — so no
+ *    one has moved on with the replacement or anything after it; and
+ *  - it comes from the browser the token was issued to (same User-Agent).
+ *
+ * The User-Agent check keeps detection for the case "unused replacement" alone
+ * would miss: a stolen token replayed from another browser before the real user
+ * refreshes again. A thief on an identical browser in that window gets through;
+ * that is the price of not logging real users out.
+ */
+async function isLostResponse(
+  db: any,
+  row: { id: string; familyId: string; rotatedAt: Date | string; userAgent: string | null },
+  userAgent: string | null | undefined
+): Promise<boolean> {
+  const presentedUa = userAgent?.slice(0, 500) ?? null;
+  if (!row.userAgent || row.userAgent !== presentedUa) return false;
+
+  const [usedSince] = await db
+    .select({ id: refreshTokens.id })
+    .from(refreshTokens)
+    .where(
+      and(
+        eq(refreshTokens.familyId, row.familyId),
+        gt(refreshTokens.rotatedAt, new Date(row.rotatedAt)),
+        ne(refreshTokens.id, row.id)
+      )
+    )
+    .limit(1);
+
+  return !usedSince;
+}
+
+/**
  * Validate a refresh token and exchange it for a new one.
  *
- * Returns `reuse_detected` when an already-rotated token is presented past the
- * grace window: two parties hold it, so the entire family is revoked and
- * everyone re-authenticates. This does not prevent theft — it makes theft
- * self-limiting and detectable, which a long-lived bearer token never is.
+ * An already-rotated token presented again is accepted within the grace window
+ * (concurrent tabs) or when it is a lost response (see isLostResponse);
+ * otherwise it returns `reuse_detected`: two parties hold it, so the entire
+ * family is revoked and everyone re-authenticates. This does not prevent theft —
+ * it makes theft self-limiting and detectable, which a long-lived bearer token
+ * never is.
  */
 export async function rotateRefreshToken(
   db: any,
@@ -143,11 +191,19 @@ export async function rotateRefreshToken(
   if (row.rotatedAt) {
     const since = Date.now() - new Date(row.rotatedAt).getTime();
     if (since > ROTATION_GRACE_MS) {
-      await revokeFamily(db, row.familyId);
+      if (!(await isLostResponse(db, row, userAgent))) {
+        await revokeFamily(db, row.familyId);
+        console.warn(
+          `[auth] refresh token reuse detected: user=${row.userId} family=${row.familyId} — family revoked`
+        );
+        return { ok: false, reason: "reuse_detected" };
+      }
+      // The browser never received the replacement. Issue another token in the
+      // same family, exactly as for a concurrent tab.
       console.warn(
-        `[auth] refresh token reuse detected: user=${row.userId} family=${row.familyId} — family revoked`
+        `[auth] refresh token replayed after a lost response: user=${row.userId} family=${row.familyId} ` +
+          `rotated ${Math.round(since / 1000)}s ago — reissued`
       );
-      return { ok: false, reason: "reuse_detected" };
     }
     // Inside the grace window: a concurrent tab, not an attacker. Fall through
     // and issue another token in the same family rather than revoking.
@@ -158,10 +214,13 @@ export async function rotateRefreshToken(
     userAgent,
   });
 
+  // rotated_at records the FIRST rotation only. Overwriting it on every replay
+  // would restart the grace window each time and move the point that
+  // isLostResponse measures "used since" from.
   await db
     .update(refreshTokens)
-    .set({ rotatedAt: new Date(), replacedById: next.id })
+    .set({ rotatedAt: row.rotatedAt ?? new Date(), replacedById: next.id })
     .where(eq(refreshTokens.id, row.id));
 
-  return { ok: true, userId: row.userId, token: next.token };
+  return { ok: true, userId: row.userId, token: next.token, familyId: row.familyId };
 }

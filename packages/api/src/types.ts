@@ -56,4 +56,6 @@ export type AppVariables = {
   userId: string;
   orgId: string | null;
   userRole: "super_admin" | "org_admin" | "member";
+  /** The caller's login session (refresh-token family), from the token's `sid`; null for older tokens. */
+  sessionId: string | null;
 };

@@ -9,15 +9,50 @@ import {
   issueRefreshToken,
   rotateRefreshToken,
   revokeAllForUser,
+  revokeFamily,
 } from "../lib/refresh-tokens";
+import { getCookie } from "hono/cookie";
 import {
+  type AppKey,
+  appFromOrigin,
   setRefreshCookie,
-  readRefreshCookie,
-  readLegacyRefreshCookie,
-  clearRefreshCookie,
+  readCookie,
+  clearCookie,
+  refreshCookieName,
+  listAppOrgCookies,
 } from "../lib/refresh-cookie";
 
 const auth = new Hono<{ Bindings: Env; Variables: AppVariables }>();
+
+/**
+ * One log line per refresh that did not end in a new token, with enough to
+ * tell the causes apart afterwards: which hint the tab sent, which cookie was
+ * used, and which refresh cookies the browser sent at all. Cookie NAMES only —
+ * they carry an org id, never a credential; values are never logged.
+ *
+ * Without this, a refresh 401 is indistinguishable from any other, and a user
+ * who "keeps getting logged out" cannot be diagnosed from the logs.
+ */
+function logRefreshOutcome(
+  c: any,
+  outcome: string,
+  details: {
+    app: AppKey;
+    hint: string;
+    usedCookie: string | null;
+    userId?: string;
+  }
+): void {
+  const sent = Object.keys(getCookie(c))
+    .filter((name) => name.startsWith("sa_refresh"))
+    .sort();
+  console.warn(
+    `[auth] refresh ${outcome}: app=${details.app} hint=${details.hint} cookie=${details.usedCookie ?? "none"} ` +
+      `sent=[${sent.join(",")}]` +
+      (details.userId ? ` user=${details.userId}` : "") +
+      ` origin=${c.req.header("Origin") ?? "none"}`
+  );
+}
 
 // Neon's HTTP SQL endpoint occasionally returns 520 or hangs when routed
 // through certain Cloudflare colos. Bound each call and retry once so a
@@ -154,14 +189,18 @@ auth.post("/login", async (c) => {
     // httpOnly cookie — see lib/access-token.ts and lib/refresh-cookie.ts.
     // Minted before the refresh row so a missing org secret fails the login
     // cleanly (503 below) instead of leaving an orphan refresh token.
-    const token = await mintAccessToken(user, c.env.JWT_SECRETS);
+    // One id for this login session: the JWT carries it as `sid` and the refresh
+    // token's family is created with it, so logout can end exactly this session.
+    const sessionId = crypto.randomUUID();
+    const token = await mintAccessToken(user, c.env.JWT_SECRETS, sessionId);
 
     const refresh = await issueRefreshToken(db, user.id, {
+      familyId: sessionId,
       userAgent: c.req.header("User-Agent"),
     });
-    // Per-org cookie so a second org login in the same browser does not
-    // overwrite this one. super_admin (no org) gets the base cookie.
-    setRefreshCookie(c, refresh.token, user.orgId ?? undefined);
+    // One cookie per app and org: this login replaces only this app's session
+    // for this org. super_admin (no org) gets the base cookie.
+    setRefreshCookie(c, refresh.token, appFromOrigin(c.req.header("Origin")), user.orgId);
 
     return c.json({
       token,
@@ -184,34 +223,43 @@ auth.post("/login", async (c) => {
 });
 
 /**
- * POST /auth/logout
- * Revokes every token issued to this user up to now.
+ * POST /auth/logout            — ends THIS session only
+ * POST /auth/logout?all=true   — ends every session of the user (all apps, devices)
  *
  * A JWT stays cryptographically valid until it expires, so clearing it from
- * localStorage only makes the browser forget it — anyone holding a copy could
- * keep using it for the remainder of its lifetime. Stamping a cutoff on the user
- * row lets authMiddleware reject tokens issued before it, which is what actually
- * ends the session.
+ * storage only makes the browser forget it — anyone holding a copy could keep
+ * using it. Logout therefore has to be enforced server-side:
  *
- * Truncated to whole seconds because `iat` has second granularity: a fresh login
- * in the same second as a logout must not be rejected as stale.
+ *  - one session: revoke its refresh-token family (the token's `sid`). The
+ *    cookie can no longer mint tokens, and authMiddleware / the relay reject
+ *    every access token carrying that `sid` at once. The user's other sessions —
+ *    another app, browser or device — are untouched.
+ *  - all sessions (`?all=true`, or a token from before `sid` existed, which
+ *    cannot name one session): stamp a cutoff on the user row so every token
+ *    issued before it is rejected, and revoke every refresh token of the user.
+ *    The cutoff is truncated to whole seconds because `iat` has second
+ *    granularity: a fresh login in the same second must not be rejected as stale.
  */
 auth.post("/logout", authMiddleware, async (c) => {
   const db = c.get("db");
   const userId = c.get("userId");
   const orgId = c.get("orgId");
-
-  const cutoff = new Date(Math.floor(Date.now() / 1000) * 1000);
+  const sessionId = c.get("sessionId");
+  const everywhere = c.req.query("all") === "true" || !sessionId;
 
   try {
-    await db
-      .update(users)
-      .set({ tokensValidAfter: cutoff, updatedAt: new Date() })
-      .where(eq(users.id, userId));
-
-    // Kill the refresh side too. Without this the access token would die at the
-    // cutoff but the cookie could still mint new ones, so logout would not stick.
-    await revokeAllForUser(db, userId);
+    if (everywhere) {
+      const cutoff = new Date(Math.floor(Date.now() / 1000) * 1000);
+      await db
+        .update(users)
+        .set({ tokensValidAfter: cutoff, updatedAt: new Date() })
+        .where(eq(users.id, userId));
+      // Kill the refresh side too. Without this the access token would die at the
+      // cutoff but the cookie could still mint new ones, so logout would not stick.
+      await revokeAllForUser(db, userId);
+    } else {
+      await revokeFamily(db, sessionId);
+    }
   } catch (error) {
     console.error("[auth] logout revocation failed:", error);
     // Surface the failure: reporting success would leave the caller believing
@@ -219,10 +267,9 @@ auth.post("/logout", authMiddleware, async (c) => {
     return c.json({ error: "Logout failed, please try again" }, 503);
   }
 
-  // Clear only THIS org's cookie — a Superatom staffer logged into another org
-  // in another tab must stay signed in there. revokeAllForUser above only kills
-  // this user's families, and a user belongs to one org, so this is exact.
-  clearRefreshCookie(c, orgId ?? undefined);
+  // Clear only THIS app's cookie for this org — another app, or another org in
+  // this app, keeps its own session.
+  clearCookie(c, refreshCookieName(c.req.url, appFromOrigin(c.req.header("Origin")), orgId));
 
   return c.json({ message: "Logged out successfully" });
 });
@@ -243,11 +290,16 @@ auth.post("/refresh", async (c) => {
 
   // The tab tells us which session it wants: its projectId (runtime UIs) or
   // orgId (admin UI). One browser can hold several org cookies, so without this
-  // hint we would not know which to rotate. The body is optional — an old client
-  // that posts nothing falls back to the base cookie below.
+  // hint we would not know which to rotate. The body is optional — see the
+  // cookie choice below for what happens without one.
   let hintOrgId: string | null = null;
+  // What the tab sent and how it resolved, for the outcome log only.
+  let hint = "none";
   try {
     const body = await c.req.json<{ projectId?: string; orgId?: string; orgSlug?: string }>();
+    if (body?.orgId) hint = `orgId:${body.orgId}`;
+    else if (body?.projectId) hint = `projectId:${body.projectId}`;
+    else if (body?.orgSlug) hint = `orgSlug:${body.orgSlug}`;
     hintOrgId = body?.orgId ?? null;
     if (!hintOrgId && body?.projectId) {
       const [p] = await db
@@ -266,30 +318,55 @@ auth.post("/refresh", async (c) => {
       hintOrgId = o?.id ?? null;
     }
   } catch {
-    // No/invalid body — fall through to the base cookie.
+    // No/invalid body — treated as no hint.
   }
+  if (hint !== "none" && !hintOrgId) hint += "(unresolved)";
 
-  // Prefer the org-scoped cookie; fall back to the base cookie for super_admin
-  // sessions and for sessions issued before per-org cookies existed. Track which
-  // one we actually used so a failure clears exactly that cookie.
-  let usedOrgId: string | null | undefined;
-  let presented = hintOrgId ? readRefreshCookie(c, hintOrgId) : undefined;
-  if (presented) {
-    usedOrgId = hintOrgId;
+  // Choose the cookie. Each app has its own (`<base>_<app>_<orgId>`), picked by
+  // the app the request comes from — so runtime never sees the platform UI's
+  // session, and the reverse, even for two users of the same org:
+  //
+  //   analytics (super-admin app) → the base cookie ONLY, whatever the body says.
+  //                                 Someone who is both a super_admin and an org
+  //                                 member must never get their org session here.
+  //   other app, org hint         → that app's cookie for that org, nothing else
+  //   other app, no hint          → that app's only org cookie; several is
+  //                                 ambiguous, so sign in again rather than guess
+  //   local, nothing else found   → the base cookie (local super_admin development)
+  //
+  // Runtime and platform never get the base cookie: it is shared across
+  // *.superatom.ai, so falling back to it handed an org tab a super_admin token,
+  // or logged it out when that session was dead.
+  const app = appFromOrigin(c.req.header("Origin"));
+  let usedCookie: string | null = null;
+  if (app === "analytics") {
+    usedCookie = refreshCookieName(c.req.url, app);
+  } else if (hintOrgId) {
+    usedCookie = refreshCookieName(c.req.url, app, hintOrgId);
   } else {
-    presented = readLegacyRefreshCookie(c);
-    if (presented) usedOrgId = null;
+    const orgCookies = listAppOrgCookies(c, app);
+    if (orgCookies.length > 1) {
+      logRefreshOutcome(c, "rejected reason=multiple_org_sessions", { app, hint, usedCookie: null });
+      // 401, not 409: clients already treat 401 as "show login" and anything
+      // else as a transient error to retry.
+      return c.json({ error: "Several organizations are signed in, please sign in again" }, 401);
+    }
+    if (orgCookies.length === 1) usedCookie = refreshCookieName(c.req.url, app, orgCookies[0]);
+    else if (app === "local") usedCookie = refreshCookieName(c.req.url, app);
   }
 
+  const presented = usedCookie ? readCookie(c, usedCookie) : undefined;
   if (!presented) {
+    logRefreshOutcome(c, "rejected reason=no_cookie", { app, hint, usedCookie: null });
     return c.json({ error: "No refresh token" }, 401);
   }
 
   const result = await rotateRefreshToken(db, presented, c.req.header("User-Agent"));
 
   if (!result.ok) {
+    logRefreshOutcome(c, `rejected reason=${result.reason}`, { app, hint, usedCookie });
     // Clear whichever cookie we read from so the browser stops replaying it.
-    clearRefreshCookie(c, usedOrgId ?? undefined);
+    clearCookie(c, usedCookie!);
     const message =
       result.reason === "reuse_detected"
         ? "Session revoked, please sign in again"
@@ -313,23 +390,19 @@ auth.post("/refresh", async (c) => {
     .limit(1);
 
   if (!user || !user.isActive) {
+    logRefreshOutcome(c, "rejected reason=inactive", { app, hint, usedCookie, userId: result.userId });
     await revokeAllForUser(db, result.userId);
-    clearRefreshCookie(c, user?.orgId ?? usedOrgId ?? undefined);
+    clearCookie(c, usedCookie!);
     return c.json({ error: "Account is not active" }, 401);
   }
 
-  // Rotate the cookie under the user's actual org. When we fell back to the base
-  // cookie for an org user (a pre-per-org session), this migrates it onto the
-  // suffixed name.
-  setRefreshCookie(c, result.token, user.orgId ?? undefined);
-
-  // If we just migrated an org user OFF the legacy base cookie, drop the base
-  // cookie now. Otherwise it lingers holding the token we just consumed, and a
-  // later hint-less refresh would replay it and trip reuse detection — revoking
-  // the whole family (a hard logout of every session). super_admin keeps the
-  // base cookie (it has no org and legitimately uses it), hence the org guard.
-  if (usedOrgId === null && user.orgId) {
-    clearRefreshCookie(c);
+  // Rotate the cookie under this app and the user's actual org. If that is a
+  // different name from the one we read (a session in the base cookie that turns
+  // out to belong to an org user), drop the old one: it now holds a consumed
+  // token, and replaying it later would trip reuse detection.
+  setRefreshCookie(c, result.token, app, user.orgId);
+  if (refreshCookieName(c.req.url, app, user.orgId) !== usedCookie) {
+    clearCookie(c, usedCookie!);
   }
 
   // The refresh token has already rotated and its cookie is set on this
@@ -338,7 +411,7 @@ auth.post("/refresh", async (c) => {
   // the consumed token, and trip reuse detection on its next refresh.
   let token: string;
   try {
-    token = await mintAccessToken(user, c.env.JWT_SECRETS);
+    token = await mintAccessToken(user, c.env.JWT_SECRETS, result.familyId);
   } catch (error) {
     console.error("[auth] refresh: access token signing failed:", error);
     return c.json({ error: "Authorization service unavailable" }, 503);

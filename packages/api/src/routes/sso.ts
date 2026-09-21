@@ -12,7 +12,7 @@ import {
 import { isAllowedRedirect } from "../lib/origins";
 import { mintAccessToken } from "../lib/access-token";
 import { issueRefreshToken } from "../lib/refresh-tokens";
-import { setRefreshCookie } from "../lib/refresh-cookie";
+import { setRefreshCookie, appFromUrl } from "../lib/refresh-cookie";
 
 const sso = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -425,15 +425,20 @@ sso.get("/callback", async (c) => {
     }
 
     // Issue SA-API JWT, signed with the user's org secret (lib/org-secrets.ts)
-    const saToken = await mintAccessToken(user, c.env.JWT_SECRETS);
+    // One id for this login session: the JWT's `sid` and the refresh family.
+    const sessionId = crypto.randomUUID();
+    const saToken = await mintAccessToken(user, c.env.JWT_SECRETS, sessionId);
 
     // The refresh token goes in an httpOnly cookie; only the 15-minute access
     // token travels in the URL. That bounds the damage if this redirect leaks
     // into browser history or an access log.
     const refresh = await issueRefreshToken(db, user.id, {
+      familyId: sessionId,
       userAgent: c.req.header("User-Agent"),
     });
-    setRefreshCookie(c, refresh.token, user.orgId ?? undefined);
+    // The browser arrives here from the IdP, so Origin does not name our app;
+    // the verified front-end we send the user back to does.
+    setRefreshCookie(c, refresh.token, appFromUrl(safeRedirectTo), user.orgId);
 
     if (!safeRedirectTo) {
       // Login succeeded but there is no verified destination to deliver the
