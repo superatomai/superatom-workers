@@ -12,7 +12,7 @@ import {
 import { isAllowedRedirect } from "../lib/origins";
 import { mintAccessToken } from "../lib/access-token";
 import { issueRefreshToken } from "../lib/refresh-tokens";
-import { setRefreshCookie, appFromUrl } from "../lib/refresh-cookie";
+import { setRefreshCookie, siteFromUrl } from "../lib/refresh-cookie";
 
 const sso = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -436,9 +436,9 @@ sso.get("/callback", async (c) => {
       familyId: sessionId,
       userAgent: c.req.header("User-Agent"),
     });
-    // The browser arrives here from the IdP, so Origin does not name our app;
+    // The browser arrives here from the IdP, so Origin does not name our site;
     // the verified front-end we send the user back to does.
-    setRefreshCookie(c, refresh.token, appFromUrl(safeRedirectTo), user.orgId);
+    setRefreshCookie(c, refresh.token, siteFromUrl(safeRedirectTo));
 
     if (!safeRedirectTo) {
       // Login succeeded but there is no verified destination to deliver the

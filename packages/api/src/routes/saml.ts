@@ -16,7 +16,7 @@ import { authMiddleware, adminOnly } from "../middleware/auth";
 import { isAllowedRedirect } from "../lib/origins";
 import { mintAccessToken } from "../lib/access-token";
 import { issueRefreshToken } from "../lib/refresh-tokens";
-import { setRefreshCookie, appFromUrl } from "../lib/refresh-cookie";
+import { setRefreshCookie, siteFromUrl } from "../lib/refresh-cookie";
 import { DOMParser } from"@xmldom/xmldom";
 
 
@@ -359,9 +359,9 @@ saml.post("/acs", async (c) => {
     });
     // Redirect target: the verified RelayState front-end (SP-initiated) or the
     // platform default (IdP-initiated). The IdP posts here, so Origin names the
-    // IdP, not our app — the front-end we send the user back to decides the cookie.
+    // IdP, not our site — the front-end we send the user back to decides the cookie.
     const frontendCallbackUrl = relayState ? errorRedirectUrl : defaultRedirect;
-    setRefreshCookie(c, refresh.token, appFromUrl(frontendCallbackUrl), user.orgId);
+    setRefreshCookie(c, refresh.token, siteFromUrl(frontendCallbackUrl));
 
     // Redirect to frontend with token
     return c.redirect(`${frontendCallbackUrl}?token=${saToken}`);

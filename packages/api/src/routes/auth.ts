@@ -13,13 +13,12 @@ import {
 } from "../lib/refresh-tokens";
 import { getCookie } from "hono/cookie";
 import {
-  type AppKey,
-  appFromOrigin,
+  SUPER_ADMIN_SITE,
+  siteFromOrigin,
   setRefreshCookie,
   readCookie,
   clearCookie,
   refreshCookieName,
-  listAppOrgCookies,
 } from "../lib/refresh-cookie";
 
 const auth = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -37,7 +36,7 @@ function logRefreshOutcome(
   c: any,
   outcome: string,
   details: {
-    app: AppKey;
+    site: string;
     hint: string;
     usedCookie: string | null;
     userId?: string;
@@ -47,7 +46,7 @@ function logRefreshOutcome(
     .filter((name) => name.startsWith("sa_refresh"))
     .sort();
   console.warn(
-    `[auth] refresh ${outcome}: app=${details.app} hint=${details.hint} cookie=${details.usedCookie ?? "none"} ` +
+    `[auth] refresh ${outcome}: site=${details.site} hint=${details.hint} cookie=${details.usedCookie ?? "none"} ` +
       `sent=[${sent.join(",")}]` +
       (details.userId ? ` user=${details.userId}` : "") +
       ` origin=${c.req.header("Origin") ?? "none"}`
@@ -198,9 +197,9 @@ auth.post("/login", async (c) => {
       familyId: sessionId,
       userAgent: c.req.header("User-Agent"),
     });
-    // One cookie per app and org: this login replaces only this app's session
-    // for this org. super_admin (no org) gets the base cookie.
-    setRefreshCookie(c, refresh.token, appFromOrigin(c.req.header("Origin")), user.orgId);
+    // One cookie per site: this login replaces that site's session, whatever org
+    // it was for, and leaves every other site alone.
+    setRefreshCookie(c, refresh.token, siteFromOrigin(c.req.header("Origin")));
 
     return c.json({
       token,
@@ -243,7 +242,6 @@ auth.post("/login", async (c) => {
 auth.post("/logout", authMiddleware, async (c) => {
   const db = c.get("db");
   const userId = c.get("userId");
-  const orgId = c.get("orgId");
   const sessionId = c.get("sessionId");
   const everywhere = c.req.query("all") === "true" || !sessionId;
 
@@ -267,9 +265,8 @@ auth.post("/logout", authMiddleware, async (c) => {
     return c.json({ error: "Logout failed, please try again" }, 503);
   }
 
-  // Clear only THIS app's cookie for this org — another app, or another org in
-  // this app, keeps its own session.
-  clearCookie(c, refreshCookieName(c.req.url, appFromOrigin(c.req.header("Origin")), orgId));
+  // Clear only this site's cookie — every other site keeps its own session.
+  clearCookie(c, refreshCookieName(c.req.url, siteFromOrigin(c.req.header("Origin"))));
 
   return c.json({ message: "Logged out successfully" });
 });
@@ -322,51 +319,24 @@ auth.post("/refresh", async (c) => {
   }
   if (hint !== "none" && !hintOrgId) hint += "(unresolved)";
 
-  // Choose the cookie. Each app has its own (`<base>_<app>_<orgId>`), picked by
-  // the app the request comes from — so runtime never sees the platform UI's
-  // session, and the reverse, even for two users of the same org:
-  //
-  //   analytics (super-admin app) → the base cookie ONLY, whatever the body says.
-  //                                 Someone who is both a super_admin and an org
-  //                                 member must never get their org session here.
-  //   other app, org hint         → that app's cookie for that org, nothing else
-  //   other app, no hint          → that app's only org cookie; several is
-  //                                 ambiguous, so sign in again rather than guess
-  //   local, nothing else found   → the base cookie (local super_admin development)
-  //
-  // Runtime and platform never get the base cookie: it is shared across
-  // *.superatom.ai, so falling back to it handed an org tab a super_admin token,
-  // or logged it out when that session was dead.
-  const app = appFromOrigin(c.req.header("Origin"));
-  let usedCookie: string | null = null;
-  if (app === "analytics") {
-    usedCookie = refreshCookieName(c.req.url, app);
-  } else if (hintOrgId) {
-    usedCookie = refreshCookieName(c.req.url, app, hintOrgId);
-  } else {
-    const orgCookies = listAppOrgCookies(c, app);
-    if (orgCookies.length > 1) {
-      logRefreshOutcome(c, "rejected reason=multiple_org_sessions", { app, hint, usedCookie: null });
-      // 401, not 409: clients already treat 401 as "show login" and anything
-      // else as a transient error to retry.
-      return c.json({ error: "Several organizations are signed in, please sign in again" }, 401);
-    }
-    if (orgCookies.length === 1) usedCookie = refreshCookieName(c.req.url, app, orgCookies[0]);
-    else if (app === "local") usedCookie = refreshCookieName(c.req.url, app);
-  }
-
-  const presented = usedCookie ? readCookie(c, usedCookie) : undefined;
+  // Choose the cookie: the one for the site this request comes from. One site,
+  // one session — so a new tab, which has no token to say which org it wants,
+  // always finds exactly one cookie, and a login elsewhere never touches it.
+  // The super-admin app (analytics) reads only the bare base cookie.
+  const site = siteFromOrigin(c.req.header("Origin"));
+  const usedCookie = refreshCookieName(c.req.url, site);
+  const presented = readCookie(c, usedCookie);
   if (!presented) {
-    logRefreshOutcome(c, "rejected reason=no_cookie", { app, hint, usedCookie: null });
+    logRefreshOutcome(c, "rejected reason=no_cookie", { site, hint, usedCookie: null });
     return c.json({ error: "No refresh token" }, 401);
   }
 
   const result = await rotateRefreshToken(db, presented, c.req.header("User-Agent"));
 
   if (!result.ok) {
-    logRefreshOutcome(c, `rejected reason=${result.reason}`, { app, hint, usedCookie });
-    // Clear whichever cookie we read from so the browser stops replaying it.
-    clearCookie(c, usedCookie!);
+    logRefreshOutcome(c, `rejected reason=${result.reason}`, { site, hint, usedCookie });
+    // Clear the cookie we read from so the browser stops replaying it.
+    clearCookie(c, usedCookie);
     const message =
       result.reason === "reuse_detected"
         ? "Session revoked, please sign in again"
@@ -390,19 +360,24 @@ auth.post("/refresh", async (c) => {
     .limit(1);
 
   if (!user || !user.isActive) {
-    logRefreshOutcome(c, "rejected reason=inactive", { app, hint, usedCookie, userId: result.userId });
+    logRefreshOutcome(c, "rejected reason=inactive", { site, hint, usedCookie, userId: result.userId });
     await revokeAllForUser(db, result.userId);
-    clearCookie(c, usedCookie!);
+    clearCookie(c, usedCookie);
     return c.json({ error: "Account is not active" }, 401);
   }
 
-  // Rotate the cookie under this app and the user's actual org. If that is a
-  // different name from the one we read (a session in the base cookie that turns
-  // out to belong to an org user), drop the old one: it now holds a consumed
-  // token, and replaying it later would trip reuse detection.
-  setRefreshCookie(c, result.token, app, user.orgId);
-  if (refreshCookieName(c.req.url, app, user.orgId) !== usedCookie) {
-    clearCookie(c, usedCookie!);
+  // The token has rotated: store its replacement in the site's cookie.
+  setRefreshCookie(c, result.token, site);
+
+  // A tab that names an org (its token's, or its URL's project) while the site's
+  // session now belongs to another org — someone picked a different org, or
+  // signed in as someone else, in another tab of this site. Sign this tab out
+  // rather than quietly switching it; the session itself stays valid for the tab
+  // that owns it (its cookie is set above). Not for analytics: super_admin
+  // sessions have no org.
+  if (site !== SUPER_ADMIN_SITE && hintOrgId && user.orgId !== hintOrgId) {
+    logRefreshOutcome(c, "rejected reason=org_switched", { site, hint, usedCookie, userId: user.id });
+    return c.json({ error: "Signed in to another organization in this app, please sign in again" }, 401);
   }
 
   // The refresh token has already rotated and its cookie is set on this

@@ -12,20 +12,25 @@
  * and SameSite=Lax applies. Lax also blocks cross-site POSTs, which is the CSRF
  * control for /auth/refresh.
  *
- * One cookie per APP and org: `<base>_<app>_<orgId>`. A `.superatom.ai` cookie
- * is shared by every subdomain, so a name without the app made runtime and the
- * platform UI share one session: logging into one as another user switched the
- * other to that user, and logging in or out in one changed the other. With the
- * app in the name each app keeps its own session; the org suffix lets several
- * orgs coexist within one app. super_admin has no org and uses the unsuffixed
- * base name. See AUTH-AND-SDK-DESIGN.md §3.6.
+ * ONE COOKIE PER SITE: `<base>_<site>`, where the site is the front-end the
+ * request comes from (dev.live → `dev-live`, dev.platform → `dev-platform`,
+ * bluelinx.superatom.ai → `bluelinx`). A `.superatom.ai` cookie is shared by
+ * every subdomain, so the name is what keeps sessions apart:
+ *
+ *  - Earlier names shared one cookie across apps (`<base>_<orgId>`), so logging
+ *    into one app as someone else switched the other app to that user.
+ *  - Then names carried app AND org (`<base>_<app>_<orgId>`), so choosing a
+ *    second org in the same app added a second cookie, and a new tab — which has
+ *    no token to say which org it wants — could not tell them apart.
+ *
+ * Keyed by site alone, each site has exactly one session: signing in, or picking
+ * another org, replaces it; a new tab always finds its site's single cookie.
+ * The super-admin app (analytics) keeps the bare base name. See
+ * AUTH-AND-SDK-DESIGN.md §3.6.
  */
 
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { REFRESH_TOKEN_TTL_MS } from "./refresh-tokens";
-
-/** The front-end a session belongs to. */
-export type AppKey = "runtime" | "platform" | "analytics" | "local";
 
 /**
  * Base cookie name, scoped per environment.
@@ -50,54 +55,54 @@ function refreshCookieBase(requestUrl: string): string {
 }
 
 /**
- * The super-admin apps. Their refresh uses the base (super_admin) cookie only —
- * never an org cookie, even for someone who is also an org member.
+ * The super-admin app. Its session uses the bare base cookie and nothing else —
+ * never a site cookie, even for someone who is also an org member.
  * (superadmin.superatom.ai has its own session and never calls /auth/refresh.)
  */
+export const SUPER_ADMIN_SITE = "analytics";
 const SUPER_ADMIN_APP_HOSTS = new Set(["analytics.superatom.ai", "dev.analytics.superatom.ai"]);
 
-function appFromHost(host: string): AppKey {
-  if (SUPER_ADMIN_APP_HOSTS.has(host)) return "analytics";
-  if (host === "platform.superatom.ai" || host.endsWith(".platform.superatom.ai")) return "platform";
-  if (host === "localhost" || host === "127.0.0.1") return "local";
-  // live., dev.live., and client subdomains (bluelinx.superatom.ai …).
-  return "runtime";
+function siteFromParsed(url: URL): string {
+  const host = url.hostname.toLowerCase();
+  if (SUPER_ADMIN_APP_HOSTS.has(host)) return SUPER_ADMIN_SITE;
+  // Local front-ends differ only by port (runtime and platform side by side).
+  if (host === "localhost" || host === "127.0.0.1") return `local-${url.port || "80"}`;
+  const name = host.endsWith(".superatom.ai") ? host.slice(0, -".superatom.ai".length) : host;
+  return name.replace(/[^a-z0-9-]/g, "-") || "root";
 }
 
 /**
- * Which app a request comes from, by its Origin header — set by the browser, not
- * by page script. Requests without one (server-to-server) count as runtime.
+ * The site a request comes from, by its Origin header — set by the browser, not
+ * by page script. Requests without one (server-to-server) get a site of their
+ * own that no browser session uses.
  */
-export function appFromOrigin(origin: string | null | undefined): AppKey {
-  if (!origin) return "runtime";
+export function siteFromOrigin(origin: string | null | undefined): string {
+  if (!origin) return "none";
   try {
-    return appFromHost(new URL(origin).hostname);
+    return siteFromParsed(new URL(origin));
   } catch {
-    return "runtime";
+    return "none";
   }
 }
 
 /**
- * Which app a front-end URL belongs to. Used by the SSO/SAML callbacks: there the
+ * The site a front-end URL belongs to. Used by the SSO/SAML callbacks: there the
  * browser arrives from the identity provider, so Origin names the IdP (or is
- * absent), and the app is the verified front-end the user is being sent back to.
+ * absent), and the site is the verified front-end the user is being sent back to.
  */
-export function appFromUrl(url: string | null | undefined): AppKey {
-  if (!url) return "runtime";
+export function siteFromUrl(url: string | null | undefined): string {
+  if (!url) return "none";
   try {
-    return appFromHost(new URL(url).hostname);
+    return siteFromParsed(new URL(url));
   } catch {
-    return "runtime";
+    return "none";
   }
 }
 
-/**
- * Cookie name for a session: `<base>_<app>_<orgId>`, or the bare base for
- * super_admin (no org).
- */
-export function refreshCookieName(requestUrl: string, app: AppKey, orgId?: string | null): string {
+/** Cookie name for a site's session: `<base>_<site>`; the super-admin app uses `<base>`. */
+export function refreshCookieName(requestUrl: string, site: string): string {
   const base = refreshCookieBase(requestUrl);
-  return orgId ? `${base}_${app}_${orgId}` : base;
+  return site === SUPER_ADMIN_SITE ? base : `${base}_${site}`;
 }
 
 /**
@@ -144,10 +149,24 @@ function cookieOptions(requestUrl: string) {
   };
 }
 
-/** Set the refresh cookie for an app's session in an org (no org → super_admin). */
-export function setRefreshCookie(c: any, token: string, app: AppKey, orgId?: string | null): void {
-  setCookie(c, refreshCookieName(c.req.url, app, orgId), token, {
-    ...cookieOptions(c.req.url),
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+
+/**
+ * Names used by earlier cookie schemes, in this environment: `<base>_<orgId>` and
+ * `<base>_<app>_<orgId>`. Nothing reads them any more; they are deleted whenever
+ * a session cookie is set so they do not linger in the browser for 30 days.
+ */
+function obsoleteCookieNames(c: any): string[] {
+  const base = refreshCookieBase(c.req.url);
+  const obsolete = new RegExp(`^${base}_(?:(?:runtime|platform|local)_)?${UUID}$`, "i");
+  return Object.keys(getCookie(c)).filter((name) => obsolete.test(name));
+}
+
+/** Set (replace) the site's refresh cookie. */
+export function setRefreshCookie(c: any, token: string, site: string): void {
+  const options = cookieOptions(c.req.url);
+  setCookie(c, refreshCookieName(c.req.url, site), token, {
+    ...options,
     httpOnly: true,
     maxAge: Math.floor(REFRESH_TOKEN_TTL_MS / 1000),
   });
@@ -157,11 +176,9 @@ export function setRefreshCookie(c: any, token: string, app: AppKey, orgId?: str
   // other environment on the way in, so a stale cross-environment token cannot be
   // presented on a later request.
   const otherBase = refreshCookieBase(c.req.url) === "sa_refresh" ? "sa_refresh_dev" : "sa_refresh";
-  deleteCookie(c, orgId ? `${otherBase}_${app}_${orgId}` : otherBase, cookieOptions(c.req.url));
+  deleteCookie(c, site === SUPER_ADMIN_SITE ? otherBase : `${otherBase}_${site}`, options);
 
-  // Tidy the pre-per-app, app-less org cookie (`<base>_<orgId>`). Nothing reads it
-  // any more; drop it so it does not sit in the browser for another 30 days.
-  if (orgId) deleteCookie(c, `${refreshCookieBase(c.req.url)}_${orgId}`, cookieOptions(c.req.url));
+  for (const name of obsoleteCookieNames(c)) deleteCookie(c, name, options);
 }
 
 /** Read a refresh cookie by its full name. */
@@ -172,19 +189,4 @@ export function readCookie(c: any, name: string): string | undefined {
 /** Clear a refresh cookie by its full name. */
 export function clearCookie(c: any, name: string): void {
   deleteCookie(c, name, cookieOptions(c.req.url));
-}
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * Org ids of every refresh cookie of `app` this environment's browser sent.
- * Exact `<base>_<app>_<uuid>` match, so on prod (`sa_refresh`) dev cookies
- * (`sa_refresh_dev_…`) are not included.
- */
-export function listAppOrgCookies(c: any, app: AppKey): string[] {
-  const prefix = `${refreshCookieBase(c.req.url)}_${app}_`;
-  return Object.keys(getCookie(c))
-    .filter((name) => name.startsWith(prefix))
-    .map((name) => name.slice(prefix.length))
-    .filter((orgId) => UUID.test(orgId));
 }
