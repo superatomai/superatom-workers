@@ -40,6 +40,9 @@ INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
 INSTALL_CODE_REF = "dev"
 INSTALL_SA_API_URL = "https://sa-api-dev.ashish-91e.workers.dev"
 INSTALL_WS_URL = "wss://sa-websocket-dev.ashish-91e.workers.dev/websocket"
+# Dev UIs have no per-org subdomains ("dev" is a reserved slug in the platform UI).
+INSTALL_PLATFORM_UI_URL = "https://dev.platform.superatom.ai"
+INSTALL_USER_UI_URL = "https://dev.live.superatom.ai"
 INSTALL_LLM_PROXY_MODE = "dummy"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.

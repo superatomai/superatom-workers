@@ -178,6 +178,8 @@ install.post("/api/redeem", async (c) => {
       SA_ORG_ID: row.orgId,
       SA_ORG_SLUG: row.orgSlug,
       SA_WEBSOCKET_URL: c.env.INSTALL_WS_URL,
+      PLATFORM_UI_URL: c.env.INSTALL_PLATFORM_UI_URL?.replace("{slug}", row.orgSlug),
+      USER_UI_URL: c.env.INSTALL_USER_UI_URL?.replace("{slug}", row.orgSlug),
       OPENROUTER_API_KEY: proxyKey,
       SA_INTERNAL_SERVICE_TOKEN: c.env.SA_INTERNAL_SERVICE_TOKEN,
       RESEND_API_KEY: c.env.RESEND_API_KEY,

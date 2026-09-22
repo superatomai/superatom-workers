@@ -61,6 +61,9 @@ export type Env = {
   INSTALL_DOWNLOAD_SECRET?: string;
   // Values handed to new installs.
   INSTALL_SA_API_URL: string;
+  // Client UI links for the install summary; "{slug}" is replaced with the org slug.
+  INSTALL_PLATFORM_UI_URL: string;
+  INSTALL_USER_UI_URL: string;
   INSTALL_WS_URL?: string;
   RESEND_API_KEY?: string;
   // Per-project LLM proxy keys via the llm-proxy worker's admin API; "dummy" skips it (dev).

@@ -45,6 +45,8 @@ INSTALL_HOST = "install.superatom.ai"
 INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
 INSTALL_CODE_REF = "main"
 INSTALL_SA_API_URL = "https://sa-api.superatom.ai"
+INSTALL_PLATFORM_UI_URL = "https://{slug}.platform.superatom.ai"
+INSTALL_USER_UI_URL = "https://{slug}.superatom.ai"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
