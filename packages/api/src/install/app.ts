@@ -46,10 +46,18 @@ async function codeUrl(c: { req: { url: string }; env: Env }, sha: string, proje
   return `${new URL(c.req.url).origin}/api/code/${await signDownload(c.env, sha, projectId)}`;
 }
 
-/** GET / — the installer script itself. */
+// install.sh's built-in default; replaced on serve so the script talks back to the host it came from.
+const DEFAULT_BASE = "${SA_INSTALL_URL:-https://install.superatom.ai}";
+
+/** GET / — the installer script itself, pointed at this host (dev vs prod). */
 install.get("/", async (c) => {
   const script = await installScript(c.env);
-  return c.body(script, 200, { "Content-Type": "text/plain; charset=utf-8" });
+  const origin = new URL(c.req.url).origin;
+  if (!script.includes(DEFAULT_BASE)) {
+    console.warn("[install] install.sh default URL line not found; serving it unchanged");
+  }
+  const body = script.replace(DEFAULT_BASE, "${SA_INSTALL_URL:-" + origin + "}");
+  return c.body(body, 200, { "Content-Type": "text/plain; charset=utf-8" });
 });
 
 /**
