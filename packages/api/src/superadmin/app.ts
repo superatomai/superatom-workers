@@ -8,6 +8,7 @@ import orgRoutes from "./routes/orgs";
 import orgAdminRoutes from "./routes/org-admins";
 import orgProjectRoutes from "./routes/projects";
 import overviewRoutes from "./routes/overview";
+import installTokenRoutes from "./routes/install-tokens";
 
 /**
  * Super-admin console API, served only on SUPERADMIN_HOST under /api.
@@ -31,6 +32,7 @@ superadmin.use("/overview", requireSuperAdmin);
 superadmin.route("/overview", overviewRoutes);
 superadmin.route("/orgs", orgRoutes);
 superadmin.route("/orgs/:orgId/admins", orgAdminRoutes);
+superadmin.route("/orgs/:orgId/projects/:projectId/install-tokens", installTokenRoutes);
 superadmin.route("/orgs/:orgId/projects", orgProjectRoutes);
 
 superadmin.notFound((c) => c.json({ error: "Not found" }, 404));

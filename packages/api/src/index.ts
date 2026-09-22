@@ -4,6 +4,7 @@ import { createDb } from "./db";
 import { isAllowedOrigin } from "./lib/origins";
 import { serveUi } from "./lib/serve-ui";
 import superadminApp from "./superadmin/app";
+import installApp from "./install/app";
 import type { Env, AppVariables } from "./types";
 
 import authRoutes from "./routes/auth";
@@ -114,8 +115,8 @@ app.onError((err, c) => {
 });
 
 // ─── Host dispatch ───────────────────────────────────────
-// The super-admin host gets its own app, so sa-api's credentialed *.superatom.ai
-// CORS and routes never apply there. Everything else is sa-api, unchanged.
+// The super-admin and install hosts get their own apps, so sa-api's credentialed
+// *.superatom.ai CORS and routes never apply there. Everything else is sa-api, unchanged.
 export default {
   fetch(request, env, ctx) {
     const { hostname, pathname } = new URL(request.url);
@@ -123,6 +124,10 @@ export default {
       return pathname === "/api" || pathname.startsWith("/api/")
         ? superadminApp.fetch(request, env, ctx)
         : serveUi(env.FRONTEND_BUILDS, "superadmin", request);
+    }
+    // curl-only installer host (`curl -fsSL https://install.superatom.ai | sh`).
+    if (env.INSTALL_HOST && hostname === env.INSTALL_HOST) {
+      return installApp.fetch(request, env, ctx);
     }
     return app.fetch(request, env, ctx);
   },

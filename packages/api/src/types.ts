@@ -49,6 +49,24 @@ export type Env = {
   // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).
   SUPERADMIN_JWT_SECRET: string;
   SUPERADMIN_LOGIN_LIMITER: RateLimit;
+  // ─── Installer host (src/install) ───
+  INSTALL_HOST: string;
+  INSTALL_RATE_LIMITER: RateLimit;
+  // Code source: fine-grained GitHub token, one repo, contents read-only.
+  GITHUB_CODE_TOKEN?: string;
+  INSTALL_CODE_REPO: string;
+  INSTALL_CODE_REF: string;
+  INSTALL_GITHUB_API?: string;
+  // Signs the short-lived code download links (min 32 chars).
+  INSTALL_DOWNLOAD_SECRET?: string;
+  // Values handed to new installs.
+  INSTALL_SA_API_URL: string;
+  INSTALL_WS_URL?: string;
+  RESEND_API_KEY?: string;
+  // Per-project LLM proxy keys via the llm-proxy worker's admin API; "dummy" skips it (dev).
+  LLM_PROXY?: Fetcher;
+  LLM_PROXY_ADMIN_SECRET?: string;
+  INSTALL_LLM_PROXY_MODE?: string;
 };
 
 export type AppVariables = {

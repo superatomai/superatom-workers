@@ -34,6 +34,13 @@ bucket_name = "sa-frontend-builds-dev"
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
 SUPERADMIN_HOST = "dev.superadmin.superatom.ai"
+# Installer host. Dev installs the dev branch, a dummy LLM key and the dev websocket.
+INSTALL_HOST = "dev.install.superatom.ai"
+INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
+INSTALL_CODE_REF = "dev"
+INSTALL_SA_API_URL = "https://sa-api-dev.ashish-91e.workers.dev"
+INSTALL_WS_URL = "wss://sa-websocket-dev.ashish-91e.workers.dev/websocket"
+INSTALL_LLM_PROXY_MODE = "dummy"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
@@ -49,6 +56,13 @@ type = "ratelimit"
 namespace_id = "2003"
 simple = { limit = 10, period = 60 }
 
+# Installer (redeem / update / code download) throttle, per IP.
+[[unsafe.bindings]]
+name = "INSTALL_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "2005"
+simple = { limit = 20, period = 60 }
+
 # Secrets (set once, then managed via Cloudflare dashboard or wrangler):
 #   pnpm wrangler secret put DATABASE_URL --config wrangler.dev.toml
 #   pnpm wrangler secret put JWT_SECRET --config wrangler.dev.toml
@@ -58,6 +72,9 @@ simple = { limit = 10, period = 60 }
 #   pnpm wrangler secret put SA_INTERNAL_SERVICE_TOKEN --config wrangler.dev.toml
 #   pnpm wrangler secret put OPENROUTER_API_KEY --config wrangler.dev.toml
 #   pnpm wrangler secret put SUPERADMIN_JWT_SECRET --config wrangler.dev.toml
+#   pnpm wrangler secret put GITHUB_CODE_TOKEN --config wrangler.dev.toml        # same read-only PAT as prod is fine
+#   pnpm wrangler secret put INSTALL_DOWNLOAD_SECRET --config wrangler.dev.toml  # fresh random value
+#   pnpm wrangler secret put RESEND_API_KEY --config wrangler.dev.toml           # optional on dev
 #
 # DATABASE_URL: Dev Neon PostgreSQL connection string
 # JWT_SECRET: A fresh random secret (different from prod). Signs only SSO/SAML

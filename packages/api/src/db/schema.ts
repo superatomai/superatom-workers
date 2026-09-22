@@ -508,3 +508,36 @@ export const superAdmins = pgTable(
   },
   (table) => [uniqueIndex("super_admins_email_idx").on(sql`lower(${table.email})`)]
 );
+
+// ─── Install Tokens ─────────────────────────────────────
+// One-time tokens for `curl -fsSL https://install.superatom.ai | sh`, generated in the
+// super-admin console. Only the SHA-256 is stored; redeeming issues the project's API key.
+
+export const installTokens = pgTable(
+  "install_tokens",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tokenHash: varchar("token_hash", { length: 64 }).notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    orgId: uuid("org_id").notNull(),
+    /** Stack / folder name on the VM, and the LLM proxy clientId. */
+    installName: varchar("install_name", { length: 63 }).notNull(),
+    /** 0 = unlimited. */
+    llmBudgetCents: integer("llm_budget_cents").default(0).notNull(),
+    /** Set once this token created the LLM proxy client, so a retry after a failed redeem may rotate it. */
+    llmClientId: varchar("llm_client_id", { length: 100 }),
+    createdBy: varchar("created_by", { length: 255 }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    redeemedAt: timestamp("redeemed_at", { withTimezone: true }),
+    redeemedIp: varchar("redeemed_ip", { length: 64 }),
+    redeemedCommit: varchar("redeemed_commit", { length: 40 }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("install_tokens_hash_idx").on(table.tokenHash),
+    index("install_tokens_project_idx").on(table.projectId),
+  ]
+);
