@@ -61,25 +61,19 @@ install.get("/", async (c) => {
 });
 
 /**
- * POST /api/redeem {token} — single use. Creates the project's API key and LLM proxy key
- * and returns everything setup.sh --docker needs. The token is only marked used in the
- * same transaction that stores the API key, so any failure before that leaves it retryable.
+ * Loads an install token and applies every precondition for redeeming it (valid, unused,
+ * not revoked or expired, project has no API key). Throws InstallError otherwise.
+ * Shared by token-info (read-only) and redeem, so both enforce exactly the same rules.
  */
-install.post("/api/redeem", async (c) => {
-  const ip = clientIp(c);
-  if (await limited(c.env, `redeem:${ip}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
+async function usableToken(db: Database, rawToken: unknown) {
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (!TOKEN_FORMAT.test(token)) throw new InstallError(404, "Unknown install token");
 
-  const body = await c.req.json<{ token?: unknown }>().catch(() => null);
-  const token = typeof body?.token === "string" ? body.token.trim() : "";
-  if (!TOKEN_FORMAT.test(token)) return c.text("Unknown install token", 404);
-
-  const db = c.var.db;
   const [row] = await db
     .select({
       id: installTokens.id,
       installName: installTokens.installName,
       llmBudgetCents: installTokens.llmBudgetCents,
-      llmClientId: installTokens.llmClientId,
       createdBy: installTokens.createdBy,
       expiresAt: installTokens.expiresAt,
       redeemedAt: installTokens.redeemedAt,
@@ -94,10 +88,10 @@ install.post("/api/redeem", async (c) => {
     .where(eq(installTokens.tokenHash, await sha256Hex(token)))
     .limit(1);
 
-  if (!row) return c.text("Unknown install token", 404);
-  if (row.revokedAt) return c.text("This install token was revoked", 410);
-  if (row.redeemedAt) return c.text("This install token was already used", 410);
-  if (row.expiresAt.getTime() < Date.now()) return c.text("This install token has expired", 410);
+  if (!row) throw new InstallError(404, "Unknown install token");
+  if (row.revokedAt) throw new InstallError(410, "This install token was revoked");
+  if (row.redeemedAt) throw new InstallError(410, "This install token was already used");
+  if (row.expiresAt.getTime() < Date.now()) throw new InstallError(410, "This install token has expired");
 
   const [active] = await db
     .select({ id: apiKeys.id })
@@ -105,11 +99,48 @@ install.post("/api/redeem", async (c) => {
     .where(and(eq(apiKeys.projectId, row.projectId), eq(apiKeys.isActive, true)))
     .limit(1);
   if (active) {
-    return c.text("This project already has an active API key. Revoke it in the super-admin console, then generate a new install token.", 409);
+    throw new InstallError(
+      409,
+      "This project already has an active API key. Revoke it in the super-admin console, then generate a new install token."
+    );
   }
+  return row;
+}
+
+/**
+ * POST /api/token-info {token} — checks a token without using it, so the installer can
+ * prepare the install folder before spending the one-time token.
+ */
+install.post("/api/token-info", async (c) => {
+  if (await limited(c.env, `token-info:${clientIp(c)}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
+  const body = await c.req.json<{ token?: unknown }>().catch(() => null);
+  const row = await usableToken(c.var.db, body?.token);
+  return c.text(envLines({ INSTALL_NAME: row.installName }));
+});
+
+/**
+ * POST /api/redeem {token} — single use. Creates the project's API key and LLM proxy key
+ * and returns everything setup.sh --docker needs. The token is only marked used in the
+ * same transaction that stores the API key, so any failure before that leaves it retryable.
+ */
+install.post("/api/redeem", async (c) => {
+  const ip = clientIp(c);
+  if (await limited(c.env, `redeem:${ip}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
+
+  const body = await c.req.json<{ token?: unknown }>().catch(() => null);
+  const db = c.var.db;
+  const row = await usableToken(db, body?.token);
+
+  // An existing LLM proxy client may be reused only if this project's own install tokens created it
+  // (e.g. an earlier redeem whose install then failed); anyone else's client is never touched.
+  const [ownClient] = await db
+    .select({ id: installTokens.id })
+    .from(installTokens)
+    .where(and(eq(installTokens.projectId, row.projectId), eq(installTokens.llmClientId, row.installName)))
+    .limit(1);
 
   const sha = await latestCommit(c.env);
-  const { proxyKey, created } = await issueProxyKey(c.env, row.installName, row.llmBudgetCents, row.llmClientId === row.installName);
+  const { proxyKey, created } = await issueProxyKey(c.env, row.installName, row.llmBudgetCents, !!ownClient);
   if (created) {
     await db.update(installTokens).set({ llmClientId: row.installName }).where(eq(installTokens.id, row.id));
   }

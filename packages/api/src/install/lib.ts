@@ -130,7 +130,7 @@ async function proxyAdmin(env: Env, path: string, body: unknown): Promise<Respon
 
 /**
  * Creates the project's LLM proxy client and returns its key (shown nowhere, sent only to the VM).
- * `mayRotate`: this token already created the client on an earlier, failed redeem — rotating is safe.
+ * `mayRotate`: this project's own install token created the client earlier (an install that failed) — safe to rotate.
  * Budget 0 means unlimited, which llm-proxy spells null (0 would block every call).
  */
 export async function issueProxyKey(
