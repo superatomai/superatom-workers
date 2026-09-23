@@ -4,7 +4,7 @@ import { organizations, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, superAdminOnly, orgScopeGuard } from "../middleware/auth";
 import { validatePassword } from "../lib/password-policy";
-import { createOrgSecret } from "../lib/org-secrets";
+import { createOrgSecret, createSdkSecret, deleteSdkSecret, getSdkSecret } from "../lib/org-secrets";
 
 const orgs = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -197,6 +197,73 @@ orgs.put("/:orgId", authMiddleware, adminOnly, orgScopeGuard, async (c) => {
   }
 
   return c.json(updated);
+});
+
+/**
+ * SDK secret — the key a customer's backend signs its users' tokens with for
+ * /auth/sdk/exchange (see routes/sdk-auth.ts). super_admin only: whoever holds it
+ * can sign in as any user of the org through the SDK.
+ */
+async function orgExists(db: AppVariables["db"], orgId: string): Promise<boolean> {
+  const [org] = await db
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  return !!org;
+}
+
+/**
+ * GET /orgs/:orgId/sdk-secret
+ * Whether SDK sign-in is enabled for the org. Never returns the secret.
+ */
+orgs.get("/:orgId/sdk-secret", authMiddleware, superAdminOnly, async (c) => {
+  const orgId = c.req.param("orgId");
+  if (!(await orgExists(c.get("db"), orgId))) return c.json({ error: "Organization not found" }, 404);
+  try {
+    return c.json({ enabled: !!(await getSdkSecret(c.env.JWT_SECRETS, orgId)) });
+  } catch (error) {
+    console.error("[orgs] SDK secret lookup failed:", error);
+    return c.json({ error: "Could not read the SDK secret, please try again" }, 503);
+  }
+});
+
+/**
+ * POST /orgs/:orgId/sdk-secret
+ * Create the org's SDK secret, or rotate it if one exists. Returns the secret
+ * ONCE — it cannot be read back; hand it to the customer securely. After a
+ * rotation the old secret stops working within about two minutes.
+ */
+orgs.post("/:orgId/sdk-secret", authMiddleware, superAdminOnly, async (c) => {
+  const orgId = c.req.param("orgId");
+  if (!(await orgExists(c.get("db"), orgId))) return c.json({ error: "Organization not found" }, 404);
+  try {
+    const rotated = !!(await getSdkSecret(c.env.JWT_SECRETS, orgId));
+    const secret = await createSdkSecret(c.env.JWT_SECRETS, orgId);
+    console.log(`[orgs] SDK secret ${rotated ? "rotated" : "created"}: org=${orgId} by=${c.get("userId")}`);
+    return c.json({ secret, rotated }, rotated ? 200 : 201);
+  } catch (error) {
+    console.error("[orgs] could not store the SDK secret:", error);
+    return c.json({ error: "Could not store the SDK secret, please try again" }, 503);
+  }
+});
+
+/**
+ * DELETE /orgs/:orgId/sdk-secret
+ * Turn SDK sign-in off for the org. Users already signed in keep access until
+ * their token expires (at most 15 minutes).
+ */
+orgs.delete("/:orgId/sdk-secret", authMiddleware, superAdminOnly, async (c) => {
+  const orgId = c.req.param("orgId");
+  if (!(await orgExists(c.get("db"), orgId))) return c.json({ error: "Organization not found" }, 404);
+  try {
+    await deleteSdkSecret(c.env.JWT_SECRETS, orgId);
+    console.log(`[orgs] SDK secret deleted: org=${orgId} by=${c.get("userId")}`);
+    return c.json({ enabled: false });
+  } catch (error) {
+    console.error("[orgs] could not delete the SDK secret:", error);
+    return c.json({ error: "Could not delete the SDK secret, please try again" }, 503);
+  }
 });
 
 export default orgs;

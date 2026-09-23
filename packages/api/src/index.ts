@@ -23,6 +23,16 @@ import analyticsRoutes from "./routes/analytics";
 import speechRoutes from "./routes/speech";
 import answerFeedbackRoutes from "./routes/answer-feedback";
 import feedbackRoutes from "./routes/product-feedback";
+import sdkAuthRoutes from "./routes/sdk-auth";
+
+/**
+ * SDK sign-in is called from CUSTOMER sites, whose origins we do not know. It is
+ * safe to answer any origin here and only here: the endpoint reads no cookies and
+ * is authenticated solely by the signed customer token in the body, so a page on
+ * another site gains nothing it could not do from a server anyway. Every other
+ * route keeps the first-party allowlist below.
+ */
+const SDK_EXCHANGE_PATH = "/auth/sdk/exchange";
 
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -54,6 +64,8 @@ app.use(
       // Non-browser callers (curl, server-to-server) send no Origin at all —
       // CORS is irrelevant to them, so there is nothing to allow or deny.
       if (!origin) return undefined;
+
+      if (c.req.path === SDK_EXCHANGE_PATH) return origin;
 
       // Returning undefined omits Access-Control-Allow-Origin, so the browser
       // blocks the response. allowHeaders/allowMethods stay at Hono's defaults,
@@ -88,6 +100,7 @@ app.get("/health", (c) =>
 app.route("/auth", authRoutes);
 app.route("/auth/sso", ssoRoutes);
 app.route("/auth/sso/saml", samlRoutes);
+app.route("/auth/sdk", sdkAuthRoutes);
 app.route("/auth", bootstrapRoutes);
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);

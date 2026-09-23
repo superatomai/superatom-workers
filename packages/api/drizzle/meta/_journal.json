@@ -85,6 +85,13 @@
       "when": 1790063013440,
       "tag": "0011_install_tokens",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790158544337,
+      "tag": "0012_external_roles",
+      "breakpoints": true
     }
   ]
 }

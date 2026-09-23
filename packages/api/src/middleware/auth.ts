@@ -16,6 +16,8 @@ export type AuthResult =
       role: AppVariables["userRole"];
       /** The login session (refresh-token family) the token belongs to; null for pre-`sid` tokens. */
       sessionId: string | null;
+      /** "sdk" for a token from the SDK exchange (always acts as a member); "app" otherwise. */
+      tokenSource: AppVariables["tokenSource"];
     }
   | { ok: false; status: 401 | 503; error: string };
 
@@ -74,6 +76,7 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
   let userId: string;
   let issuedAt: number | undefined;
   let sessionId: string | null;
+  let tokenSource: AppVariables["tokenSource"];
   try {
     // Pin the algorithm so the token header cannot choose how it is verified.
     const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
@@ -89,6 +92,8 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     if (payload.sid !== undefined && (!sessionId || !UUID.test(sessionId))) {
       return { ok: false, status: 401, error: "Invalid token payload" };
     }
+    // Set only by the SDK exchange, inside a token signed with our own key.
+    tokenSource = payload.src === "sdk" ? "sdk" : "app";
   } catch {
     return { ok: false, status: 401, error: "Invalid or expired token" };
   }
@@ -170,7 +175,22 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     return { ok: false, status: 401, error: "Invalid account state" };
   }
 
-  return { ok: true, userId, orgId: user.orgId, role: user.role, sessionId };
+  // An SDK session keeps the role we hold for the user, so promoting someone in
+  // the platform also gives them the admin VIEW inside the customer's app. What
+  // it cannot do is CHANGE the org: adminOnly and superAdminOnly refuse anything
+  // but a read from an SDK token (see below).
+  //
+  // Why reads but not writes: the customer's backend chooses which user their
+  // token names, so whoever holds the SDK secret can sign in as any user of
+  // their own org, an org_admin included. Reading that org's own data is what
+  // the SDK is for; creating users or rotating keys is not.
+  //
+  // A super_admin belongs to no single org and never arrives this way.
+  if (tokenSource === "sdk" && (user.role === "super_admin" || !user.orgId)) {
+    return { ok: false, status: 401, error: "Invalid token payload" };
+  }
+
+  return { ok: true, userId, orgId: user.orgId, role: user.role, sessionId, tokenSource };
 }
 
 /** JWT auth middleware — see authenticateRequest. */
@@ -187,6 +207,7 @@ export const authMiddleware = createMiddleware<{
   c.set("orgId", result.orgId);
   c.set("userRole", result.role);
   c.set("sessionId", result.sessionId);
+  c.set("tokenSource", result.tokenSource);
 
   await next();
 });
@@ -203,8 +224,21 @@ export const adminOnly = createMiddleware<{
   if (role !== "org_admin" && role !== "super_admin") {
     return c.json({ error: "Forbidden: admin role required" }, 403);
   }
+  if (isSdkWrite(c)) {
+    return c.json({ error: "Not available to SDK sessions" }, 403);
+  }
   await next();
 });
+
+/**
+ * A change requested with an SDK token. An admin signed in through a customer's
+ * app may READ everything their role allows, but the org's setup — users,
+ * projects, SSO, API keys — changes only from a real login on our platform,
+ * because the customer's backend decides which user their token names.
+ */
+function isSdkWrite(c: { get: (k: "tokenSource") => AppVariables["tokenSource"]; req: { method: string } }): boolean {
+  return c.get("tokenSource") === "sdk" && c.req.method !== "GET" && c.req.method !== "HEAD";
+}
 
 /**
  * Middleware that requires the user to be a super_admin.
@@ -217,6 +251,10 @@ export const superAdminOnly = createMiddleware<{
   const role = c.get("userRole");
   if (role !== "super_admin") {
     return c.json({ error: "Forbidden: super_admin role required" }, 403);
+  }
+  // Belt and braces: a super_admin cannot reach here through the SDK anyway.
+  if (c.get("tokenSource") === "sdk") {
+    return c.json({ error: "Not available to SDK sessions" }, 403);
   }
   await next();
 });

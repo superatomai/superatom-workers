@@ -69,7 +69,23 @@ export const users = pgTable(
     ssoSubject: varchar("sso_subject", { length: 500 }),
     role: userRoleEnum("role").default("member").notNull(),
     isActive: boolean("is_active").default(true).notNull(),
+    /**
+     * Data-access config: row filters the relay stamps on every request.
+     *
+     * For SDK sign-ins it is written from the token's `access` claim
+     * (routes/sdk-auth.ts): turned into row filters when the project has an
+     * `sdkAccessMapping`, otherwise stored exactly as the customer sent it
+     * (e.g. {"customerId":[41306]}) — visible, and nothing enforces it until a
+     * mapping exists, which is what an unmapped claim means anyway.
+     */
     config: jsonb("config"), // free-form per-user config
+    /**
+     * The user's role names in the CUSTOMER's own system (e.g. ["sales_manager"]),
+     * as sent in the `roles` claim of an SDK sign-in. A list, since a user can hold
+     * several. Stored only: it never grants our permissions — `role` above alone
+     * decides those. Nullable — NULL for users who never signed in through the SDK.
+     */
+    externalRoles: jsonb("external_roles").$type<string[]>(),
     /**
      * Session revocation cutoff: tokens issued before this instant are rejected.
      * This is what makes logout actually invalidate a JWT rather than merely

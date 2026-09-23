@@ -413,14 +413,19 @@ auth.get("/me", authMiddleware, async (c) => {
     return c.json({ error: "User not found" }, 404);
   }
 
+  // The role this session acts with (authMiddleware): the stored role, except an
+  // SDK session, which is always a member — so it neither sees an admin's app list
+  // nor reports an admin role.
+  const role = c.get("userRole");
+
   // Super admin: no org, no app list
-  if (user.role === "super_admin") {
+  if (role === "super_admin") {
     return c.json({
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
-        role: user.role,
+        role,
         config: user.config,
       },
       organization: null,
@@ -438,7 +443,7 @@ auth.get("/me", authMiddleware, async (c) => {
 
   // Get permitted apps
   let permittedApps;
-  if (user.role === "org_admin") {
+  if (role === "org_admin") {
     // Admin sees all active apps in the org
     permittedApps = await db
       .select({
@@ -506,7 +511,7 @@ auth.get("/me", authMiddleware, async (c) => {
       id: user.id,
       email: user.email,
       name: user.name,
-      role: user.role,
+      role,
       config: user.config,
     },
     organization: org

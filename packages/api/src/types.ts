@@ -79,4 +79,6 @@ export type AppVariables = {
   userRole: "super_admin" | "org_admin" | "member";
   /** The caller's login session (refresh-token family), from the token's `sid`; null for older tokens. */
   sessionId: string | null;
+  /** "sdk" when the token came from the SDK exchange — such a session always acts as a member. */
+  tokenSource: "app" | "sdk";
 };

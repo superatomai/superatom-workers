@@ -28,11 +28,17 @@ export const ACCESS_TOKEN_TTL = "15m";
  * `sid` claim. It lets logout end one session: verifiers reject a token whose
  * family has been revoked (see sessionAliveSql). Every login and refresh passes
  * one; the parameter is optional only for type-compatibility.
+ *
+ * `src: "sdk"` marks a token issued by the SDK exchange (routes/sdk-auth.ts).
+ * Verifiers treat such a session as a `member` whatever the user's role in the
+ * database, so a customer-signed sign-in can never reach admin actions. The claim
+ * is ours: it is signed with `org:<orgId>`, which the customer does not hold.
  */
 export async function mintAccessToken(
   user: { id: string; orgId: string | null; role: string },
   jwtSecrets: KVNamespace,
-  sessionId?: string
+  sessionId?: string,
+  src?: "sdk"
 ): Promise<string> {
   const secret = await getOrgSecret(jwtSecrets, user.orgId);
   if (!secret) throw new MissingOrgSecretError(user.orgId);
@@ -42,6 +48,7 @@ export async function mintAccessToken(
     orgId: user.orgId,
     role: user.role,
     ...(sessionId ? { sid: sessionId } : {}),
+    ...(src ? { src } : {}),
   })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
