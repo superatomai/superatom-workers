@@ -39,7 +39,7 @@ import { users, projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { getOrgSecret, getSdkSecret } from "../lib/org-secrets";
 import { mintAccessToken } from "../lib/access-token";
-import { readAccessMapping, buildAccessConfig, unmappedWarning, type AccessMapping } from "../lib/sdk-access";
+import { readAccessDefaults, buildFiltersConfig, sendsFilters, type AccessDefaults } from "../lib/sdk-access";
 
 const sdkAuth = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -58,9 +58,6 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 /** Bounds on the optional `roles` claim, so a bad token cannot fill the database. */
 const MAX_ROLES = 20;
 const MAX_ROLE_LENGTH = 100;
-
-/** Longest `access` claim (as JSON) we store, so a bad token cannot fill the column. */
-const MAX_ACCESS_LENGTH = 8000;
 
 /**
  * The customer's `roles` claim as a clean list, or null if it is malformed.
@@ -105,9 +102,15 @@ function sameJson(a: unknown, b: unknown): boolean {
   return JSON.stringify(canonical(a ?? null)) === JSON.stringify(canonical(b ?? null));
 }
 
+/**
+ * `reason` also goes back to the caller as `code`. The SDK needs to tell apart
+ * "this user's session ended" from "this token was built wrong" — the first is
+ * something to tell the user, the second is for whoever wrote the integration —
+ * and it cannot do that from the message alone.
+ */
 function reject(c: any, status: 400 | 401 | 403 | 503, error: string, reason: string, detail = "") {
   console.warn(`[sdk-auth] exchange rejected: reason=${reason}${detail ? " " + detail : ""}`);
-  return c.json({ error }, status);
+  return c.json({ error, code: reason }, status);
 }
 
 sdkAuth.post("/exchange", async (c) => {
@@ -218,38 +221,30 @@ sdkAuth.post("/exchange", async (c) => {
     );
   }
 
-  // Which data they may see: the `access` claim's values, placed on the tables
-  // and columns the project's mapping names (lib/sdk-access.ts). A project with
-  // no mapping has SDK access filtering off, and its users' config is left alone.
-  let mapping: AccessMapping | null;
+  // Which data they may see: the customer writes the filters, since they know
+  // their own schema (lib/sdk-access.ts). We add only the source id and a
+  // fallback label, from the project's `sdkAccess`.
+  let accessDefaults: AccessDefaults;
   try {
-    mapping = readAccessMapping(project.config);
+    accessDefaults = readAccessDefaults(project.config);
   } catch (error) {
     // Our configuration, not their token.
-    return reject(c, 503, "Sign-in service unavailable", "access_mapping_invalid", `project=${projectId} ${(error as Error).message}`);
+    return reject(c, 503, "Sign-in service unavailable", "access_config_invalid", `project=${projectId} ${(error as Error).message}`);
   }
   let accessConfig: unknown = null;
-  const warnings: string[] = [];
-  const sentAccess =
-    payload.access && typeof payload.access === "object" && !Array.isArray(payload.access) ? payload.access : null;
-  if (mapping) {
-    const access = buildAccessConfig(payload.access, mapping);
+  if (payload.access !== undefined && payload.access !== null) {
+    if (!sendsFilters(payload.access)) {
+      return reject(
+        c,
+        401,
+        'access must be a list of filters, e.g. [{ "table": "orders", "column": "customer_id", "op": "in", "values": [12] }]',
+        "bad_access",
+        `org=${orgId}`
+      );
+    }
+    const access = buildFiltersConfig(payload.access, accessDefaults);
     if (!access.ok) return reject(c, 401, access.error, access.reason, `org=${orgId}`);
     accessConfig = access.config;
-    warnings.push(...access.warnings);
-  } else if (sentAccess) {
-    // No mapping yet (they come at onboarding): nothing can be enforced, so the
-    // claim is stored exactly as sent — visible, and ready to be mapped later.
-    const names = Object.keys(sentAccess);
-    if (names.length) warnings.push(unmappedWarning(names));
-    if (JSON.stringify(sentAccess).length <= MAX_ACCESS_LENGTH) {
-      accessConfig = sentAccess;
-    } else {
-      warnings.push(`access is larger than ${MAX_ACCESS_LENGTH} characters, so it was not stored`);
-    }
-  }
-  if (warnings.length) {
-    console.warn(`[sdk-auth] exchange warning: project=${projectId} ${warnings.join("; ")}`);
   }
   const configUpdate = { config: accessConfig };
 
@@ -342,9 +337,6 @@ sdkAuth.post("/exchange", async (c) => {
       role: user.role,
       externalRoles: roles,
     },
-    // Things in their token we accepted but could not apply, e.g. an access
-    // field not mapped yet. Present only when there are any.
-    ...(warnings.length ? { warnings } : {}),
   });
 });
 

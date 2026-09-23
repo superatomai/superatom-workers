@@ -73,10 +73,10 @@ export const users = pgTable(
      * Data-access config: row filters the relay stamps on every request.
      *
      * For SDK sign-ins it is written from the token's `access` claim
-     * (routes/sdk-auth.ts): turned into row filters when the project has an
-     * `sdkAccessMapping`, otherwise stored exactly as the customer sent it
-     * (e.g. {"customerId":[41306]}) — visible, and nothing enforces it until a
-     * mapping exists, which is what an unmapped claim means anyway.
+     * (routes/sdk-auth.ts): the customer sends the row filters themselves, and
+     * we add only the source id and a fallback label from the project's
+     * `sdkAccess`. Overwritten on every sign-in, so their side stays the source
+     * of truth.
      */
     config: jsonb("config"), // free-form per-user config
     /**

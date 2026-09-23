@@ -3,55 +3,34 @@
  * the user's `users.config`, which the relay stamps onto every message and the
  * backend enforces by rewriting SQL.
  *
- * The customer sends only VALUES, in their own terms:
+ * The customer writes the filters — they know their own schema:
  *
- *   "access": { "customerId": [12, 15], "locationId": 9 }
+ *   "access": [
+ *     { "table": "com_trn_documentstamp", "column": "LocationId", "op": "in",
+ *       "values": [5, 117, 127], "label": "Bhubaneshwar region" }
+ *   ]
  *
- * Each name IS the column it filters, so a token reads the same as the data.
- * Which source and table it lives in is agreed at onboarding and stored on the
- * project, never taken from the token — schema details are not per-user, and a
- * bug on their side must not be able to point a filter at a different column:
- *
- *   projects.config.sdkAccessMapping = {
- *     "customerId": { "sourceId": "mssql-…", "table": "orders", "column": "customerId" },
- *     "locationId": [ { …documents… }, { …stock… } ]   // the same column in several tables
- *   }
- *
- * `column` must equal the field name — a mapping that points elsewhere is refused
- * as a configuration fault. A column that is named differently in another table
- * therefore needs its own field name.
- *
- * The result follows the config interface the backend reads
- * (sdk-nodejs `policiesFromConfig`): an array of
- * `{ sourceId, rowFilters: [{ table, column, op, values, label }] }`, one entry per source.
+ * We add only what is ours to know: the source id, and a fallback label, from
+ * `projects.config.sdkAccess`. The result follows the config interface the
+ * backend reads (sdk-nodejs `policiesFromConfig`):
+ * `[{ sourceId, rowFilters: [{ table, column, op, values, label }] }]`.
  *
  * Rules:
- *  - Only the names the token sends become filters; a name it leaves out is not
- *    restricted, and no `access` at all means no restriction (config null).
- *  - Anything malformed rejects the sign-in rather than being dropped: the
- *    backend silently drops a bad filter, which would leave the user unrestricted.
- *    That includes an empty list — "no customers" must not read as "all customers".
- *  - A name not in the project's mapping restricts nothing, and does not block
- *    the sign-in: mappings are set up at onboarding, often after the customer
- *    has started sending `access`. It is reported back as a warning instead.
+ *  - No `access`, or an empty list, means no restriction (config null).
+ *  - Anything malformed refuses the sign-in rather than being dropped: the
+ *    backend silently ignores a filter with no column or no values, which would
+ *    leave the user unrestricted. An empty `values` list is refused for the same
+ *    reason — "no customers" must not end up meaning "all customers".
  */
 
-const OPS = ["in", "not_in"] as const;
+/**
+ * Every operator the SQL rewriter supports. `eq`/`ne` compare against a single
+ * value — the rewriter uses `values[0]` — so more than one value with them is
+ * refused rather than silently trimmed.
+ */
+const OPS = ["in", "not_in", "eq", "ne"] as const;
 type Op = (typeof OPS)[number];
-
-/** Where one access name applies in the customer's data. */
-export interface AccessTarget {
-  /** Source the filter applies to; absent means every source. */
-  sourceId?: string;
-  table: string;
-  column: string;
-  /** Default "in". */
-  op?: Op;
-  /** How the restriction is described to the user, e.g. "Assigned customers". */
-  label?: string;
-}
-
-export type AccessMapping = Record<string, AccessTarget[]>;
+const SINGLE_VALUE_OPS: readonly Op[] = ["eq", "ne"];
 
 /** Mirrors sdk-nodejs `RowFilter` / `SourcePolicy`. */
 interface RowFilter {
@@ -70,48 +49,36 @@ interface SourcePolicy {
 const MAX_VALUES = 1000;
 const MAX_VALUE_LENGTH = 200;
 const MAX_NAME_LENGTH = 100;
+/** Filters one token may carry when the customer sends them itself. */
+const MAX_FILTERS = 50;
 
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 
-/**
- * The project's mapping: null when the project has none (SDK access is not set
- * up), or throws when it is malformed — a configuration fault on our side.
- */
-export function readAccessMapping(projectConfig: unknown): AccessMapping | null {
-  const raw = (projectConfig as Record<string, unknown> | null)?.sdkAccessMapping;
-  if (raw === undefined || raw === null) return null;
-  if (typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("sdkAccessMapping must be an object");
-  }
-
-  const mapping: AccessMapping = {};
-  for (const [name, value] of Object.entries(raw)) {
-    const list = Array.isArray(value) ? value : [value];
-    if (list.length === 0) throw new Error(`sdkAccessMapping.${name} is empty`);
-    mapping[name] = list.map((t, i) => {
-      const where = `sdkAccessMapping.${name}${Array.isArray(value) ? `[${i}]` : ""}`;
-      if (!t || typeof t !== "object") throw new Error(`${where} must be an object`);
-      const { sourceId, table, column, op, label } = t as Record<string, unknown>;
-      if (!nonEmpty(table) || !nonEmpty(column)) throw new Error(`${where} needs table and column`);
-      // The field name IS the column name: what the customer sends reads the same
-      // as the data it filters, and nobody has to remember a second vocabulary.
-      if (column.trim() !== name) {
-        throw new Error(`${where}.column must be "${name}" — the access field name is the column name`);
-      }
-      if (sourceId !== undefined && !nonEmpty(sourceId)) throw new Error(`${where}.sourceId must be a string`);
-      if (op !== undefined && !OPS.includes(op as Op)) throw new Error(`${where}.op must be one of ${OPS.join(", ")}`);
-      if (label !== undefined && !nonEmpty(label)) throw new Error(`${where}.label must be a string`);
-      return {
-        ...(sourceId ? { sourceId: sourceId.trim() } : {}),
-        table: table.trim(),
-        column: column.trim(),
-        op: (op as Op | undefined) ?? "in",
-        ...(label ? { label: label.trim() } : {}),
-      };
-    });
-  }
-  return mapping;
+/** What the project adds to filters the customer sent: ours to know, not theirs. */
+export interface AccessDefaults {
+  /** Source the filters apply to; absent means every source. */
+  sourceId?: string;
+  /** Fallback label for a filter that came without one. */
+  label?: string;
 }
+
+/**
+ * `projects.config.sdkAccess` — used with the `filters` shape. Throws when it is
+ * malformed, a configuration fault on our side.
+ */
+export function readAccessDefaults(projectConfig: unknown): AccessDefaults {
+  const raw = (projectConfig as Record<string, unknown> | null)?.sdkAccess;
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error("sdkAccess must be an object");
+  const { sourceId, label } = raw as Record<string, unknown>;
+  if (sourceId !== undefined && !nonEmpty(sourceId)) throw new Error("sdkAccess.sourceId must be a string");
+  if (label !== undefined && !nonEmpty(label)) throw new Error("sdkAccess.label must be a string");
+  return {
+    ...(sourceId ? { sourceId: (sourceId as string).trim() } : {}),
+    ...(label ? { label: (label as string).trim() } : {}),
+  };
+}
+
 
 /** One value or a list, as a clean list; null if malformed. */
 function parseValues(value: unknown): (string | number)[] | null {
@@ -133,52 +100,74 @@ export type AccessResult =
   | { ok: true; config: SourcePolicy[] | null; warnings: string[] }
   | { ok: false; reason: string; error: string };
 
-/** Warning for access names the project has no mapping for. */
-export function unmappedWarning(names: string[]): string {
-  const list = names.map((n) => `access.${n.slice(0, MAX_NAME_LENGTH)}`).join(", ");
-  return `${list} ${names.length === 1 ? "is" : "are"} not set up for this project yet, so not applied`;
+/** True when the token sends filters rather than values for us to map. */
+export function sendsFilters(access: unknown): boolean {
+  return Array.isArray(access);
 }
 
 /**
- * The user's config from the `access` claim and the project's mapping (empty
- * when the project has none).
+ * The user's config from filters the CUSTOMER wrote. They know their schema, so
+ * table, column, op and values come from the token; the source id is ours, and a
+ * filter without a label gets one so the assistant does not read SQL aloud.
+ *
+ * Everything is checked: a filter the backend would silently drop — no column, no
+ * values — must refuse the sign-in instead, or the user ends up unrestricted.
  */
-export function buildAccessConfig(access: unknown, mapping: AccessMapping): AccessResult {
-  if (access === undefined || access === null) return { ok: true, config: null, warnings: [] };
-  if (typeof access !== "object" || Array.isArray(access)) {
-    return { ok: false, reason: "bad_access", error: "access must be an object, e.g. { \"customerId\": [12] }" };
+export function buildFiltersConfig(access: unknown, defaults: AccessDefaults): AccessResult {
+  const raw = access as unknown[];
+  if (raw.length === 0) return { ok: true, config: null, warnings: [] };
+  if (raw.length > MAX_FILTERS) {
+    return { ok: false, reason: "bad_access_filters", error: `access must hold at most ${MAX_FILTERS} filters` };
   }
 
-  const bySource = new Map<string, SourcePolicy>();
-  const unmapped: string[] = [];
-  for (const [name, value] of Object.entries(access)) {
-    const targets = mapping[name];
-    if (!targets) {
-      unmapped.push(name);
-      continue;
+  const rowFilters: RowFilter[] = [];
+  for (const [i, entry] of raw.entries()) {
+    const where = `access[${i}]`;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return { ok: false, reason: "bad_access_filters", error: `${where} must be an object` };
     }
-    const values = parseValues(value);
-    if (!values) {
+    const { table, column, op, values, label } = entry as Record<string, unknown>;
+
+    if (!nonEmpty(table) || table.trim().length > MAX_NAME_LENGTH) {
+      return { ok: false, reason: "bad_access_filters", error: `${where}.table is required` };
+    }
+    if (!nonEmpty(column) || column.trim().length > MAX_NAME_LENGTH) {
+      return { ok: false, reason: "bad_access_filters", error: `${where}.column is required` };
+    }
+    if (op !== undefined && !OPS.includes(op as Op)) {
+      return { ok: false, reason: "bad_access_filters", error: `${where}.op must be one of ${OPS.join(", ")}` };
+    }
+    const parsed = parseValues(values);
+    if (!parsed) {
       return {
         ok: false,
-        reason: "bad_access_values",
-        error: `access.${name.slice(0, MAX_NAME_LENGTH)} must be a value or a list of 1–${MAX_VALUES} values (strings or numbers)`,
+        reason: "bad_access_filters",
+        error: `${where}.values must be a value or a list of 1–${MAX_VALUES} values (strings or numbers)`,
       };
     }
-    for (const t of targets) {
-      const key = t.sourceId ?? "";
-      if (!bySource.has(key)) bySource.set(key, { ...(t.sourceId ? { sourceId: t.sourceId } : {}), rowFilters: [] });
-      bySource.get(key)!.rowFilters.push({
-        table: t.table,
-        column: t.column,
-        op: t.op ?? "in",
-        values,
-        // Without a label the agent describes the restriction as a raw SQL predicate.
-        label: t.label ?? `${name} ${values.join(", ")}`,
-      });
+    if (label !== undefined && (!nonEmpty(label) || label.trim().length > MAX_VALUE_LENGTH)) {
+      return { ok: false, reason: "bad_access_filters", error: `${where}.label must be a short string` };
     }
+    if (SINGLE_VALUE_OPS.includes((op as Op) ?? "in") && parsed.length !== 1) {
+      return {
+        ok: false,
+        reason: "bad_access_filters",
+        error: `${where}.op "${op}" takes exactly one value — use "in" or "not_in" for several`,
+      };
+    }
+
+    rowFilters.push({
+      table: table.trim(),
+      column: column.trim(),
+      op: (op as Op | undefined) ?? "in",
+      values: parsed,
+      label: (label as string | undefined)?.trim() || defaults.label || `${column.trim()} ${parsed.join(", ")}`,
+    });
   }
 
-  const config = [...bySource.values()];
-  return { ok: true, config: config.length ? config : null, warnings: unmapped.length ? [unmappedWarning(unmapped)] : [] };
+  return {
+    ok: true,
+    config: [{ ...(defaults.sourceId ? { sourceId: defaults.sourceId } : {}), rowFilters }],
+    warnings: [],
+  };
 }
