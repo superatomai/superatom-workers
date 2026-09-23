@@ -4,7 +4,7 @@ import { organizations, projects, users } from "../../db/schema";
 import type { Env } from "../../types";
 import type { SuperAdminVariables } from "../types";
 import { validatePassword } from "../../lib/password-policy";
-import { createOrgSecret } from "../../lib/org-secrets";
+import { createOrgSecret, createSdkSecret, deleteSdkSecret, getSdkSecret } from "../../lib/org-secrets";
 import {
   cleanEmail,
   cleanName,
@@ -101,6 +101,76 @@ orgs.get("/:orgId", async (c) => {
   const [org] = await c.var.db.select(orgSummary).from(organizations).where(eq(organizations.id, orgId)).limit(1);
   if (!org) return c.json({ error: "Organization not found" }, 404);
   return c.json({ organization: org });
+});
+
+/**
+ * SDK sign-in for an org — the secret its customer's backend signs user tokens
+ * with (see routes/sdk-auth.ts). It lives in KV, not the database, and is
+ * returned only when it is created: we keep no copy to show later.
+ */
+async function findOrg(db: SuperAdminVariables["db"], orgId: string) {
+  if (!isUuid(orgId)) return null;
+  const [org] = await db
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  return org ?? null;
+}
+
+/** GET /api/orgs/:orgId/sdk-secret — whether SDK sign-in is on. Never the secret itself. */
+orgs.get("/:orgId/sdk-secret", async (c) => {
+  const org = await findOrg(c.var.db, c.req.param("orgId"));
+  if (!org) return c.json({ error: "Organization not found" }, 404);
+  try {
+    return c.json({ enabled: !!(await getSdkSecret(c.env.JWT_SECRETS, org.id)) });
+  } catch (error) {
+    console.error("[superadmin] SDK secret lookup failed:", error);
+    return c.json({ error: "Could not read the SDK secret, please try again" }, 503);
+  }
+});
+
+/**
+ * POST /api/orgs/:orgId/sdk-secret — { rotate?: boolean }
+ * Returns the secret ONCE. Without `rotate`, an existing secret is a 409, so
+ * nobody replaces a live one by accident: rotating breaks every token the
+ * customer signs with the old key within about two minutes.
+ */
+orgs.post("/:orgId/sdk-secret", async (c) => {
+  const org = await findOrg(c.var.db, c.req.param("orgId"));
+  if (!org) return c.json({ error: "Organization not found" }, 404);
+  const body = await c.req.json<{ rotate?: unknown }>().catch(() => null);
+  const rotate = body?.rotate === true;
+
+  try {
+    const existing = !!(await getSdkSecret(c.env.JWT_SECRETS, org.id));
+    if (existing && !rotate) {
+      return c.json(
+        { error: "SDK sign-in is already enabled for this organization. Rotate it to issue a new secret.", code: "SECRET_EXISTS" },
+        409
+      );
+    }
+    const secret = await createSdkSecret(c.env.JWT_SECRETS, org.id);
+    console.log(`[superadmin] SDK secret ${existing ? "rotated" : "created"}: org=${org.id} by=${c.var.admin.email}`);
+    return c.json({ secret, rotated: existing }, existing ? 200 : 201);
+  } catch (error) {
+    console.error("[superadmin] could not store the SDK secret:", error);
+    return c.json({ error: "Could not store the SDK secret, please try again" }, 503);
+  }
+});
+
+/** DELETE /api/orgs/:orgId/sdk-secret — turn SDK sign-in off. Sessions already signed in last ≤ 15 min. */
+orgs.delete("/:orgId/sdk-secret", async (c) => {
+  const org = await findOrg(c.var.db, c.req.param("orgId"));
+  if (!org) return c.json({ error: "Organization not found" }, 404);
+  try {
+    await deleteSdkSecret(c.env.JWT_SECRETS, org.id);
+    console.log(`[superadmin] SDK secret deleted: org=${org.id} by=${c.var.admin.email}`);
+    return c.json({ ok: true });
+  } catch (error) {
+    console.error("[superadmin] could not delete the SDK secret:", error);
+    return c.json({ error: "Could not delete the SDK secret, please try again" }, 503);
+  }
 });
 
 export default orgs;
