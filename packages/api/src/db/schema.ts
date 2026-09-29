@@ -74,9 +74,9 @@ export const users = pgTable(
      *
      * For SDK sign-ins it is written from the token's `access` claim
      * (routes/sdk-auth.ts): the customer sends the row filters themselves, and
-     * we add only the source id and a fallback label from the project's
-     * `sdkAccess`. Overwritten on every sign-in, so their side stays the source
-     * of truth.
+     * we route each one to the data source that owns its table, using the
+     * project's `sdkAccess.sources`. Overwritten on every sign-in, so their side
+     * stays the source of truth.
      */
     config: jsonb("config"), // free-form per-user config
     /**

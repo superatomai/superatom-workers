@@ -10,13 +10,31 @@
  *       "values": [5, 117, 127], "label": "Bhubaneshwar region" }
  *   ]
  *
- * We add only what is ours to know: the source id, and a fallback label, from
- * `projects.config.sdkAccess`. The result follows the config interface the
- * backend reads (sdk-nodejs `policiesFromConfig`):
- * `[{ sourceId, rowFilters: [{ table, column, op, values, label }] }]`.
+ * We add what is ours to know and meaningless to them: which data source each
+ * table belongs to. A project lists its sources and the tables exposed for
+ * filtering in `projects.config.sdkAccess`:
+ *
+ *   "sdkAccess": {
+ *     "sources": [
+ *       { "sourceId": "mssql-722b9497", "label": "Warehouse DB",
+ *         "tables": ["com_trn_documentstamp", "com_mst_location"] },
+ *       { "sourceId": "athena-4f2c1a9b", "label": "Lany Summary",
+ *         "tables": ["shipment_summary"] }
+ *     ]
+ *   }
+ *
+ * Each filter is routed by its table, so a project with two databases gets one
+ * policy per source — the shape the backend reads (sdk-nodejs
+ * `policiesFromConfig`): `[{ sourceId, rowFilters: [...] }]`. Without that, one
+ * source id would have to cover every filter, and a query against any other
+ * source would match no policy at all and run unrestricted.
  *
  * Rules:
  *  - No `access`, or an empty list, means no restriction (config null).
+ *  - A table listed under several sources is filtered in all of them: over-
+ *    restricting is safe, guessing one and leaving the other open is not.
+ *  - A table listed under none is kept without a source id, which the backend
+ *    offers to every source. It still only fires where that table exists.
  *  - Anything malformed refuses the sign-in rather than being dropped: the
  *    backend silently ignores a filter with no column or no values, which would
  *    leave the user unrestricted. An empty `values` list is refused for the same
@@ -54,29 +72,73 @@ const MAX_FILTERS = 50;
 
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 
-/** What the project adds to filters the customer sent: ours to know, not theirs. */
-export interface AccessDefaults {
-  /** Source the filters apply to; absent means every source. */
-  sourceId?: string;
-  /** Fallback label for a filter that came without one. */
+/** One data source of a project, and the tables it exposes for filtering. */
+interface AccessSource {
+  sourceId: string;
+  /** Human name for whoever reads the config, e.g. "Warehouse DB". Not shown to users. */
   label?: string;
+  /** Table names, lower-cased for matching. */
+  tables: string[];
 }
 
+/** What the project knows and the customer does not: where each table lives. */
+export interface AccessDefaults {
+  sources: AccessSource[];
+}
+
+/** Bounds on the project's own config, so one bad edit cannot blow up a sign-in. */
+const MAX_SOURCES = 20;
+const MAX_TABLES_PER_SOURCE = 500;
+
 /**
- * `projects.config.sdkAccess` — used with the `filters` shape. Throws when it is
- * malformed, a configuration fault on our side.
+ * `projects.config.sdkAccess`. Throws when it is malformed — that is a fault in
+ * our configuration, not in the customer's token, and the caller answers 503
+ * rather than blaming them.
+ *
+ * A project with no `sdkAccess` is not an error: its filters simply carry no
+ * source id, which the backend offers to every source.
  */
 export function readAccessDefaults(projectConfig: unknown): AccessDefaults {
   const raw = (projectConfig as Record<string, unknown> | null)?.sdkAccess;
-  if (raw === undefined || raw === null) return {};
+  if (raw === undefined || raw === null) return { sources: [] };
   if (typeof raw !== "object" || Array.isArray(raw)) throw new Error("sdkAccess must be an object");
-  const { sourceId, label } = raw as Record<string, unknown>;
-  if (sourceId !== undefined && !nonEmpty(sourceId)) throw new Error("sdkAccess.sourceId must be a string");
-  if (label !== undefined && !nonEmpty(label)) throw new Error("sdkAccess.label must be a string");
+
+  const { sources } = raw as Record<string, unknown>;
+  if (sources === undefined || sources === null) return { sources: [] };
+  if (!Array.isArray(sources)) throw new Error("sdkAccess.sources must be a list");
+  if (sources.length > MAX_SOURCES) throw new Error(`sdkAccess.sources must hold at most ${MAX_SOURCES} sources`);
+
   return {
-    ...(sourceId ? { sourceId: (sourceId as string).trim() } : {}),
-    ...(label ? { label: (label as string).trim() } : {}),
+    sources: sources.map((entry, i) => {
+      const where = `sdkAccess.sources[${i}]`;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`${where} must be an object`);
+      const { sourceId, label, tables } = entry as Record<string, unknown>;
+
+      if (!nonEmpty(sourceId)) throw new Error(`${where}.sourceId is required`);
+      if (label !== undefined && !nonEmpty(label)) throw new Error(`${where}.label must be a string`);
+      if (!Array.isArray(tables)) throw new Error(`${where}.tables must be a list`);
+      if (tables.length > MAX_TABLES_PER_SOURCE) {
+        throw new Error(`${where}.tables must hold at most ${MAX_TABLES_PER_SOURCE} tables`);
+      }
+      for (const t of tables) {
+        if (!nonEmpty(t)) throw new Error(`${where}.tables must hold table names`);
+      }
+
+      return {
+        sourceId: sourceId.trim(),
+        ...(label ? { label: (label as string).trim() } : {}),
+        // Matching is case-insensitive: a customer writing "Orders" must hit a
+        // table we recorded as "orders".
+        tables: (tables as string[]).map((t) => t.trim().toLowerCase()),
+      };
+    }),
   };
+}
+
+/** The sources a table belongs to; empty when the project lists it nowhere. */
+function sourcesForTable(table: string, defaults: AccessDefaults): AccessSource[] {
+  const want = table.toLowerCase();
+  return defaults.sources.filter((s) => s.tables.includes(want));
 }
 
 
@@ -107,8 +169,12 @@ export function sendsFilters(access: unknown): boolean {
 
 /**
  * The user's config from filters the CUSTOMER wrote. They know their schema, so
- * table, column, op and values come from the token; the source id is ours, and a
- * filter without a label gets one so the assistant does not read SQL aloud.
+ * table, column, op and values come from the token; which data source each table
+ * belongs to is ours, and a filter without a label gets one so the assistant
+ * does not read SQL aloud.
+ *
+ * Filters are grouped into one policy per source, keyed by "" for the ones the
+ * project never placed.
  *
  * Everything is checked: a filter the backend would silently drop — no column, no
  * values — must refuse the sign-in instead, or the user ends up unrestricted.
@@ -120,7 +186,7 @@ export function buildFiltersConfig(access: unknown, defaults: AccessDefaults): A
     return { ok: false, reason: "bad_access_filters", error: `access must hold at most ${MAX_FILTERS} filters` };
   }
 
-  const rowFilters: RowFilter[] = [];
+  const bySource = new Map<string, SourcePolicy>();
   for (const [i, entry] of raw.entries()) {
     const where = `access[${i}]`;
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
@@ -156,18 +222,32 @@ export function buildFiltersConfig(access: unknown, defaults: AccessDefaults): A
       };
     }
 
-    rowFilters.push({
-      table: table.trim(),
-      column: column.trim(),
-      op: (op as Op | undefined) ?? "in",
-      values: parsed,
-      label: (label as string | undefined)?.trim() || defaults.label || `${column.trim()} ${parsed.join(", ")}`,
-    });
+    // Where this table lives. Several sources means the same name in more than
+    // one database, and the filter goes into each: restricting a table we were
+    // not asked about is recoverable, leaving one open is not. No source means
+    // the project never listed it — keep it under "" so the backend offers it
+    // everywhere, which is what the single-source projects already do.
+    const matched = sourcesForTable(table.trim(), defaults);
+    const targets = matched.length ? matched : [null];
+
+    for (const source of targets) {
+      const key = source?.sourceId ?? "";
+      if (!bySource.has(key)) {
+        bySource.set(key, { ...(source ? { sourceId: source.sourceId } : {}), rowFilters: [] });
+      }
+      bySource.get(key)!.rowFilters.push({
+        table: table.trim(),
+        column: column.trim(),
+        op: (op as Op | undefined) ?? "in",
+        values: parsed,
+        // Without a label the assistant describes the restriction to the user as
+        // a raw SQL predicate. The source's own label is deliberately not used
+        // here: "Warehouse DB" names where the data lives, not what the user is
+        // limited to, and reads as nonsense in "showing you Warehouse DB only".
+        label: (label as string | undefined)?.trim() || `${column.trim()} ${parsed.join(", ")}`,
+      });
+    }
   }
 
-  return {
-    ok: true,
-    config: [{ ...(defaults.sourceId ? { sourceId: defaults.sourceId } : {}), rowFilters }],
-    warnings: [],
-  };
+  return { ok: true, config: [...bySource.values()], warnings: [] };
 }
