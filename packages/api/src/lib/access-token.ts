@@ -33,12 +33,23 @@ export const ACCESS_TOKEN_TTL = "15m";
  * Verifiers treat such a session as a `member` whatever the user's role in the
  * database, so a customer-signed sign-in can never reach admin actions. The claim
  * is ours: it is signed with `org:<orgId>`, which the customer does not hold.
+ *
+ * `access` rides along as a claim of the same name for SDK sign-ins. The customer
+ * states the user's data access on every sign-in, so the session should use what
+ * they sent rather than what we happen to have stored; the relay prefers this
+ * claim and falls back to `users.config` when it is absent. It is trustworthy for the
+ * same reason `src` is — signed with our key, not theirs — and for the same
+ * reason it must never be read from anything travelling beside the token.
+ *
+ * Callers cap its size before passing it: the token goes in the WebSocket
+ * handshake URL, and a large claim would push that past what proxies accept.
  */
 export async function mintAccessToken(
   user: { id: string; orgId: string | null; role: string },
   jwtSecrets: KVNamespace,
   sessionId?: string,
-  src?: "sdk"
+  src?: "sdk",
+  access?: unknown
 ): Promise<string> {
   const secret = await getOrgSecret(jwtSecrets, user.orgId);
   if (!secret) throw new MissingOrgSecretError(user.orgId);
@@ -49,6 +60,7 @@ export async function mintAccessToken(
     role: user.role,
     ...(sessionId ? { sid: sessionId } : {}),
     ...(src ? { src } : {}),
+    ...(access != null ? { access } : {}),
   })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()

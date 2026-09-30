@@ -4,18 +4,21 @@
  * POST /auth/sdk/exchange { projectId, token } → { token, user }
  *
  * A customer embedding the SDK has its own login. Its backend signs a
- * short-lived JWT for its user with the org's SDK secret (`sdk:<orgId>` — never
- * `org:<orgId>`, which signs our own tokens); the SDK sends it here with the
- * project it is connecting to, and gets back OUR 15-minute access token — the same
- * kind the API and the relay already verify, so neither changes.
+ * short-lived JWT for its user with the org's secret (`org:<orgId>`, the one key
+ * an org has); the SDK sends it here with the project it is connecting to, and
+ * gets back OUR 15-minute access token — the same kind the API and the relay
+ * already verify, so neither changes.
  *
  * Why an exchange rather than accepting the customer's token directly:
  *  - It names THEIR user (`sub`), not our `users.id`. We map it to ours here —
  *    creating the user on first sign-in — once, instead of in every verifier.
  *  - All the rules live in one place: claim checks, lifetime cap, refusing
  *    deactivated accounts.
- *  - A customer token is accepted by this endpoint only; it cannot be presented
- *    to the API or the relay as-is.
+ *  - Their token carries no role and no session id, so only what we mint here is
+ *    accepted by the API and the relay.
+ *
+ * The customer holds the key that signs our tokens, so these checks bind only
+ * those who come through this door.
  *
  * There is no refresh token in this mode. The customer's own session is the
  * long-lived one: to renew, the SDK asks the customer's backend for a fresh
@@ -37,9 +40,9 @@ import { and, eq, sql } from "drizzle-orm";
 import { jwtVerify, errors } from "jose";
 import { users, projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { getOrgSecret, getSdkSecret } from "../lib/org-secrets";
+import { getOrgSecret } from "../lib/org-secrets";
 import { mintAccessToken } from "../lib/access-token";
-import { readAccessDefaults, buildFiltersConfig, sendsFilters, type AccessDefaults } from "../lib/sdk-access";
+import { buildFiltersConfig, sendsFilters } from "../lib/sdk-access";
 
 const sdkAuth = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -58,6 +61,16 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 /** Bounds on the optional `roles` claim, so a bad token cannot fill the database. */
 const MAX_ROLES = 20;
 const MAX_ROLE_LENGTH = 100;
+
+/**
+ * Longest `access` we will carry in the token, as JSON.
+ *
+ * The token goes in the WebSocket handshake query string, and base64 inflates it
+ * by about a third — so 4 KB here is roughly a 6 KB token and a handshake URL
+ * comfortably under the 8 KB many proxies allow. That is hundreds of filter
+ * values: far more than a real policy uses.
+ */
+const MAX_ACCESS_BYTES = 4096;
 
 /**
  * The customer's `roles` claim as a clean list, or null if it is malformed.
@@ -81,25 +94,6 @@ function parseRoles(value: unknown): string[] | null {
     if (role && !roles.includes(role)) roles.push(role);
   }
   return roles;
-}
-
-/** Same roles in the same order — used to skip a database write when nothing changed. */
-function sameRoles(a: unknown, b: string[]): boolean {
-  return Array.isArray(a) && a.length === b.length && a.every((role, i) => role === b[i]);
-}
-
-/**
- * Same config, ignoring key order — Postgres stores jsonb keys in its own order,
- * so the config read back never matches ours key-for-key.
- */
-function sameJson(a: unknown, b: unknown): boolean {
-  const canonical = (v: unknown): unknown =>
-    Array.isArray(v)
-      ? v.map(canonical)
-      : v && typeof v === "object"
-        ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical((v as Record<string, unknown>)[k])]))
-        : v;
-  return JSON.stringify(canonical(a ?? null)) === JSON.stringify(canonical(b ?? null));
 }
 
 /**
@@ -129,7 +123,7 @@ sdkAuth.post("/exchange", async (c) => {
   // The project decides the org, and so the secret. The customer never has to
   // know — or send — our org id.
   const [project] = await db
-    .select({ orgId: projects.orgId, config: projects.config })
+    .select({ orgId: projects.orgId })
     .from(projects)
     .where(eq(projects.id, projectId))
     .limit(1);
@@ -140,28 +134,17 @@ sdkAuth.post("/exchange", async (c) => {
   }
   const orgId = project.orgId;
 
-  // The customer's token is checked with the org's SDK secret, never with
-  // `org:<orgId>` (which signs our own tokens — see lib/org-secrets.ts). No SDK
-  // secret means SDK sign-in is not enabled for this org: off by default.
-  //
-  // The org's own secret (`org:<orgId>`) is checked here too, though it is only
-  // used at the end to sign our token: without it signing would fail AFTER the
-  // user was created or linked, leaving a user who never got signed in.
+  // One key per org: it verifies the customer's token here and signs ours at the
+  // end. Read before any user is created, so signing cannot fail afterwards and
+  // leave a user who never got signed in.
   let secret: Uint8Array | null;
-  let orgSecret: Uint8Array | null;
   try {
-    [secret, orgSecret] = await Promise.all([
-      getSdkSecret(c.env.JWT_SECRETS, orgId),
-      getOrgSecret(c.env.JWT_SECRETS, orgId),
-    ]);
+    secret = await getOrgSecret(c.env.JWT_SECRETS, orgId);
   } catch (error) {
     console.error("[sdk-auth] secret lookup failed:", error);
     return c.json({ error: "Sign-in service unavailable" }, 503);
   }
   if (!secret) {
-    return reject(c, 403, "SDK sign-in is not enabled for this organization", "sdk_not_enabled", `org=${orgId}`);
-  }
-  if (!orgSecret) {
     // A setup fault on our side, not a bad token.
     return reject(c, 503, "Sign-in service unavailable", "org_secret_missing", `org=${orgId}`);
   }
@@ -221,16 +204,15 @@ sdkAuth.post("/exchange", async (c) => {
     );
   }
 
-  // Which data they may see: the customer writes the filters, since they know
-  // their own schema (lib/sdk-access.ts). We add only the source id and a
-  // fallback label, from the project's `sdkAccess`.
-  let accessDefaults: AccessDefaults;
-  try {
-    accessDefaults = readAccessDefaults(project.config);
-  } catch (error) {
-    // Our configuration, not their token.
-    return reject(c, 503, "Sign-in service unavailable", "access_config_invalid", `project=${projectId} ${(error as Error).message}`);
-  }
+  // Which data they may see. The customer writes it, either as plain row filters
+  // (one data source, nothing to disambiguate) or as whole policies naming a
+  // source each (lib/sdk-access.ts). We check it; nothing is read from the
+  // project and no source id is inferred.
+  //
+  // It then rides in the access token and is never written to the user, so the
+  // customer's latest word wins on every sign-in and nothing here goes stale.
+  // `users.config` is the platform's own column: set by an admin, and used only
+  // when a token carries no access at all.
   let accessConfig: unknown = null;
   if (payload.access !== undefined && payload.access !== null) {
     if (!sendsFilters(payload.access)) {
@@ -242,11 +224,27 @@ sdkAuth.post("/exchange", async (c) => {
         `org=${orgId}`
       );
     }
-    const access = buildFiltersConfig(payload.access, accessDefaults);
+    const access = buildFiltersConfig(payload.access);
     if (!access.ok) return reject(c, 401, access.error, access.reason, `org=${orgId}`);
     accessConfig = access.config;
+
+    // The token travels in the WebSocket handshake URL, so the claim has a
+    // ceiling. Refused rather than dropped: a dropped claim falls back to
+    // whatever is stored, which for an SDK user is usually nothing — the user
+    // would connect UNRESTRICTED, the one outcome worth failing loudly to avoid.
+    if (accessConfig !== null) {
+      const size = JSON.stringify(accessConfig).length;
+      if (size > MAX_ACCESS_BYTES) {
+        return reject(
+          c,
+          401,
+          `access is too large (${size} characters, limit ${MAX_ACCESS_BYTES}) — send fewer filters or fewer values`,
+          "access_too_large",
+          `org=${orgId}`
+        );
+      }
+    }
   }
-  const configUpdate = { config: accessConfig };
 
   // Find the user: by their id in the customer's system first, then — once — by
   // email, to link an account that already exists (e.g. created by our admins).
@@ -268,16 +266,23 @@ sdkAuth.post("/exchange", async (c) => {
       if (byEmail.ssoSubject && byEmail.ssoSubject !== sub) {
         return reject(c, 401, "This email is already linked to another identity", "email_linked_elsewhere", `org=${orgId}`);
       }
+      // Linking an account that already exists here: stamp the identity so we
+      // recognise them next time, and nothing else. The account predates this
+      // sign-in, so its roles and access are the platform's to say, not the
+      // token's.
       await db
         .update(users)
-        .set({ ssoSubject: sub, externalRoles: roles, ...configUpdate, updatedAt: new Date() })
+        .set({ ssoSubject: sub, updatedAt: new Date() })
         .where(eq(users.id, byEmail.id));
-      user = { ...byEmail, ssoSubject: sub, externalRoles: roles, ...configUpdate };
+      user = { ...byEmail, ssoSubject: sub };
     } else {
       try {
         [user] = await db
           .insert(users)
-          .values({ orgId, email, name, ssoSubject: sub, externalRoles: roles, ...configUpdate, role: "member", isActive: true })
+          // No `config`: what the customer sends rides in the token and is never
+          // written down. `users.config` belongs to the platform alone, so an
+          // admin's edit there is the only thing that can end up in this column.
+          .values({ orgId, email, name, ssoSubject: sub, externalRoles: roles, role: "member", isActive: true })
           .returning();
       } catch {
         // Two first sign-ins racing: the other request created the row. Use it.
@@ -298,27 +303,19 @@ sdkAuth.post("/exchange", async (c) => {
     return reject(c, 401, "Account is deactivated", "inactive", `org=${orgId} user=${user.id}`);
   }
 
-  // Keep their roles and data access current: overwritten on every sign-in —
-  // including config an admin set by hand — so changes on their side reach us.
-  // Written only when something actually changed, so a normal sign-in costs no
-  // extra write. (New and just-linked users already have them.)
-  const changes = {
-    ...(sameRoles(user.externalRoles, roles) ? {} : { externalRoles: roles }),
-    ...(sameJson(user.config, accessConfig) ? {} : { config: accessConfig }),
-  };
-  if (Object.keys(changes).length) {
-    await db
-      .update(users)
-      .set({ ...changes, updatedAt: new Date() })
-      .where(eq(users.id, user.id));
-    user = { ...user, ...changes };
-  }
+  // Their role names are written once, when we create the user, and never
+  // again: an admin may edit them in the platform afterwards, and a later
+  // sign-in must not quietly undo that. Data access is not written at all.
 
   // Marked `src: "sdk"`: the API and the relay treat this session as a member,
   // whatever the account's role — even an org_admin linked by email above.
+  //
+  // The access travels in the token, so THIS sign-in uses what the customer just
+  // sent, not what is stored. When they send none, the claim is absent and the
+  // relay falls back to `users.config` — the platform's copy.
   let accessToken: string;
   try {
-    accessToken = await mintAccessToken(user, c.env.JWT_SECRETS, undefined, "sdk");
+    accessToken = await mintAccessToken(user, c.env.JWT_SECRETS, undefined, "sdk", accessConfig);
   } catch (error) {
     console.error("[sdk-auth] access token signing failed:", error);
     return c.json({ error: "Sign-in service unavailable" }, 503);

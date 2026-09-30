@@ -72,11 +72,11 @@ export const users = pgTable(
     /**
      * Data-access config: row filters the relay stamps on every request.
      *
-     * For SDK sign-ins it is written from the token's `access` claim
-     * (routes/sdk-auth.ts): the customer sends the row filters themselves, and
-     * we route each one to the data source that owns its table, using the
-     * project's `sdkAccess.sources`. Overwritten on every sign-in, so their side
-     * stays the source of truth.
+     * SDK sign-ins never write here. What the customer sends as `access` travels
+     * in the access token instead (routes/sdk-auth.ts), so their latest word
+     * applies to that session and nothing we stored can go stale against it.
+     * This column is the platform's own: an admin sets it, and the relay uses it
+     * only for sessions whose token carries no access.
      */
     config: jsonb("config"), // free-form per-user config
     /**

@@ -3,42 +3,37 @@
  * the user's `users.config`, which the relay stamps onto every message and the
  * backend enforces by rewriting SQL.
  *
- * The customer writes the filters — they know their own schema:
+ * The customer writes it, in whichever of two shapes fits their project. With
+ * ONE data source there is nothing to disambiguate, so they send filters:
  *
  *   "access": [
- *     { "table": "com_trn_documentstamp", "column": "LocationId", "op": "in",
- *       "values": [5, 117, 127], "label": "Bhubaneshwar region" }
+ *     { "table": "fact_sales", "column": "cust_id", "op": "in", "values": [5, 117] },
+ *     { "table": "fact_sales", "column": "status", "op": "not_in", "values": ["Cancelled"] }
  *   ]
  *
- * We add what is ours to know and meaningless to them: which data source each
- * table belongs to. A project lists its sources and the tables exposed for
- * filtering in `projects.config.sdkAccess`:
+ * With SEVERAL data sources a filter has to say which one it belongs to, so they
+ * send whole policies — the same shape we store:
  *
- *   "sdkAccess": {
- *     "sources": [
- *       { "sourceId": "mssql-722b9497", "label": "Warehouse DB",
- *         "tables": ["com_trn_documentstamp", "com_mst_location"] },
- *       { "sourceId": "athena-4f2c1a9b", "label": "Lany Summary",
- *         "tables": ["shipment_summary"] }
- *     ]
- *   }
+ *   "access": [
+ *     { "label": "Assigned customers", "sourceId": "mssql-722b9497",
+ *       "rowFilters": [ { "table": "customer", "column": "customerId", "op": "in", "values": [5, 117] } ] },
+ *     { "label": "Assigned customers", "sourceId": "postgres-4f2c1a9b",
+ *       "rowFilters": [ { "table": "shipment_summary", "column": "customer_ref", "op": "in", "values": [41306] } ] }
+ *   ]
  *
- * Each filter is routed by its table, so a project with two databases gets one
- * policy per source — the shape the backend reads (sdk-nodejs
- * `policiesFromConfig`): `[{ sourceId, rowFilters: [...] }]`. Without that, one
- * source id would have to cover every filter, and a query against any other
- * source would match no policy at all and run unrestricted.
+ * Either way we only check and store: nothing is inferred from the project, and
+ * no source id is guessed. The result is the config interface the backend reads
+ * (sdk-nodejs `policiesFromConfig`): `[{ sourceId?, label?, rowFilters: [...] }]`.
  *
  * Rules:
  *  - No `access`, or an empty list, means no restriction (config null).
- *  - A table listed under several sources is filtered in all of them: over-
- *    restricting is safe, guessing one and leaving the other open is not.
- *  - A table listed under none is kept without a source id, which the backend
- *    offers to every source. It still only fires where that table exists.
- *  - Anything malformed refuses the sign-in rather than being dropped: the
+ *  - The two shapes may be mixed in one list; loose filters collect into a
+ *    single policy with no source id.
+ *  - Anything malformed refuses the sign-in rather than being dropped. The
  *    backend silently ignores a filter with no column or no values, which would
- *    leave the user unrestricted. An empty `values` list is refused for the same
- *    reason — "no customers" must not end up meaning "all customers".
+ *    leave the user UNRESTRICTED — so a typo must fail loudly here instead. An
+ *    empty `values` list is refused for the same reason: "no customers" must not
+ *    end up meaning "all customers".
  */
 
 /**
@@ -60,6 +55,7 @@ interface RowFilter {
 }
 interface SourcePolicy {
   sourceId?: string;
+  label?: string;
   rowFilters: RowFilter[];
 }
 
@@ -67,187 +63,168 @@ interface SourcePolicy {
 const MAX_VALUES = 1000;
 const MAX_VALUE_LENGTH = 200;
 const MAX_NAME_LENGTH = 100;
-/** Filters one token may carry when the customer sends them itself. */
+/** Entries one token may carry, whether filters or policies. */
 const MAX_FILTERS = 50;
+/** Row filters one policy may carry. */
+const MAX_FILTERS_PER_POLICY = 50;
 
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 
-/** One data source of a project, and the tables it exposes for filtering. */
-interface AccessSource {
-  sourceId: string;
-  /** Human name for whoever reads the config, e.g. "Warehouse DB". Not shown to users. */
-  label?: string;
-  /** Table names, lower-cased for matching. */
-  tables: string[];
+/** How a value reads in a message: quoted if text, bare if a number. */
+function describe(item: unknown): string {
+  if (item === null) return "null";
+  if (typeof item === "string") return `"${item.slice(0, 30)}"`;
+  if (typeof item === "number") return String(item);
+  if (Array.isArray(item)) return "a list";
+  return typeof item;
 }
-
-/** What the project knows and the customer does not: where each table lives. */
-export interface AccessDefaults {
-  sources: AccessSource[];
-}
-
-/** Bounds on the project's own config, so one bad edit cannot blow up a sign-in. */
-const MAX_SOURCES = 20;
-const MAX_TABLES_PER_SOURCE = 500;
 
 /**
- * `projects.config.sdkAccess`. Throws when it is malformed — that is a fault in
- * our configuration, not in the customer's token, and the caller answers 503
- * rather than blaming them.
- *
- * A project with no `sdkAccess` is not an error: its filters simply carry no
- * source id, which the backend offers to every source.
+ * One value or a list, as a clean list. On failure it says what is wrong in
+ * words, since this message reaches whoever wrote the integration.
  */
-export function readAccessDefaults(projectConfig: unknown): AccessDefaults {
-  const raw = (projectConfig as Record<string, unknown> | null)?.sdkAccess;
-  if (raw === undefined || raw === null) return { sources: [] };
-  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error("sdkAccess must be an object");
+function parseValues(value: unknown): { ok: true; values: (string | number)[] } | { ok: false; why: string } {
+  if (value === undefined || value === null) return { ok: false, why: "is missing" };
 
-  const { sources } = raw as Record<string, unknown>;
-  if (sources === undefined || sources === null) return { sources: [] };
-  if (!Array.isArray(sources)) throw new Error("sdkAccess.sources must be a list");
-  if (sources.length > MAX_SOURCES) throw new Error(`sdkAccess.sources must hold at most ${MAX_SOURCES} sources`);
-
-  return {
-    sources: sources.map((entry, i) => {
-      const where = `sdkAccess.sources[${i}]`;
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`${where} must be an object`);
-      const { sourceId, label, tables } = entry as Record<string, unknown>;
-
-      if (!nonEmpty(sourceId)) throw new Error(`${where}.sourceId is required`);
-      if (label !== undefined && !nonEmpty(label)) throw new Error(`${where}.label must be a string`);
-      if (!Array.isArray(tables)) throw new Error(`${where}.tables must be a list`);
-      if (tables.length > MAX_TABLES_PER_SOURCE) {
-        throw new Error(`${where}.tables must hold at most ${MAX_TABLES_PER_SOURCE} tables`);
-      }
-      for (const t of tables) {
-        if (!nonEmpty(t)) throw new Error(`${where}.tables must hold table names`);
-      }
-
-      return {
-        sourceId: sourceId.trim(),
-        ...(label ? { label: (label as string).trim() } : {}),
-        // Matching is case-insensitive: a customer writing "Orders" must hit a
-        // table we recorded as "orders".
-        tables: (tables as string[]).map((t) => t.trim().toLowerCase()),
-      };
-    }),
-  };
-}
-
-/** The sources a table belongs to; empty when the project lists it nowhere. */
-function sourcesForTable(table: string, defaults: AccessDefaults): AccessSource[] {
-  const want = table.toLowerCase();
-  return defaults.sources.filter((s) => s.tables.includes(want));
-}
-
-
-/** One value or a list, as a clean list; null if malformed. */
-function parseValues(value: unknown): (string | number)[] | null {
   const list = Array.isArray(value) ? value : [value];
-  if (list.length === 0 || list.length > MAX_VALUES) return null;
+  if (list.length === 0) return { ok: false, why: "is empty — an empty list restricts nothing" };
+  if (list.length > MAX_VALUES) return { ok: false, why: `has ${list.length} values, more than the ${MAX_VALUES} allowed` };
 
   const out: (string | number)[] = [];
-  for (const item of list) {
+  for (const [i, item] of list.entries()) {
+    const at = Array.isArray(value) ? ` at ${i}` : "";
     let v: string | number;
-    if (typeof item === "number" && Number.isFinite(item)) v = item;
-    else if (typeof item === "string" && item.trim() && item.trim().length <= MAX_VALUE_LENGTH) v = item.trim();
-    else return null;
+    if (typeof item === "number") {
+      if (!Number.isFinite(item)) return { ok: false, why: `has a value${at} that is not a real number` };
+      v = item;
+    } else if (typeof item === "string") {
+      if (!item.trim()) return { ok: false, why: `has an empty text value${at}` };
+      if (item.trim().length > MAX_VALUE_LENGTH) {
+        return { ok: false, why: `has a text value${at} over ${MAX_VALUE_LENGTH} characters` };
+      }
+      v = item.trim();
+    } else {
+      return { ok: false, why: `must hold text or numbers, found ${describe(item)}${at}` };
+    }
     if (!out.includes(v)) out.push(v);
   }
-  return out;
+  return { ok: true, values: out };
 }
 
 export type AccessResult =
-  | { ok: true; config: SourcePolicy[] | null; warnings: string[] }
+  | { ok: true; config: SourcePolicy[] | null }
   | { ok: false; reason: string; error: string };
 
-/** True when the token sends filters rather than values for us to map. */
+/** True when the token carries an access list at all. */
 export function sendsFilters(access: unknown): boolean {
   return Array.isArray(access);
 }
 
+/** A failure carrying where it happened, so the customer can find the entry. */
+function bad(error: string): { ok: false; reason: string; error: string } {
+  return { ok: false, reason: "bad_access_filters", error };
+}
+
 /**
- * The user's config from filters the CUSTOMER wrote. They know their schema, so
- * table, column, op and values come from the token; which data source each table
- * belongs to is ours, and a filter without a label gets one so the assistant
- * does not read SQL aloud.
- *
- * Filters are grouped into one policy per source, keyed by "" for the ones the
- * project never placed.
- *
- * Everything is checked: a filter the backend would silently drop — no column, no
- * values — must refuse the sign-in instead, or the user ends up unrestricted.
+ * One row filter, checked. `fallbackLabel` is the policy's label, used when the
+ * filter has none — without any label the assistant describes the restriction to
+ * the user as a raw SQL predicate.
  */
-export function buildFiltersConfig(access: unknown, defaults: AccessDefaults): AccessResult {
-  const raw = access as unknown[];
-  if (raw.length === 0) return { ok: true, config: null, warnings: [] };
-  if (raw.length > MAX_FILTERS) {
-    return { ok: false, reason: "bad_access_filters", error: `access must hold at most ${MAX_FILTERS} filters` };
+function readFilter(entry: unknown, where: string, fallbackLabel?: string): RowFilter | { ok: false; reason: string; error: string } {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return bad(`${where} must be an object`);
+  const { table, column, op, values, label } = entry as Record<string, unknown>;
+
+  if (!nonEmpty(table)) return bad(`${where}.table is missing`);
+  if (table.trim().length > MAX_NAME_LENGTH) return bad(`${where}.table is over ${MAX_NAME_LENGTH} characters`);
+  if (!nonEmpty(column)) return bad(`${where}.column is missing`);
+  if (column.trim().length > MAX_NAME_LENGTH) return bad(`${where}.column is over ${MAX_NAME_LENGTH} characters`);
+  if (op !== undefined && !OPS.includes(op as Op)) {
+    return bad(`${where}.op ${describe(op)} is not supported — use ${OPS.join(", ")}`);
   }
 
-  const bySource = new Map<string, SourcePolicy>();
+  const parsed = parseValues(values);
+  if (!parsed.ok) return bad(`${where}.values ${parsed.why}`);
+
+  if (label !== undefined && (!nonEmpty(label) || label.trim().length > MAX_VALUE_LENGTH)) {
+    return bad(`${where}.label must be short text`);
+  }
+  if (SINGLE_VALUE_OPS.includes((op as Op) ?? "in") && parsed.values.length !== 1) {
+    return bad(`${where}.op "${op}" takes one value, got ${parsed.values.length} — use "in" or "not_in" for several`);
+  }
+
+  return {
+    table: table.trim(),
+    column: column.trim(),
+    op: (op as Op | undefined) ?? "in",
+    values: parsed.values,
+    label: (label as string | undefined)?.trim() || fallbackLabel || `${column.trim()} ${parsed.values.join(", ")}`,
+  };
+}
+
+const isFailure = (v: unknown): v is { ok: false; reason: string; error: string } =>
+  !!v && typeof v === "object" && (v as { ok?: unknown }).ok === false;
+
+/**
+ * The user's config from the `access` claim. Accepts a list of row filters, a
+ * list of source policies, or a mix, and stores what it is given — the project
+ * is not consulted and no source id is inferred.
+ */
+export function buildFiltersConfig(access: unknown): AccessResult {
+  const raw = access as unknown[];
+  if (raw.length === 0) return { ok: true, config: null };
+  if (raw.length > MAX_FILTERS) {
+    return bad(`access must hold at most ${MAX_FILTERS} entries`);
+  }
+
+  const policies: SourcePolicy[] = [];
+  /** Loose filters, collected into one policy with no source id. */
+  const loose: RowFilter[] = [];
+
   for (const [i, entry] of raw.entries()) {
     const where = `access[${i}]`;
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      return { ok: false, reason: "bad_access_filters", error: `${where} must be an object` };
-    }
-    const { table, column, op, values, label } = entry as Record<string, unknown>;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return bad(`${where} must be an object`);
+    const { sourceId, label, rowFilters } = entry as Record<string, unknown>;
 
-    if (!nonEmpty(table) || table.trim().length > MAX_NAME_LENGTH) {
-      return { ok: false, reason: "bad_access_filters", error: `${where}.table is required` };
+    // A policy is anything carrying `rowFilters`. Deciding on that key rather
+    // than on `sourceId` matters: a policy whose source id was left out is still
+    // a policy, and must not be read as a filter missing its table.
+    if (rowFilters === undefined) {
+      if (sourceId !== undefined) {
+        return bad(`${where} has a sourceId but no rowFilters — a filter cannot name a source on its own`);
+      }
+      const filter = readFilter(entry, where);
+      if (isFailure(filter)) return filter;
+      loose.push(filter);
+      continue;
     }
-    if (!nonEmpty(column) || column.trim().length > MAX_NAME_LENGTH) {
-      return { ok: false, reason: "bad_access_filters", error: `${where}.column is required` };
+
+    if (!Array.isArray(rowFilters)) return bad(`${where}.rowFilters must be a list`);
+    if (rowFilters.length === 0) return bad(`${where}.rowFilters is empty`);
+    if (rowFilters.length > MAX_FILTERS_PER_POLICY) {
+      return bad(`${where}.rowFilters must hold at most ${MAX_FILTERS_PER_POLICY} filters`);
     }
-    if (op !== undefined && !OPS.includes(op as Op)) {
-      return { ok: false, reason: "bad_access_filters", error: `${where}.op must be one of ${OPS.join(", ")}` };
-    }
-    const parsed = parseValues(values);
-    if (!parsed) {
-      return {
-        ok: false,
-        reason: "bad_access_filters",
-        error: `${where}.values must be a value or a list of 1–${MAX_VALUES} values (strings or numbers)`,
-      };
+    if (sourceId !== undefined && (!nonEmpty(sourceId) || sourceId.trim().length > MAX_NAME_LENGTH)) {
+      return bad(`${where}.sourceId must be a string`);
     }
     if (label !== undefined && (!nonEmpty(label) || label.trim().length > MAX_VALUE_LENGTH)) {
-      return { ok: false, reason: "bad_access_filters", error: `${where}.label must be a short string` };
-    }
-    if (SINGLE_VALUE_OPS.includes((op as Op) ?? "in") && parsed.length !== 1) {
-      return {
-        ok: false,
-        reason: "bad_access_filters",
-        error: `${where}.op "${op}" takes exactly one value — use "in" or "not_in" for several`,
-      };
+      return bad(`${where}.label must be a short string`);
     }
 
-    // Where this table lives. Several sources means the same name in more than
-    // one database, and the filter goes into each: restricting a table we were
-    // not asked about is recoverable, leaving one open is not. No source means
-    // the project never listed it — keep it under "" so the backend offers it
-    // everywhere, which is what the single-source projects already do.
-    const matched = sourcesForTable(table.trim(), defaults);
-    const targets = matched.length ? matched : [null];
-
-    for (const source of targets) {
-      const key = source?.sourceId ?? "";
-      if (!bySource.has(key)) {
-        bySource.set(key, { ...(source ? { sourceId: source.sourceId } : {}), rowFilters: [] });
-      }
-      bySource.get(key)!.rowFilters.push({
-        table: table.trim(),
-        column: column.trim(),
-        op: (op as Op | undefined) ?? "in",
-        values: parsed,
-        // Without a label the assistant describes the restriction to the user as
-        // a raw SQL predicate. The source's own label is deliberately not used
-        // here: "Warehouse DB" names where the data lives, not what the user is
-        // limited to, and reads as nonsense in "showing you Warehouse DB only".
-        label: (label as string | undefined)?.trim() || `${column.trim()} ${parsed.join(", ")}`,
-      });
+    const policyLabel = (label as string | undefined)?.trim();
+    const filters: RowFilter[] = [];
+    for (const [j, f] of rowFilters.entries()) {
+      const filter = readFilter(f, `${where}.rowFilters[${j}]`, policyLabel);
+      if (isFailure(filter)) return filter;
+      filters.push(filter);
     }
+
+    policies.push({
+      ...(sourceId ? { sourceId: (sourceId as string).trim() } : {}),
+      ...(policyLabel ? { label: policyLabel } : {}),
+      rowFilters: filters,
+    });
   }
 
-  return { ok: true, config: [...bySource.values()], warnings: [] };
+  if (loose.length) policies.push({ rowFilters: loose });
+  return { ok: true, config: policies };
 }

@@ -115,6 +115,17 @@ export async function verifyBrowserSession(
 	let userId: string;
 	let issuedAt: number | undefined;
 	let sessionId: string | null;
+	/**
+	 * The caller's data access, when the token states it (SDK sign-ins do —
+	 * sa-api puts the customer's `access` claim here after checking it). Used in
+	 * place of the stored `users.config` below, so the customer's latest word
+	 * wins over whatever we last wrote down.
+	 *
+	 * Safe to trust for the same reason `userId` is: it comes out of a token we
+	 * signed, verified a line above. Nothing the browser sends beside the token
+	 * is ever read this way — see the authContext deletion in the broadcaster.
+	 */
+	let tokenConfig: unknown = null;
 	try {
 		// Pin the algorithm so the token header cannot choose how it is verified.
 		const { payload } = await jwtVerify(token, secret, { algorithms: ['HS256'] });
@@ -123,6 +134,9 @@ export async function verifyBrowserSession(
 		issuedAt = payload.iat;
 		if (!userId) {
 			return { ok: false, status: 401, reason: 'invalid_token_payload' };
+		}
+		if (payload.access !== undefined && payload.access !== null) {
+			tokenConfig = payload.access;
 		}
 		// `sid` is the login session (refresh-token family). Absent on tokens from
 		// before it existed; malformed means a bad token. Mirrors sa-api.
@@ -202,7 +216,16 @@ export async function verifyBrowserSession(
 			return { ok: false, status: 401, reason: 'invalid_account_state' };
 		}
 
-		session = { userId, orgId: account.org_id, role: account.role, config: account.config ?? null };
+		// The token's access when it carries one, the stored config otherwise. A
+		// user created through the SDK is restricted by what their own backend
+		// sent this time; `users.config` is the default an admin can edit here,
+		// used when a token says nothing about access.
+		session = {
+			userId,
+			orgId: account.org_id,
+			role: account.role,
+			config: tokenConfig ?? account.config ?? null,
+		};
 	} catch (error: any) {
 		console.error('[auth] account lookup failed:', error?.message);
 		return { ok: false, status: 500, reason: 'account_lookup_failed' };
