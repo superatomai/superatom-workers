@@ -12,6 +12,11 @@ import {
   pgEnum,
   uniqueIndex,
   index,
+  bigserial,
+  bigint,
+  primaryKey,
+  check,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 
@@ -556,4 +561,372 @@ export const installTokens = pgTable(
     uniqueIndex("install_tokens_hash_idx").on(table.tokenHash),
     index("install_tokens_project_idx").on(table.projectId),
   ]
+);
+
+// ═════════════════════════════════════════════════════════
+// Composition graph — authored on the platform, replicated to engines.
+// Working tables keep the engine's columns (plus org/project/owner) and global
+// integer ids, so an engine's replica keeps the same ids.
+// ═════════════════════════════════════════════════════════
+
+/** Who a concept applies to: everyone in the project, one user, or a group. */
+export const conceptTypeEnum = pgEnum("concept_type", ["global", "user", "group"]);
+
+// ─── Graph Nodes ─────────────────────────────────────────
+// Every node (a domain or any other kind); non-owner edits go to graph_change_requests.
+
+export const graphNodes = pgTable(
+  "graph_nodes",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    ownerId: uuid("owner_id").references(() => users.id, { onDelete: "set null" }),
+    // domain | part | file | setting | program | … (intermediate kinds to confirm)
+    kind: varchar("kind", { length: 16 }).notNull(),
+    name: varchar("name", { length: 96 }).notNull(),
+    title: varchar("title", { length: 160 }),
+    body: text("body").notNull(),
+    // Kind-specific: a domain's threshold/shared/fallback, a file's path, a setting's key/value.
+    meta: jsonb("meta").default({}).notNull(),
+    // sha256 of kind + name + body + meta, computed by sa-api on save.
+    hash: varchar("hash", { length: 64 }).notNull(),
+    // draft | published | retired — whether a domain is routable. Versioned with the content.
+    status: varchar("status", { length: 12 }).default("draft").notNull(),
+    // platform | import | agent
+    origin: varchar("origin", { length: 24 }),
+    // Optimistic concurrency: a save sends the version it read; a mismatch is a 409.
+    editVersion: integer("edit_version").default(1).notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    // Soft delete: ids are never reused; deleted rows are left out of new releases.
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("graph_nodes_project_kind_name_idx")
+      .on(table.projectId, table.kind, sql`lower(${table.name})`)
+      .where(sql`${table.deletedAt} IS NULL`),
+    index("graph_nodes_project_kind_idx").on(table.projectId, table.kind),
+    index("graph_nodes_owner_idx").on(table.ownerId),
+  ]
+);
+
+// ─── Concepts ────────────────────────────────────────────
+// Same columns as the engine's `concepts`; proposals live in graph_change_requests.
+
+export const concepts = pgTable(
+  "concepts",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    ownerId: uuid("owner_id").references(() => users.id, { onDelete: "set null" }),
+    name: varchar("name", { length: 64 }).notNull(),
+    body: text("body").notNull(),
+    // definition | lookup | filter | formula | invariant (invariant = always injected)
+    kind: varchar("kind", { length: 24 }).default("definition").notNull(),
+    // Optional: null until type-based routing exists.
+    type: conceptTypeEnum("type"),
+    // Names of concepts this one depends on (as in the engine).
+    requires: text("requires").array().default(sql`'{}'::text[]`).notNull(),
+    // Output contract: { type, unit, grain, caveats }.
+    returns: jsonb("returns").default({}).notNull(),
+    aliases: text("aliases").array().default(sql`'{}'::text[]`).notNull(),
+    description: varchar("description", { length: 240 }),
+    // platform | data_source | knowledge_node | user_question | agent_validated
+    origin: varchar("origin", { length: 24 }),
+    // The engine's project_sources.id; null = any source. Not an FK (sources live in the engine).
+    sourceId: varchar("source_id", { length: 100 }),
+    // Which item it came from, e.g. 'kb:42'.
+    originRef: varchar("origin_ref", { length: 100 }),
+    // Parity with the engine: always null here.
+    supersedes: integer("supersedes"),
+    // Parity with the engine: rows here are always verified.
+    verified: boolean("verified").default(true).notNull(),
+    editVersion: integer("edit_version").default(1).notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("concepts_project_name_source_idx")
+      .on(table.projectId, sql`lower(${table.name})`, sql`coalesce(${table.sourceId}, '')`)
+      .where(sql`${table.deletedAt} IS NULL`),
+    index("concepts_aliases_idx").using("gin", table.aliases),
+    index("concepts_project_kind_idx").on(table.projectId, table.kind),
+    index("concepts_project_type_idx").on(table.projectId, table.type),
+    index("concepts_owner_idx").on(table.ownerId),
+  ]
+);
+
+// ─── Graph Edges ─────────────────────────────────────────
+// Links node → node and node → concept, owned with their parent node. Must stay acyclic.
+
+export const graphEdges = pgTable(
+  "graph_edges",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    parentId: integer("parent_id")
+      .notNull()
+      .references(() => graphNodes.id, { onDelete: "cascade" }),
+    childNodeId: integer("child_node_id").references(() => graphNodes.id, { onDelete: "cascade" }),
+    childConceptId: integer("child_concept_id").references(() => concepts.id, { onDelete: "cascade" }),
+    // concept | prompt | file | setting | program | domain (+ intermediate roles to confirm)
+    role: varchar("role", { length: 12 }).notNull(),
+    // Order within the parent and role: 1, 2, 3 …
+    position: integer("position").notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    // Exactly one child: a node or a concept.
+    check("graph_edges_one_child", sql`(${table.childNodeId} IS NULL) <> (${table.childConceptId} IS NULL)`),
+    check("graph_edges_no_self_link", sql`${table.childNodeId} IS NULL OR ${table.childNodeId} <> ${table.parentId}`),
+    index("graph_edges_parent_idx").on(table.parentId, table.role, table.position),
+    index("graph_edges_child_node_idx").on(table.childNodeId),
+    index("graph_edges_child_concept_idx").on(table.childConceptId),
+  ]
+);
+
+// ─── Graph Domain Terms ──────────────────────────────────
+// A domain's routing keywords. Belong to the domain (same ownership).
+
+export const graphDomainTerms = pgTable(
+  "graph_domain_terms",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    nodeId: integer("node_id")
+      .notNull()
+      .references(() => graphNodes.id, { onDelete: "cascade" }),
+    // Lower-case; a multi-word term matches as a phrase.
+    term: varchar("term", { length: 64 }).notNull(),
+    weight: integer("weight").default(1).notNull(),
+  },
+  (table) => [
+    uniqueIndex("graph_domain_terms_node_term_idx").on(table.nodeId, sql`lower(${table.term})`),
+  ]
+);
+
+// ─── Graph Change Requests ───────────────────────────────
+// Non-owner edits and agent proposals, held until the owner merges or rejects them.
+
+export const graphChangeRequests = pgTable(
+  "graph_change_requests",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // node | concept
+    entity: varchar("entity", { length: 8 }).notNull(),
+    // graph_nodes.id or concepts.id per `entity` (not an FK); null when proposing a new item.
+    entityId: integer("entity_id"),
+    // create | update | delete
+    action: varchar("action", { length: 8 }).notNull(),
+    // The item's edit_version when the request was started; a mismatch at merge is a conflict.
+    baseEditVersion: integer("base_edit_version"),
+    // Full proposed content (for a node: fields + edges + terms).
+    proposed: jsonb("proposed").notNull(),
+    // Null for an agent proposal.
+    authorId: uuid("author_id").references(() => users.id, { onDelete: "set null" }),
+    // user | agent | import
+    source: varchar("source", { length: 12 }).notNull(),
+    originRef: varchar("origin_ref", { length: 100 }),
+    // open | merged | rejected | withdrawn
+    status: varchar("status", { length: 10 }).default("open").notNull(),
+    reviewedBy: uuid("reviewed_by").references(() => users.id, { onDelete: "set null" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    // Required when rejecting.
+    reviewComment: text("review_comment"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("graph_change_requests_project_status_idx").on(table.projectId, table.status),
+    index("graph_change_requests_entity_idx").on(table.entity, table.entityId, table.status),
+    index("graph_change_requests_author_idx").on(table.authorId),
+  ]
+);
+
+// ─── Graph Changes ───────────────────────────────────────
+// Append-only edit history of the working copy (before/after per change). Releases don't use it.
+
+export const graphChanges = pgTable(
+  "graph_changes",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // node | concept
+    entity: varchar("entity", { length: 8 }).notNull(),
+    // graph_nodes.id or concepts.id per `entity` (not an FK: history outlives the row).
+    entityId: integer("entity_id").notNull(),
+    // create | update | delete | owner
+    action: varchar("action", { length: 8 }).notNull(),
+    // edit | merge | import
+    via: varchar("via", { length: 8 }).notNull(),
+    // Set when `via` is merge.
+    changeRequestId: integer("change_request_id").references(() => graphChangeRequests.id, { onDelete: "set null" }),
+    // The item before and after (for a node: fields + edges + terms; for owner: { ownerId }). Null for create / delete.
+    before: jsonb("before"),
+    after: jsonb("after"),
+    changedBy: uuid("changed_by").references(() => users.id, { onDelete: "set null" }),
+    changedAt: timestamp("changed_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("graph_changes_item_idx").on(table.entity, table.entityId, table.changedAt),
+    index("graph_changes_project_idx").on(table.projectId, table.changedAt),
+  ]
+);
+
+// ─── Graph Revisions ─────────────────────────────────────
+// Append-only: an immutable copy of an item each time a release includes a change to it.
+
+export const graphRevisions = pgTable(
+  "graph_revisions",
+  {
+    // node | concept
+    entity: varchar("entity", { length: 8 }).notNull(),
+    // graph_nodes.id or concepts.id per `entity` (not an FK: history outlives the row).
+    entityId: integer("entity_id").notNull(),
+    // 1, 2, 3 … per item.
+    rev: integer("rev").notNull(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Full snapshot (for a node: fields + edges + terms).
+    content: jsonb("content").notNull(),
+    // Hash of content plus its children's hashes (Merkle).
+    hash: varchar("hash", { length: 64 }).notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.entity, table.entityId, table.rev] }),
+    index("graph_revisions_project_idx").on(table.projectId),
+  ]
+);
+
+// ─── Graph Releases ──────────────────────────────────────
+// Append-only: a published, immutable snapshot of a project's whole graph.
+
+export const graphReleases = pgTable(
+  "graph_releases",
+  {
+    id: serial("id").primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Release number per project: 1, 2, 3 …
+    seq: integer("seq").notNull(),
+    // [{ entity, id, rev, hash }] — exactly which revision of every node and concept.
+    items: jsonb("items").notNull(),
+    // Hash over all items; engines compare it to verify their copy.
+    rootHash: varchar("root_hash", { length: 64 }).notNull(),
+    // The release this one was built on (for diffs).
+    parentReleaseId: integer("parent_release_id").references((): AnyPgColumn => graphReleases.id, {
+      onDelete: "set null",
+    }),
+    notes: text("notes"),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("graph_releases_project_seq_idx").on(table.projectId, table.seq)]
+);
+
+// ─── Graph Release Events ────────────────────────────────
+// Append-only publish/rollback log; the latest event's to_release_id is current.
+// Engines order by event_seq, so a rollback to an older release still applies.
+
+export const graphReleaseEvents = pgTable(
+  "graph_release_events",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // +1 per event per project.
+    eventSeq: bigint("event_seq", { mode: "number" }).notNull(),
+    // publish | rollback
+    action: varchar("action", { length: 12 }).notNull(),
+    // Null on the first release.
+    fromReleaseId: integer("from_release_id").references(() => graphReleases.id),
+    toReleaseId: integer("to_release_id")
+      .notNull()
+      .references(() => graphReleases.id),
+    // Required for rollback.
+    reason: text("reason"),
+    actor: uuid("actor").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("graph_release_events_project_seq_idx").on(table.projectId, table.eventSeq)]
+);
+
+// ─── Graph Engine State ──────────────────────────────────
+// Which release each engine runs, from its GRAPH_ACK / GRAPH_NACK.
+
+export const graphEngineState = pgTable(
+  "graph_engine_state",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // The id the engine sends in GRAPH_HELLO (a UUID stored on the engine machine).
+    engineId: varchar("engine_id", { length: 64 }).notNull(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    // Last release it acknowledged.
+    appliedReleaseId: integer("applied_release_id").references(() => graphReleases.id, {
+      onDelete: "set null",
+    }),
+    appliedRootHash: varchar("applied_root_hash", { length: 64 }),
+    // in_sync | behind | error
+    status: varchar("status", { length: 12 }).notNull(),
+    // Error from the last GRAPH_NACK.
+    lastError: text("last_error"),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    lastAckAt: timestamp("last_ack_at", { withTimezone: true }),
+  },
+  (table) => [primaryKey({ columns: [table.projectId, table.engineId] })]
 );

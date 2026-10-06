@@ -45,6 +45,12 @@ INSTALL_PLATFORM_UI_URL = "https://dev.platform.superatom.ai"
 INSTALL_USER_UI_URL = "https://dev.live.superatom.ai"
 INSTALL_LLM_PROXY_MODE = "dummy"
 
+# sa-websocket-dev's per-project DO, told about composition graph releases. Deploy sa-websocket-dev first.
+[[durable_objects.bindings]]
+name = "BROADCASTER"
+class_name = "Broadcaster"
+script_name = "sa-websocket-dev"
+
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
 name = "SPEECH_RATE_LIMITER"

@@ -74,6 +74,12 @@ simple = { limit = 20, period = 60 }
 binding = "LLM_PROXY"
 service = "llm-proxy"
 
+# sa-websocket's per-project DO, told about composition graph releases. Deploy sa-websocket first.
+[[durable_objects.bindings]]
+name = "BROADCASTER"
+class_name = "Broadcaster"
+script_name = "sa-websocket"
+
 # Environment variables (set via wrangler secret or dashboard)
 # These should be set as secrets, not in this file:
 #   wrangler secret put DATABASE_URL

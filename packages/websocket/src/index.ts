@@ -53,6 +53,11 @@ export default {
 			return apiKeyResponse;
 		}
 
+		// Internal only: sa-api calls the DO's /graph-release via its binding; never forward it from outside.
+		if (url.pathname === '/graph-release') {
+			return new Response('Not found', { status: 404 });
+		}
+
 		const projectId = url.searchParams.get('projectId');
 		if (!projectId) {
 			return new Response(

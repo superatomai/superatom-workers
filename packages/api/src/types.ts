@@ -70,6 +70,8 @@ export type Env = {
   LLM_PROXY?: Fetcher;
   LLM_PROXY_ADMIN_SECRET?: string;
   INSTALL_LLM_PROXY_MODE?: string;
+  /** Optional: sa-websocket's Broadcaster DO, notified on composition graph publish/rollback. */
+  BROADCASTER?: DurableObjectNamespace;
 };
 
 export type AppVariables = {
