@@ -792,9 +792,9 @@ export const graphChanges = pgTable(
     entity: varchar("entity", { length: 8 }).notNull(),
     // graph_nodes.id or concepts.id per `entity` (not an FK: history outlives the row).
     entityId: integer("entity_id").notNull(),
-    // create | update | delete | owner
+    // create | update | delete | restore | owner
     action: varchar("action", { length: 8 }).notNull(),
-    // edit | merge | import
+    // edit | merge | import | discard
     via: varchar("via", { length: 8 }).notNull(),
     // Set when `via` is merge.
     changeRequestId: integer("change_request_id").references(() => graphChangeRequests.id, { onDelete: "set null" }),

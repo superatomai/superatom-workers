@@ -33,7 +33,7 @@ import {
   rejectRequest,
   updateOwnRequest,
 } from "../lib/graph/requests";
-import { currentRelease, diffItems, getRelease, notifyRelease, pendingChanges, publish, releaseContent, rollback, type ReleaseItem } from "../lib/graph/release";
+import { currentRelease, diffItems, discardDraft, getRelease, notifyRelease, pendingChanges, publish, releaseContent, rollback, type ReleaseItem } from "../lib/graph/release";
 import { importGraph, type ImportMode } from "../lib/graph/import";
 
 /** Composition graph routes (/projects/:projectId/graph), org admins only; engines see edits only after a publish. */
@@ -631,6 +631,12 @@ graphRouter.get(
 graphRouter.get(
   "/publish/preview",
   handler(async (c, s) => c.json(await pendingChanges(c.get("db"), s))),
+);
+
+/** POST /discard — put the working copy back to the live release (any admin). Nothing is published. */
+graphRouter.post(
+  "/discard",
+  handler(async (c, s) => c.json(await tx(c, (q) => discardDraft(q, s)))),
 );
 
 /** POST /publish — { notes? }: freeze the working copy as the next release and make it current. */

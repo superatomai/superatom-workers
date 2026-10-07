@@ -1,11 +1,27 @@
-import { and, desc, eq, sql } from "drizzle-orm";
-import { graphReleaseEvents, graphReleases, graphRevisions } from "../../db/schema";
+import { and, desc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
+import { concepts, graphChanges, graphNodes, graphReleaseEvents, graphReleases, graphRevisions, users } from "../../db/schema";
 import type { Q } from "../../db/tx";
 import type { Env } from "../../types";
 import { analyseGraph, MAX_DEPTH } from "./dag";
 import { HttpError } from "./errors";
 import { canonicalJson, sha256Hex } from "./hash";
-import { edgeOrder, lockProject, loadWorkingCopy, type ConceptRow, type EdgeRow, type NodeRow, type Scope, type TermRow } from "./store";
+import {
+  conceptFieldsOf,
+  edgeOrder,
+  lockProject,
+  loadWorkingCopy,
+  logChange,
+  nodeContent as flatNode,
+  proposalOf,
+  writeConcept,
+  writeNode,
+  type ConceptRow,
+  type EdgeRow,
+  type NodeRow,
+  type Scope,
+  type TermRow,
+} from "./store";
+import type { EdgeInput, NodeProposal, TermInput } from "./validate";
 
 /** Releases: immutable numbered snapshots; the current one is the latest release event's to_release_id. */
 
@@ -223,12 +239,126 @@ export async function pendingChanges(q: Q, s: Scope) {
   ]);
   const liveJson = new Map(liveContent.map((r) => [`${r.entity}:${r.id}`, canonicalJson(r.content)]));
   const changed = hashDiffers.filter((i) => liveJson.get(itemKey(i)) !== canonicalJson(i.content));
+  const by = await changedBy(q, s.projectId, current?.release.createdAt ?? null);
+  const row = (i: { entity: string; id: number }, name: string | null) => ({
+    entity: i.entity as ReleaseItem["entity"],
+    id: i.id,
+    name,
+    changedBy: by.get(itemKey(i)) ?? [],
+  });
   return {
     current: current ? { seq: current.release.seq } : null,
-    added: added.map((i) => ({ entity: i.entity, id: i.id, name: nameOf(i) })),
-    changed: changed.map((i) => ({ entity: i.entity, id: i.id, name: nameOf(i) })),
-    removed: removedNamed.map((i) => ({ entity: i.entity as ReleaseItem["entity"], id: i.id, name: nameOf(i) })),
+    added: added.map((i) => row(i, nameOf(i))),
+    changed: changed.map((i) => row(i, nameOf(i))),
+    removed: removedNamed.map((i) => row(i, nameOf(i))),
   };
+}
+
+/** Who changed each item since `since` (the live version), from the edit history: item key → names. */
+async function changedBy(q: Q, projectId: string, since: Date | null): Promise<Map<string, string[]>> {
+  const rows = await q
+    .selectDistinct({ entity: graphChanges.entity, entityId: graphChanges.entityId, name: users.name, email: users.email })
+    .from(graphChanges)
+    .leftJoin(users, eq(users.id, graphChanges.changedBy))
+    .where(and(eq(graphChanges.projectId, projectId), since ? gt(graphChanges.changedAt, since) : undefined));
+  const out = new Map<string, string[]>();
+  for (const r of rows) {
+    const who = r.name || r.email;
+    if (!who) continue;
+    const k = `${r.entity}:${r.entityId}`;
+    out.set(k, [...(out.get(k) ?? []), who]);
+  }
+  return out;
+}
+
+/**
+ * Discard the draft: put the working copy back to the live release. Items the
+ * draft added are removed, items it deleted come back, changed ones get their
+ * live content. Every reset is in the edit history (via "discard"). Nothing is
+ * published and open change requests are left alone. Run in a transaction.
+ */
+export async function discardDraft(q: Q, s: Scope) {
+  await lockProject(q, s.projectId);
+  const current = await currentRelease(q, s.projectId);
+  if (!current) throw new HttpError(409, "Nothing is published yet, so there's no version to go back to");
+  const live = await releaseContent(q, s.projectId, current.release.items as ReleaseItem[]);
+  const liveIds = { node: new Set<number>(), concept: new Set<number>() };
+  for (const i of live) liveIds[i.entity as "node" | "concept"].add(i.id);
+  const how = { via: "discard" as const };
+  const counts = { removed: 0, restored: 0, reverted: 0 };
+
+  // 1. Remove what the draft added (first, so restored items can take back their names).
+  const wc = await loadWorkingCopy(q, s.projectId);
+  const newNodes = wc.nodes.filter((n) => !liveIds.node.has(n.id));
+  const newConcepts = wc.concepts.filter((c) => !liveIds.concept.has(c.id));
+  if (newNodes.length) {
+    await q
+      .update(graphNodes)
+      .set({ deletedAt: new Date(), editVersion: sql`${graphNodes.editVersion} + 1`, updatedBy: s.userId, updatedAt: new Date() })
+      .where(inArray(graphNodes.id, newNodes.map((n) => n.id)));
+  }
+  if (newConcepts.length) {
+    await q
+      .update(concepts)
+      .set({ deletedAt: new Date(), editVersion: sql`${concepts.editVersion} + 1`, updatedBy: s.userId, updatedAt: new Date() })
+      .where(inArray(concepts.id, newConcepts.map((c) => c.id)));
+  }
+  for (const n of newNodes) {
+    const content = flatNode(proposalOf(n, wc.edges.filter((e) => e.parentId === n.id), wc.terms.filter((t) => t.nodeId === n.id)));
+    await logChange(q, s, { entity: "node", entityId: n.id, action: "delete", before: content, after: null }, how);
+  }
+  for (const c of newConcepts) {
+    await logChange(q, s, { entity: "concept", entityId: c.id, action: "delete", before: conceptFieldsOf(c), after: null }, how);
+  }
+  counts.removed = newNodes.length + newConcepts.length;
+
+  // 2. Bring back what the draft deleted.
+  const deletedNodes = [...liveIds.node].length
+    ? await q.select().from(graphNodes).where(and(inArray(graphNodes.id, [...liveIds.node]), isNotNull(graphNodes.deletedAt)))
+    : [];
+  const deletedConcepts = [...liveIds.concept].length
+    ? await q.select().from(concepts).where(and(inArray(concepts.id, [...liveIds.concept]), isNotNull(concepts.deletedAt)))
+    : [];
+  if (deletedNodes.length) {
+    await q.update(graphNodes).set({ deletedAt: null, updatedBy: s.userId, updatedAt: new Date() }).where(inArray(graphNodes.id, deletedNodes.map((n) => n.id)));
+  }
+  if (deletedConcepts.length) {
+    await q.update(concepts).set({ deletedAt: null, updatedBy: s.userId, updatedAt: new Date() }).where(inArray(concepts.id, deletedConcepts.map((c) => c.id)));
+  }
+  counts.restored = deletedNodes.length + deletedConcepts.length;
+
+  // 3. Live content back onto every live item (concepts first: nodes link to them).
+  const rows = await loadWorkingCopy(q, s.projectId);
+  const restored = new Set([...deletedNodes.map((n) => `node:${n.id}`), ...deletedConcepts.map((c) => `concept:${c.id}`)]);
+  for (const item of live.filter((i) => i.entity === "concept")) {
+    const row = rows.concepts.find((c) => c.id === item.id);
+    if (!row) continue;
+    const target = { ...conceptFieldsOf(row), ...(item.content as Partial<ReturnType<typeof conceptFieldsOf>>) };
+    if (canonicalJson(conceptFieldsOf(row)) !== canonicalJson(target)) {
+      await writeConcept(q, s, row, target, how);
+      if (!restored.has(`concept:${item.id}`)) counts.reverted++;
+    }
+  }
+  for (const item of live.filter((i) => i.entity === "node")) {
+    const row = rows.nodes.find((n) => n.id === item.id);
+    if (!row) continue;
+    const c = item.content as NodeProposal["fields"] & { edges: EdgeInput[]; terms: TermInput[] };
+    const target: NodeProposal = {
+      fields: { kind: c.kind, name: c.name, title: c.title, body: c.body, meta: c.meta ?? {}, status: c.status },
+      edges: c.edges ?? [],
+      terms: c.terms ?? [],
+    };
+    const now = flatNode(proposalOf(row, rows.edges.filter((e) => e.parentId === row.id), rows.terms.filter((t) => t.nodeId === row.id)));
+    if (canonicalJson(now) !== canonicalJson(flatNode(target))) {
+      await writeNode(q, s, row, target, how);
+      if (!restored.has(`node:${item.id}`)) counts.reverted++;
+    }
+  }
+  // A restored item is in the history as restored, whatever step 3 did with it.
+  for (const n of deletedNodes) await logChange(q, s, { entity: "node", entityId: n.id, action: "restore", before: null, after: { id: n.id } }, how);
+  for (const c of deletedConcepts) await logChange(q, s, { entity: "concept", entityId: c.id, action: "restore", before: null, after: { id: c.id } }, how);
+
+  return { version: current.release.seq, ...counts };
 }
 
 /** Publish the working copy as the next release. Run in a transaction. */

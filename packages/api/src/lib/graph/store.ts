@@ -190,7 +190,7 @@ export async function nodeNames(q: Q, ids: number[]): Promise<Map<number, string
 
 /** How a change reached the working copy, and the request it came from (merge). */
 export interface ChangeVia {
-  via?: "edit" | "merge" | "import";
+  via?: "edit" | "merge" | "import" | "discard";
   changeRequestId?: number;
 }
 
@@ -205,7 +205,7 @@ export const nodeContent = (p: NodeProposal) => ({
 export async function logChange(
   q: Q,
   s: Scope,
-  c: { entity: "node" | "concept"; entityId: number; action: "create" | "update" | "delete" | "owner"; before: unknown; after: unknown },
+  c: { entity: "node" | "concept"; entityId: number; action: "create" | "update" | "delete" | "restore" | "owner"; before: unknown; after: unknown },
   how: ChangeVia = {},
 ): Promise<void> {
   if (c.action === "update" && canonicalJson(c.before) === canonicalJson(c.after)) return;
