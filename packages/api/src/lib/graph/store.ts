@@ -190,7 +190,7 @@ export async function nodeNames(q: Q, ids: number[]): Promise<Map<number, string
 
 /** How a change reached the working copy, and the request it came from (merge). */
 export interface ChangeVia {
-  via?: "edit" | "merge" | "import" | "discard";
+  via?: "edit" | "merge" | "import" | "discard" | "rollback";
   changeRequestId?: number;
 }
 

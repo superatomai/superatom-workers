@@ -281,10 +281,16 @@ export async function discardDraft(q: Q, s: Scope) {
   await lockProject(q, s.projectId);
   const current = await currentRelease(q, s.projectId);
   if (!current) throw new HttpError(409, "Nothing is published yet, so there's no version to go back to");
-  const live = await releaseContent(q, s.projectId, current.release.items as ReleaseItem[]);
+  const counts = await resetWorkingCopy(q, s, current.release.items as ReleaseItem[], "discard");
+  return { version: current.release.seq, ...counts };
+}
+
+/** Put the working copy back to a release's items (see discardDraft). The project must be locked. */
+async function resetWorkingCopy(q: Q, s: Scope, items: ReleaseItem[], via: "discard" | "rollback") {
+  const live = await releaseContent(q, s.projectId, items);
   const liveIds = { node: new Set<number>(), concept: new Set<number>() };
   for (const i of live) liveIds[i.entity as "node" | "concept"].add(i.id);
-  const how = { via: "discard" as const };
+  const how = { via };
   const counts = { removed: 0, restored: 0, reverted: 0 };
 
   // 1. Remove what the draft added (first, so restored items can take back their names).
@@ -358,7 +364,7 @@ export async function discardDraft(q: Q, s: Scope) {
   for (const n of deletedNodes) await logChange(q, s, { entity: "node", entityId: n.id, action: "restore", before: null, after: { id: n.id } }, how);
   for (const c of deletedConcepts) await logChange(q, s, { entity: "concept", entityId: c.id, action: "restore", before: null, after: { id: c.id } }, how);
 
-  return { version: current.release.seq, ...counts };
+  return counts;
 }
 
 /** Publish the working copy as the next release. Run in a transaction. */
@@ -405,7 +411,12 @@ export async function publish(q: Q, s: Scope, notes: string | null) {
   return { release, eventSeq, changes };
 }
 
-/** Point the project back at an earlier release. Nothing is deleted; it is one more event. */
+/**
+ * Make an earlier release live again: one more event, and the working copy is
+ * put back to that release, so the page shows it with no draft. Releases are
+ * never deleted, so the newer one can be made live again. Unpublished edits are
+ * dropped (the UI lists them first). Run in a transaction.
+ */
 export async function rollback(q: Q, s: Scope, toSeq: number, reason: string) {
   await lockProject(q, s.projectId);
   const current = await currentRelease(q, s.projectId);
@@ -424,6 +435,7 @@ export async function rollback(q: Q, s: Scope, toSeq: number, reason: string) {
     reason,
     actor: s.userId,
   });
+  await resetWorkingCopy(q, s, target.items as ReleaseItem[], "rollback");
   return { release: target, eventSeq, from: current.release.seq };
 }
 
