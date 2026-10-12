@@ -19,6 +19,7 @@ import permissionsRoutes from "./routes/permissions";
 import myAppsRoutes from "./routes/my-apps";
 import uploadRoutes from "./routes/upload";
 import sourceUploadRoutes from "./routes/source-upload";
+import chatAttachmentUploadRoutes from "./routes/chat-attachment-upload";
 import analyticsRoutes from "./routes/analytics";
 import speechRoutes from "./routes/speech";
 import answerFeedbackRoutes from "./routes/answer-feedback";
@@ -108,6 +109,7 @@ app.route("/orgs/:orgId/users", usersRoutes);
 app.route("/orgs/:orgId/projects", projectsRoutes);
 // More specific prefix first — Hono matches in registration order.
 app.route("/upload/source-file", sourceUploadRoutes);
+app.route("/upload/chat-attachment", chatAttachmentUploadRoutes);
 app.route("/upload", uploadRoutes);
 app.route("/my/apps", myAppsRoutes); // must be before appsRoutes (mounted at /) to avoid adminOnly middleware
 app.route("/apps", permissionsRoutes); // handles /apps/:appId/permissions
