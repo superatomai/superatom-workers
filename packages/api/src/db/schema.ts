@@ -930,3 +930,57 @@ export const graphEngineState = pgTable(
   },
   (table) => [primaryKey({ columns: [table.projectId, table.engineId] })]
 );
+
+// ─── Files ───────────────────────────────────────────────
+// One row per file kept in R2, whatever put it there. The row is the record of
+// the file; the object in R2 is its content. A changed file is a new row that
+// points at the one it replaces, never an overwrite.
+
+export const files = pgTable(
+  "files",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // The chat agent the file belongs to, when it belongs to one.
+    appId: uuid("app_id").references(() => apps.id, { onDelete: "set null" }),
+    // Who put it there; null once that user is removed.
+    userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
+    // chat_attachment now; agent_output and source_file later.
+    kind: varchar("kind", { length: 32 }).notNull(),
+    // What the file belongs to: ownerType "thread" with the thread id, "source" with
+    // the data source's id, and so on. These ids live in the project's own database
+    // (thread ids are nanoids, source ids look like "excel-168814462398"), so they
+    // are plain strings with no foreign key. Both set, or both empty.
+    ownerType: varchar("owner_type", { length: 32 }),
+    ownerId: varchar("owner_id", { length: 255 }),
+    fileName: text("file_name").notNull(),
+    contentType: varchar("content_type", { length: 255 }),
+    sizeBytes: bigint("size_bytes", { mode: "number" }),
+    r2Key: text("r2_key").notNull(),
+    etag: varchar("etag", { length: 128 }),
+    // pending: reserved, not yet confirmed in R2 | ready | deleted | expired: never completed
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    version: integer("version").notNull().default(1),
+    // The row this one replaces, when it is a changed copy.
+    previousVersionId: uuid("previous_version_id").references((): AnyPgColumn => files.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("files_r2_key_unique").on(table.r2Key),
+    index("files_org_idx").on(table.orgId),
+    index("files_project_kind_idx").on(table.projectId, table.kind),
+    index("files_owner_idx").on(table.ownerType, table.ownerId),
+    check("files_owner_check", sql`(${table.ownerType} is null) = (${table.ownerId} is null)`),
+    // The sweep that expires uploads that never completed.
+    index("files_status_created_idx").on(table.status, table.createdAt),
+    check("files_status_check", sql`${table.status} in ('pending', 'ready', 'deleted', 'expired')`),
+  ]
+);

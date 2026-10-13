@@ -20,6 +20,7 @@ import myAppsRoutes from "./routes/my-apps";
 import uploadRoutes from "./routes/upload";
 import sourceUploadRoutes from "./routes/source-upload";
 import chatAttachmentUploadRoutes from "./routes/chat-attachment-upload";
+import filesRoutes from "./routes/files";
 import analyticsRoutes from "./routes/analytics";
 import speechRoutes from "./routes/speech";
 import answerFeedbackRoutes from "./routes/answer-feedback";
@@ -111,6 +112,7 @@ app.route("/orgs/:orgId/projects", projectsRoutes);
 app.route("/upload/source-file", sourceUploadRoutes);
 app.route("/upload/chat-attachment", chatAttachmentUploadRoutes);
 app.route("/upload", uploadRoutes);
+app.route("/files", filesRoutes); // agent output files (service token) and downloads (user)
 app.route("/my/apps", myAppsRoutes); // must be before appsRoutes (mounted at /) to avoid adminOnly middleware
 app.route("/apps", permissionsRoutes); // handles /apps/:appId/permissions
 app.route("/projects/:projectId/graph", graphRoutes); // composition graph (org admins only)
