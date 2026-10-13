@@ -1,7 +1,7 @@
 {
   "name": "sa-api",
   "version": "1.0.0",
-  "description": "SuperAtom REST API — org management, user management, app permissions, auth",
+  "description": "SuperAtom REST API \u2014 org management, user management, app permissions, auth",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
@@ -18,7 +18,8 @@
     "db:migrate:prod": "DATABASE_URL=$(grep -E '^DATABASE_URL=' .env | cut -d= -f2-) drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "superadmin": "tsx scripts/super-admins.ts"
+    "superadmin": "tsx scripts/super-admins.ts",
+    "mirror-engine": "tsx scripts/mirror-engine.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",

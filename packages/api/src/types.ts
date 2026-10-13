@@ -44,6 +44,8 @@ export type Env = {
   SPEECH_CORRECT_TERMS?: string;
   // Built front-end apps, served by hostname: <app>/releases/<buildId>/… + <app>/current.json.
   FRONTEND_BUILDS: R2Bucket;
+  // Docker Engine/compose mirrors and per-release deploy bundles.
+  INSTALL_ARTIFACTS: R2Bucket;
   // Hostname that serves the super-admin console (UI + /api/*) instead of sa-api.
   SUPERADMIN_HOST: string;
   // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).

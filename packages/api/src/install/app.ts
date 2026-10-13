@@ -17,6 +17,7 @@ import {
   verifyDownload,
 } from "./lib";
 import { isUniqueViolation } from "../superadmin/lib/validate";
+import engine from "./engine";
 
 /**
  * install.superatom.ai — what `curl -fsSL https://install.superatom.ai | sh` talks to.
@@ -30,8 +31,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 install.use("*", async (c, next) => {
   c.set("db", createDb(c.env.DATABASE_URL));
   await next();
-  c.header("Cache-Control", "no-store");
+  // Engine artifacts are immutable and set their own; everything else is per-install.
+  if (!c.res.headers.get("Cache-Control")) c.header("Cache-Control", "no-store");
 });
+
+// Docker Engine + compose, for VMs that cannot reach download.docker.com.
+install.route("/api/engine", engine);
 
 async function limited(env: Env, key: string): Promise<boolean> {
   const { success } = await env.INSTALL_RATE_LIMITER.limit({ key });
