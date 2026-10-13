@@ -15,7 +15,7 @@ minimumReleaseAgeExclude:
 # local dev toolchain (miniflare/unenv/drizzle-kit/tsx) past known CVEs.
 overrides:
   esbuild: ^0.28.1
-  undici: ^6.28.0
+  undici: ^6.28.1
   ws: ^8.21.0
   defu: ^6.1.5
   sharp: ^0.35.4

@@ -15,15 +15,61 @@ bucket_name = "sa-assets-dev"
 binding = "R2_SOURCE_FILES"
 bucket_name = "sa-source-files-dev"
 
+# Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
+# MUST be the same namespace in sa-api-dev and sa-websocket-dev: sa-api-dev signs
+# with it, sa-websocket-dev verifies with it. Keys: org:<orgId>, org:__global.
+# Create ONCE, from packages/api (not here — that would make a second store):
+#   npx wrangler kv namespace create JWT_SECRETS --config wrangler.dev.toml
+# then paste the same id into this file and the other worker's wrangler.dev.toml.
+[[kv_namespaces]]
+binding = "JWT_SECRETS"
+id = "9c9a0b9db2e346b98150dc0f2f9a27df"
+
+# Built front-end apps — isolated from prod.
+[[r2_buckets]]
+binding = "FRONTEND_BUILDS"
+bucket_name = "sa-frontend-builds-dev"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
+SUPERADMIN_HOST = "dev.superadmin.superatom.ai"
+# Installer host. Dev installs the dev branch, a dummy LLM key and the dev websocket.
+INSTALL_HOST = "dev.install.superatom.ai"
+INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
+INSTALL_CODE_REF = "dev"
+INSTALL_SA_API_URL = "https://sa-api-dev.ashish-91e.workers.dev"
+INSTALL_WS_URL = "wss://sa-websocket-dev.ashish-91e.workers.dev/websocket"
+# Dev UIs have no per-org subdomains ("dev" is a reserved slug in the platform UI).
+INSTALL_PLATFORM_UI_URL = "https://dev.platform.superatom.ai"
+INSTALL_USER_UI_URL = "https://dev.live.superatom.ai"
+INSTALL_LLM_PROXY_MODE = "dummy"
+
+# sa-websocket-dev's per-project DO, told about composition graph releases. Deploy sa-websocket-dev first.
+[[durable_objects.bindings]]
+name = "BROADCASTER"
+class_name = "Broadcaster"
+script_name = "sa-websocket-dev"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
 name = "SPEECH_RATE_LIMITER"
 type = "ratelimit"
 namespace_id = "2001"
+simple = { limit = 20, period = 60 }
+
+# Super-admin console login throttle, per IP and per IP+email.
+[[unsafe.bindings]]
+name = "SUPERADMIN_LOGIN_LIMITER"
+type = "ratelimit"
+namespace_id = "2003"
+simple = { limit = 10, period = 60 }
+
+# Installer (redeem / update / code download) throttle, per IP.
+[[unsafe.bindings]]
+name = "INSTALL_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "2005"
 simple = { limit = 20, period = 60 }
 
 # Secrets (set once, then managed via Cloudflare dashboard or wrangler):
@@ -34,9 +80,14 @@ simple = { limit = 20, period = 60 }
 #   pnpm wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.dev.toml
 #   pnpm wrangler secret put SA_INTERNAL_SERVICE_TOKEN --config wrangler.dev.toml
 #   pnpm wrangler secret put OPENROUTER_API_KEY --config wrangler.dev.toml
+#   pnpm wrangler secret put SUPERADMIN_JWT_SECRET --config wrangler.dev.toml
+#   pnpm wrangler secret put GITHUB_CODE_TOKEN --config wrangler.dev.toml        # same read-only PAT as prod is fine
+#   pnpm wrangler secret put INSTALL_DOWNLOAD_SECRET --config wrangler.dev.toml  # fresh random value
+#   pnpm wrangler secret put RESEND_API_KEY --config wrangler.dev.toml           # optional on dev
 #
 # DATABASE_URL: Dev Neon PostgreSQL connection string
-# JWT_SECRET: A fresh random secret (different from prod)
+# JWT_SECRET: A fresh random secret (different from prod). Signs only SSO/SAML
+#   state tokens; access tokens are signed with the per-org JWT_SECRETS (KV above).
 # R2_ACCOUNT_ID: Cloudflare account id, used to derive R2 S3 endpoint
 # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY: R2 API token scoped to sa-assets-dev
 #   and sa-source-files-dev only (not prod's buckets) — used to presign multipart URLs

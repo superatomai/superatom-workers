@@ -6,8 +6,11 @@ export interface Env {
 	BROADCASTER: DurableObjectNamespace;
 	DATABASE_URL: string;
 	SUPERATOM_SERVICE_KEY: string;
-	/** Shared with sa-api; verifies browser session tokens. */
-	JWT_SECRET: string;
+	/**
+	 * Per-org signing secrets (org:<orgId>, org:__global), the same KV namespace
+	 * sa-api signs with; verifies browser session tokens. See auth/org-secrets.ts.
+	 */
+	JWT_SECRETS: KVNamespace;
 	/** "true" enforces browser auth; anything else logs violations only. */
 	WS_AUTH_ENFORCE: string;
 }
@@ -48,6 +51,11 @@ export default {
 		const apiKeyResponse = await handleApiKeyRoutes(request, env);
 		if (apiKeyResponse) {
 			return apiKeyResponse;
+		}
+
+		// Internal only: sa-api calls the DO's /graph-release via its binding; never forward it from outside.
+		if (url.pathname === '/graph-release') {
+			return new Response('Not found', { status: 404 });
 		}
 
 		const projectId = url.searchParams.get('projectId');
@@ -139,7 +147,7 @@ export default {
 			const result = await verifyBrowserSession({
 				token: extractToken(request, url),
 				projectId,
-				jwtSecret: env.JWT_SECRET,
+				jwtSecrets: env.JWT_SECRETS,
 				databaseUrl: env.DATABASE_URL,
 			});
 

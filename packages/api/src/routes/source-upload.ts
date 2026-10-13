@@ -26,7 +26,7 @@ import { AwsClient } from "aws4fetch";
 import { eq } from "drizzle-orm";
 import { projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware } from "../middleware/auth";
+import { authMiddleware, authenticateRequest } from "../middleware/auth";
 
 // 5 MB is the S3/R2 minimum part size (except for the last part).
 // 10 MB chosen as default — gives 100 parts for a 1 GB file, well under the 10,000 cap.
@@ -285,18 +285,11 @@ sourceUploadRouter.post("/signed-get", async (c) => {
 
   // If not a service call, require a normal JWT.
   if (!isService) {
-    // Inline JWT check (can't use authMiddleware on a per-route basis after the
-    // service-token branch above without duplicating the middleware chain).
-    const authHeader = c.req.header("Authorization");
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : c.req.query("token");
-    if (!token) return c.json({ error: "Missing authorization" }, 401);
-    try {
-      const { jwtVerify } = await import("jose");
-      const secret = new TextEncoder().encode(c.env.JWT_SECRET);
-      await jwtVerify(token, secret);
-    } catch {
-      return c.json({ error: "Invalid or expired token" }, 401);
-    }
+    // Can't mount authMiddleware per-route after the service-token branch above,
+    // so run the same check directly — including the per-org secret and the
+    // account status lookup, not just the signature.
+    const auth = await authenticateRequest(c);
+    if (!auth.ok) return c.json({ error: auth.error }, auth.status);
   }
 
   const body = await c.req.json<{ key: string }>().catch(() => null);
@@ -329,16 +322,8 @@ sourceUploadRouter.post("/delete", async (c) => {
   const isService = !!serviceToken && serviceToken === c.env.SA_INTERNAL_SERVICE_TOKEN;
 
   if (!isService) {
-    const authHeader = c.req.header("Authorization");
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : c.req.query("token");
-    if (!token) return c.json({ error: "Missing authorization" }, 401);
-    try {
-      const { jwtVerify } = await import("jose");
-      const secret = new TextEncoder().encode(c.env.JWT_SECRET);
-      await jwtVerify(token, secret);
-    } catch {
-      return c.json({ error: "Invalid or expired token" }, 401);
-    }
+    const auth = await authenticateRequest(c);
+    if (!auth.ok) return c.json({ error: auth.error }, auth.status);
   }
 
   const body = await c.req.json<{ key: string }>().catch(() => null);

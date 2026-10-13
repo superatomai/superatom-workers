@@ -14,9 +14,9 @@ import {
 } from "../lib/saml";
 import { authMiddleware, adminOnly } from "../middleware/auth";
 import { isAllowedRedirect } from "../lib/origins";
-import { ACCESS_TOKEN_TTL } from "../lib/access-token";
+import { mintAccessToken } from "../lib/access-token";
 import { issueRefreshToken } from "../lib/refresh-tokens";
-import { setRefreshCookie } from "../lib/refresh-cookie";
+import { setRefreshCookie, siteFromUrl } from "../lib/refresh-cookie";
 import { DOMParser } from"@xmldom/xmldom";
 
 
@@ -345,28 +345,25 @@ saml.post("/acs", async (c) => {
       );
     }
 
-    // Issue SA-API JWT
-    const secret = new TextEncoder().encode(c.env.JWT_SECRET);
-    const saToken = await new SignJWT({
-      userId: user.id,
-      orgId: user.orgId,
-      role: user.role,
-    })
-      .setProtectedHeader({ alg: "HS256" })
-      .setIssuedAt()
-      .setExpirationTime(ACCESS_TOKEN_TTL)
-      .sign(secret);
+    // Issue SA-API JWT, signed with the user's org secret (lib/org-secrets.ts)
+    // One id for this login session: the JWT's `sid` and the refresh family.
+    const sessionId = crypto.randomUUID();
+    const saToken = await mintAccessToken(user, c.env.JWT_SECRETS, sessionId);
 
     // Refresh token in an httpOnly cookie; only the 15-minute access token goes
     // in the URL below. Applies to both the SP-initiated and IdP-initiated
     // flows, which both terminate here.
     const refresh = await issueRefreshToken(db, user.id, {
+      familyId: sessionId,
       userAgent: c.req.header("User-Agent"),
     });
-    setRefreshCookie(c, refresh.token, user.orgId ?? undefined);
+    // Redirect target: the verified RelayState front-end (SP-initiated) or the
+    // platform default (IdP-initiated). The IdP posts here, so Origin names the
+    // IdP, not our site — the front-end we send the user back to decides the cookie.
+    const frontendCallbackUrl = relayState ? errorRedirectUrl : defaultRedirect;
+    setRefreshCookie(c, refresh.token, siteFromUrl(frontendCallbackUrl));
 
     // Redirect to frontend with token
-    const frontendCallbackUrl = relayState ? errorRedirectUrl : defaultRedirect;
     return c.redirect(`${frontendCallbackUrl}?token=${saToken}`);
   } catch (err: any) {
     console.error("[SAML] ACS error:", err);

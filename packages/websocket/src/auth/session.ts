@@ -20,8 +20,11 @@
  * constitutes a valid session.
  */
 
-import { jwtVerify } from 'jose';
+import { decodeJwt, jwtVerify } from 'jose';
 import { executeQuery } from '../api-keys/service';
+import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from './org-secrets';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type UserRole = 'super_admin' | 'org_admin' | 'member';
 
@@ -50,7 +53,8 @@ export interface VerifyBrowserSessionOptions {
 	/** Raw JWT from ?token= or the Authorization header. */
 	token: string | null;
 	projectId: string;
-	jwtSecret: string | undefined;
+	/** JWT_SECRETS KV namespace — per-org signing secrets, see org-secrets.ts. */
+	jwtSecrets: KVNamespace | undefined;
 	databaseUrl: string | undefined;
 }
 
@@ -73,28 +77,71 @@ export function extractToken(request: Request, url: URL): string | null {
 export async function verifyBrowserSession(
 	options: VerifyBrowserSessionOptions
 ): Promise<SessionResult> {
-	const { token, projectId, jwtSecret, databaseUrl } = options;
+	const { token, projectId, jwtSecrets, databaseUrl } = options;
 
 	if (!token) {
 		return { ok: false, status: 401, reason: 'missing_token' };
 	}
 
-	// Fail closed on misconfiguration: without the secret we cannot verify
+	// Fail closed on misconfiguration: without the secrets we cannot verify
 	// anything, and treating that as "authenticated" would defeat the check.
-	if (!jwtSecret) {
-		console.error('[auth] JWT_SECRET is not configured on this worker');
-		return { ok: false, status: 500, reason: 'jwt_secret_not_configured' };
+	if (!jwtSecrets) {
+		console.error('[auth] JWT_SECRETS KV binding is not configured on this worker');
+		return { ok: false, status: 500, reason: 'jwt_secrets_not_configured' };
+	}
+
+	// The unverified orgId claim picks the org's secret. It is not trusted beyond
+	// that: the binding check after the users query compares it with the
+	// account's real org.
+	let claimedOrgId: string | null;
+	try {
+		claimedOrgId = (decodeJwt(token).orgId as string | null | undefined) ?? null;
+	} catch {
+		return { ok: false, status: 401, reason: 'invalid_or_expired_token' };
+	}
+
+	let secret: Uint8Array | null;
+	try {
+		secret = await getOrgSecret(jwtSecrets, claimedOrgId);
+	} catch (error: any) {
+		console.error('[auth] signing secret lookup failed:', error?.message);
+		return { ok: false, status: 500, reason: 'signing_secret_lookup_failed' };
+	}
+	if (!secret) {
+		console.warn(`[auth] no signing secret for ${secretKeyFor(claimedOrgId)}`);
+		return { ok: false, status: 401, reason: 'unknown_signing_org' };
 	}
 
 	let userId: string;
 	let issuedAt: number | undefined;
+	let sessionId: string | null;
+	/**
+	 * The caller's data access, when the token states it (SDK sign-ins do —
+	 * sa-api puts the customer's `access` claim here after checking it). Used in
+	 * place of the stored `users.config` below, so the customer's latest word
+	 * wins over whatever we last wrote down.
+	 *
+	 * Safe to trust for the same reason `userId` is: it comes out of a token we
+	 * signed, verified a line above. Nothing the browser sends beside the token
+	 * is ever read this way — see the authContext deletion in the broadcaster.
+	 */
+	let tokenConfig: unknown = null;
 	try {
-		const secret = new TextEncoder().encode(jwtSecret);
-		const { payload } = await jwtVerify(token, secret);
+		// Pin the algorithm so the token header cannot choose how it is verified.
+		const { payload } = await jwtVerify(token, secret, { algorithms: ['HS256'] });
 
 		userId = payload.userId as string;
 		issuedAt = payload.iat;
 		if (!userId) {
+			return { ok: false, status: 401, reason: 'invalid_token_payload' };
+		}
+		if (payload.access !== undefined && payload.access !== null) {
+			tokenConfig = payload.access;
+		}
+		// `sid` is the login session (refresh-token family). Absent on tokens from
+		// before it existed; malformed means a bad token. Mirrors sa-api.
+		sessionId = typeof payload.sid === 'string' ? payload.sid : null;
+		if (payload.sid !== undefined && (!sessionId || !UUID.test(sessionId))) {
 			return { ok: false, status: 401, reason: 'invalid_token_payload' };
 		}
 	} catch {
@@ -119,10 +166,17 @@ export async function verifyBrowserSession(
 			is_active: boolean;
 			tokens_valid_after: string | null;
 			config: unknown;
+			session_active: boolean;
 		}>(
 			databaseUrl,
-			'SELECT org_id, role, is_active, tokens_valid_after, config FROM users WHERE id = $1',
-			[userId]
+			// session_active: a logged-out session (its refresh family revoked) must not
+			// open a socket, while the user's other sessions still can.
+			`SELECT org_id, role, is_active, tokens_valid_after, config,
+			        ($2::uuid IS NULL OR EXISTS (
+			          SELECT 1 FROM refresh_tokens WHERE family_id = $2::uuid AND revoked_at IS NULL
+			        )) AS session_active
+			   FROM users WHERE id = $1`,
+			[userId, sessionId]
 		);
 
 		if (rows.length === 0) {
@@ -131,8 +185,19 @@ export async function verifyBrowserSession(
 
 		const account = rows[0];
 
+		// The secret that verified the token must be the account's own org's.
+		// Otherwise a holder of one org's secret could sign a token naming another
+		// org's user. Mirrors authenticateRequest in sa-api.
+		if (!isSecretBoundToUser(claimedOrgId, account.org_id)) {
+			return { ok: false, status: 401, reason: 'token_org_mismatch' };
+		}
+
 		if (!account.is_active) {
 			return { ok: false, status: 401, reason: 'account_deactivated' };
+		}
+
+		if (!account.session_active) {
+			return { ok: false, status: 401, reason: 'session_ended' };
 		}
 
 		// Logout stamps a revocation cutoff; a token minted before it is dead even
@@ -151,7 +216,16 @@ export async function verifyBrowserSession(
 			return { ok: false, status: 401, reason: 'invalid_account_state' };
 		}
 
-		session = { userId, orgId: account.org_id, role: account.role, config: account.config ?? null };
+		// The token's access when it carries one, the stored config otherwise. A
+		// user created through the SDK is restricted by what their own backend
+		// sent this time; `users.config` is the default an admin can edit here,
+		// used when a token says nothing about access.
+		session = {
+			userId,
+			orgId: account.org_id,
+			role: account.role,
+			config: tokenConfig ?? account.config ?? null,
+		};
 	} catch (error: any) {
 		console.error('[auth] account lookup failed:', error?.message);
 		return { ok: false, status: 500, reason: 'account_lookup_failed' };

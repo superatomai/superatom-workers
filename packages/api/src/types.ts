@@ -2,7 +2,11 @@ import type { Database } from "./db";
 
 export type Env = {
   DATABASE_URL: string;
+  // Signs only the SSO/SAML state tokens now. Access tokens use JWT_SECRETS.
   JWT_SECRET: string;
+  // Per-org access-token signing secrets (org:<orgId>, org:__global), shared
+  // with sa-websocket. See lib/org-secrets.ts.
+  JWT_SECRETS: KVNamespace;
   PLATFORM_UI_URL: string;
   /**
    * Optional comma-separated extra CORS origins, for front-ends not served from
@@ -38,6 +42,36 @@ export type Env = {
   // doc). Leave unset until live testing shows the recognizer-side biasing
   // (provider.options.google.prompt) is not honored.
   SPEECH_CORRECT_TERMS?: string;
+  // Built front-end apps, served by hostname: <app>/releases/<buildId>/… + <app>/current.json.
+  FRONTEND_BUILDS: R2Bucket;
+  // Hostname that serves the super-admin console (UI + /api/*) instead of sa-api.
+  SUPERADMIN_HOST: string;
+  // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).
+  SUPERADMIN_JWT_SECRET: string;
+  SUPERADMIN_LOGIN_LIMITER: RateLimit;
+  // ─── Installer host (src/install) ───
+  INSTALL_HOST: string;
+  INSTALL_RATE_LIMITER: RateLimit;
+  // Code source: fine-grained GitHub token, one repo, contents read-only.
+  GITHUB_CODE_TOKEN?: string;
+  INSTALL_CODE_REPO: string;
+  INSTALL_CODE_REF: string;
+  INSTALL_GITHUB_API?: string;
+  // Signs the short-lived code download links (min 32 chars).
+  INSTALL_DOWNLOAD_SECRET?: string;
+  // Values handed to new installs.
+  INSTALL_SA_API_URL: string;
+  // Client UI links for the install summary; "{slug}" is replaced with the org slug.
+  INSTALL_PLATFORM_UI_URL: string;
+  INSTALL_USER_UI_URL: string;
+  INSTALL_WS_URL?: string;
+  RESEND_API_KEY?: string;
+  // Per-project LLM proxy keys via the llm-proxy worker's admin API; "dummy" skips it (dev).
+  LLM_PROXY?: Fetcher;
+  LLM_PROXY_ADMIN_SECRET?: string;
+  INSTALL_LLM_PROXY_MODE?: string;
+  /** Optional: sa-websocket's Broadcaster DO, notified on composition graph publish/rollback. */
+  BROADCASTER?: DurableObjectNamespace;
 };
 
 export type AppVariables = {
@@ -45,4 +79,8 @@ export type AppVariables = {
   userId: string;
   orgId: string | null;
   userRole: "super_admin" | "org_admin" | "member";
+  /** The caller's login session (refresh-token family), from the token's `sid`; null for older tokens. */
+  sessionId: string | null;
+  /** "sdk" when the token came from the SDK exchange — such a session always acts as a member. */
+  tokenSource: "app" | "sdk";
 };

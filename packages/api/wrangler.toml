@@ -23,9 +23,30 @@ bucket_name = "sa-source-files"
 # bucket. Remove before pushing.
 # preview_bucket_name = "sa-source-files"
 
+# Private bucket for built front-end apps (super-admin console now; platform/runtime later).
+# Create with: wrangler r2 bucket create sa-frontend-builds
+[[r2_buckets]]
+binding = "FRONTEND_BUILDS"
+bucket_name = "sa-frontend-builds"
+
+# Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
+# MUST be the same namespace in sa-api and sa-websocket: sa-api signs with it,
+# sa-websocket verifies with it. Keys: org:<orgId>, org:__global.
+[[kv_namespaces]]
+binding = "JWT_SECRETS"
+id = "1669d6442bf34757a223bd7d6548d14c"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files"
+SUPERADMIN_HOST = "superadmin.superatom.ai"
+# Installer host: curl -fsSL https://install.superatom.ai | sh (src/install)
+INSTALL_HOST = "install.superatom.ai"
+INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
+INSTALL_CODE_REF = "main"
+INSTALL_SA_API_URL = "https://sa-api.superatom.ai"
+INSTALL_PLATFORM_UI_URL = "https://{slug}.platform.superatom.ai"
+INSTALL_USER_UI_URL = "https://{slug}.superatom.ai"
 
 # Per-user voice rate limit (docs/SPEECH-TO-TEXT-DESIGN.md §3.4). period must be 10 or 60.
 [[unsafe.bindings]]
@@ -33,6 +54,31 @@ name = "SPEECH_RATE_LIMITER"
 type = "ratelimit"
 namespace_id = "2001"
 simple = { limit = 20, period = 60 }
+
+# Super-admin console login throttle, per IP and per IP+email.
+[[unsafe.bindings]]
+name = "SUPERADMIN_LOGIN_LIMITER"
+type = "ratelimit"
+namespace_id = "2002"
+simple = { limit = 10, period = 60 }
+
+# Installer (redeem / update / code download) throttle, per IP.
+[[unsafe.bindings]]
+name = "INSTALL_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "2004"
+simple = { limit = 20, period = 60 }
+
+# Per-project LLM proxy keys are created through the llm-proxy worker's admin API.
+[[services]]
+binding = "LLM_PROXY"
+service = "llm-proxy"
+
+# sa-websocket's per-project DO, told about composition graph releases. Deploy sa-websocket first.
+[[durable_objects.bindings]]
+name = "BROADCASTER"
+class_name = "Broadcaster"
+script_name = "sa-websocket"
 
 # Environment variables (set via wrangler secret or dashboard)
 # These should be set as secrets, not in this file:
@@ -43,6 +89,11 @@ simple = { limit = 20, period = 60 }
 #   wrangler secret put R2_SECRET_ACCESS_KEY     # R2 API token secret
 #   wrangler secret put SA_INTERNAL_SERVICE_TOKEN # shared secret for backend → worker calls (e.g. /signed-get)
 #   wrangler secret put OPENROUTER_API_KEY       # voice transcription
+#   wrangler secret put SUPERADMIN_JWT_SECRET    # super-admin console sessions; ≥32 chars, NOT the same as JWT_SECRET
+#   wrangler secret put GITHUB_CODE_TOKEN        # installer: fine-grained PAT, superatom-setup-code only, Contents read-only
+#   wrangler secret put INSTALL_DOWNLOAD_SECRET  # installer: signs code download links; ≥32 random chars
+#   wrangler secret put LLM_PROXY_ADMIN_SECRET   # installer: the llm-proxy worker's ADMIN_SECRET
+#   wrangler secret put RESEND_API_KEY           # installer: handed to new installs (report/alert emails)
 #
 # DATABASE_URL: Prod Neon PostgreSQL connection string
 # JWT_SECRET: Secret key for signing/verifying JWTs

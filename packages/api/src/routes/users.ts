@@ -131,6 +131,9 @@ usersRouter.get("/", async (c) => {
       name: users.name,
       role: users.role,
       config: users.config,
+      // Their role names in the customer's own system, from an SDK sign-in.
+      // Read-only: the token owns them and overwrites them on every sign-in.
+      externalRoles: users.externalRoles,
       isActive: users.isActive,
       createdAt: users.createdAt,
     })
@@ -156,6 +159,7 @@ usersRouter.get("/:userId", async (c) => {
       name: users.name,
       role: users.role,
       config: users.config,
+      externalRoles: users.externalRoles,
       isActive: users.isActive,
       createdAt: users.createdAt,
     })

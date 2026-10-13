@@ -8,4 +8,5 @@ dist/
 .DS_Store
 # Admin-only API key creation script (kept out of the shared repo by request)
 packages/websocket/scripts/create-api-key.sh
+packages/websocket/scripts/create-api-key-dev.sh
 packages/websocket/scripts/revoke-api-key.sh

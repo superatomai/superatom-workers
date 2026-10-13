@@ -20,13 +20,11 @@ enabled = true
 # These should be set as secrets, not in this file:
 #   wrangler secret put DATABASE_URL
 #   wrangler secret put SUPERATOM_SERVICE_KEY
-#   wrangler secret put JWT_SECRET
 #
 # DATABASE_URL: Your Neon PostgreSQL connection string
 # SUPERATOM_SERVICE_KEY: Master key for API key management endpoints
-# JWT_SECRET: Browser session verification. MUST be byte-identical to the
-#   sa-api worker's JWT_SECRET — sa-api signs, this worker verifies. A mismatch
-#   rejects every browser connection once WS_AUTH_ENFORCE is on.
+# Browser session tokens are verified with the JWT_SECRETS KV namespace below
+#   (shared with sa-api) — this worker no longer needs JWT_SECRET.
 
 [vars]
 # Rollout gate for browser (runtime/admin) session auth.
@@ -35,10 +33,12 @@ enabled = true
 # Deploy with "false", confirm the logs are clean, then flip to "true".
 WS_AUTH_ENFORCE = "true"
 
-# Optional: KV namespaces (if you need them later)
-# [[kv_namespaces]]
-# binding = "MY_KV"
-# id = "your-kv-namespace-id"
+# Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
+# MUST be the same namespace in sa-api and sa-websocket: sa-api signs with it,
+# sa-websocket verifies with it. Keys: org:<orgId>, org:__global.
+[[kv_namespaces]]
+binding = "JWT_SECRETS"
+id = "1669d6442bf34757a223bd7d6548d14c"
 
 # Optional: R2 buckets (if you need them later)
 # [[r2_buckets]]

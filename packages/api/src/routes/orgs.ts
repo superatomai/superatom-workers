@@ -4,6 +4,7 @@ import { organizations, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, superAdminOnly, orgScopeGuard } from "../middleware/auth";
 import { validatePassword } from "../lib/password-policy";
+import { createOrgSecret } from "../lib/org-secrets";
 
 const orgs = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -41,6 +42,18 @@ orgs.post("/", authMiddleware, superAdminOnly, async (c) => {
     return c.json({ error: "name and slug are required" }, 400);
   }
 
+  // Validate the optional admin up front: rejecting it after the org (and its
+  // signing secret) had been created left a half-made org behind on a 400.
+  if (admin) {
+    if (!admin.email || !admin.name || !admin.password) {
+      return c.json({ error: "admin.email, admin.name, and admin.password are required" }, 400);
+    }
+    const pwError = validatePassword(admin.password);
+    if (pwError) {
+      return c.json({ error: pwError }, 400);
+    }
+  }
+
   // Check slug uniqueness
   const [existingOrg] = await db
     .select({ id: organizations.id })
@@ -52,24 +65,29 @@ orgs.post("/", authMiddleware, superAdminOnly, async (c) => {
     return c.json({ error: "An organization with this slug already exists" }, 409);
   }
 
+  // Every org signs its access tokens with its own secret (lib/org-secrets.ts),
+  // and an org without one cannot log in. So the id is generated here and the
+  // secret stored BEFORE the row exists: if the KV write fails there is no org
+  // yet, and if the insert fails the only leftover is an unused KV entry.
+  const orgId = crypto.randomUUID();
+  let secret: string;
+  try {
+    secret = await createOrgSecret(c.env.JWT_SECRETS, orgId);
+  } catch (error) {
+    console.error("[orgs] could not store the new org's signing secret:", error);
+    return c.json({ error: "Could not create organization, please try again" }, 503);
+  }
+
   // Create org
   const [org] = await db
     .insert(organizations)
-    .values({ name, slug, icon })
+    .values({ id: orgId, name, slug, icon })
     .returning();
 
   let orgAdmin = null;
 
-  // Optionally create org_admin
+  // Optionally create org_admin (already validated above)
   if (admin) {
-    if (!admin.email || !admin.name || !admin.password) {
-      return c.json({ error: "admin.email, admin.name, and admin.password are required" }, 400);
-    }
-    const pwError = validatePassword(admin.password);
-    if (pwError) {
-      return c.json({ error: pwError }, 400);
-    }
-
     const passwordHash = await hashPassword(admin.password);
 
     const [adminUser] = await db
@@ -92,7 +110,9 @@ orgs.post("/", authMiddleware, superAdminOnly, async (c) => {
     orgAdmin = adminUser;
   }
 
-  return c.json({ organization: org, admin: orgAdmin }, 201);
+  // The only time the secret is readable. KV holds the sole copy, so a lost one
+  // means rotating — which invalidates every live session for the org.
+  return c.json({ organization: org, admin: orgAdmin, secret }, 201);
 });
 
 /**
@@ -180,6 +200,32 @@ orgs.put("/:orgId", authMiddleware, adminOnly, orgScopeGuard, async (c) => {
   }
 
   return c.json(updated);
+});
+
+/**
+ * POST /orgs/:orgId/secret/rotate
+ * Issue a new signing secret and return it — the only other time a secret is
+ * readable. Every existing session for the org stops working within about two
+ * minutes, and the customer must start signing SDK tokens with the new one.
+ */
+orgs.post("/:orgId/secret/rotate", authMiddleware, superAdminOnly, async (c) => {
+  const orgId = c.req.param("orgId");
+  const [org] = await c
+    .get("db")
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  if (!org) return c.json({ error: "Organization not found" }, 404);
+
+  try {
+    const secret = await createOrgSecret(c.env.JWT_SECRETS, orgId);
+    console.log(`[orgs] signing secret rotated: org=${orgId} by=${c.get("userId")}`);
+    return c.json({ secret });
+  } catch (error) {
+    console.error("[orgs] could not rotate the signing secret:", error);
+    return c.json({ error: "Could not rotate the secret, please try again" }, 503);
+  }
 });
 
 export default orgs;
