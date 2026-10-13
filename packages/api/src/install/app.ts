@@ -18,6 +18,7 @@ import {
 } from "./lib";
 import { isUniqueViolation } from "../superadmin/lib/validate";
 import engine from "./engine";
+import { mountRegistry } from "./registry";
 
 /**
  * install.superatom.ai — what `curl -fsSL https://install.superatom.ai | sh` talks to.
@@ -37,6 +38,9 @@ install.use("*", async (c, next) => {
 
 // Docker Engine + compose, for VMs that cannot reach download.docker.com.
 install.route("/api/engine", engine);
+
+// OCI pulls, authenticated per project (src/install/registry.ts).
+mountRegistry(install);
 
 async function limited(env: Env, key: string): Promise<boolean> {
   const { success } = await env.INSTALL_RATE_LIMITER.limit({ key });
