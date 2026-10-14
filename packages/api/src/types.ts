@@ -63,6 +63,8 @@ export type Env = {
   INSTALL_DOWNLOAD_SECRET?: string;
   // Values handed to new installs.
   INSTALL_SA_API_URL: string;
+  // Host a VM runs `docker login`/`docker pull` against (this worker serves /v2).
+  INSTALL_REGISTRY_HOST?: string;
   // Client UI links for the install summary; "{slug}" is replaced with the org slug.
   INSTALL_PLATFORM_UI_URL: string;
   INSTALL_USER_UI_URL: string;

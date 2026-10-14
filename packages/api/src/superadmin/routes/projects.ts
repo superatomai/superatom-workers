@@ -1,12 +1,14 @@
 import { Hono } from "hono";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import { apiKeys, organizations, projects } from "../../db/schema";
 import type { Env } from "../../types";
 import type { SuperAdminVariables } from "../types";
 import { DEFAULT_DESIGN_SYSTEM } from "../../routes/projects";
 // Same generator/hash the websocket worker validates against — one key format.
 import { generateApiKey, getKeyPrefix, hashApiKey } from "../../../../websocket/src/api-keys/service";
-import { cleanName, isUniqueViolation, isUuid, projectSlugError } from "../lib/validate";
+import { cleanName, codeBranchError, isUniqueViolation, isUuid, projectSlugError } from "../lib/validate";
+import { branchExists } from "../../install/lib";
+import { projectReleases } from "../../db/schema";
 
 type Vars = SuperAdminVariables & { org: { id: string; slug: string } };
 
@@ -34,6 +36,8 @@ const projectColumns = {
   name: projects.name,
   slug: projects.slug,
   description: projects.description,
+  codeBranch: projects.codeBranch,
+  pinnedVersion: projects.pinnedVersion,
   createdAt: projects.createdAt,
   apiKey: {
     prefix: apiKeys.keyPrefix,
@@ -41,6 +45,16 @@ const projectColumns = {
     lastUsedAt: apiKeys.lastUsedAt,
   },
 };
+
+/**
+ * A branch that is not on the remote yet is allowed — it may be created later —
+ * but say so, because publishing from it would fail until then.
+ */
+async function branchWarning(env: Env, branch: string): Promise<string | undefined> {
+  return (await branchExists(env, branch)) === false
+    ? `Branch "${branch}" is not on the remote yet. Push it before publishing a release for this project.`
+    : undefined;
+}
 
 async function findProject(c: { var: Vars }, projectId: string | undefined) {
   if (!isUuid(projectId)) return null;
@@ -65,7 +79,9 @@ orgProjects.get("/", async (c) => {
 
 /** POST /api/orgs/:orgId/projects — { name, slug, description? } */
 orgProjects.post("/", async (c) => {
-  const body = await c.req.json<{ name?: unknown; slug?: unknown; description?: unknown }>().catch(() => null);
+  const body = await c.req
+    .json<{ name?: unknown; slug?: unknown; description?: unknown; codeBranch?: unknown }>()
+    .catch(() => null);
   const name = cleanName(body?.name);
   if (!name) return c.json({ error: "Project name is required (max 255 characters)." }, 400);
   const slug = typeof body?.slug === "string" ? body.slug.trim() : "";
@@ -75,6 +91,13 @@ orgProjects.post("/", async (c) => {
   if (body?.description !== undefined && body.description !== null && body.description !== "") {
     description = cleanName(body.description, 1000);
     if (!description) return c.json({ error: "Description must be at most 1000 characters." }, 400);
+  }
+
+  let codeBranch: string | undefined;
+  if (body?.codeBranch !== undefined && body.codeBranch !== null && body.codeBranch !== "") {
+    const branchError = codeBranchError(body.codeBranch);
+    if (branchError) return c.json({ error: branchError }, 400);
+    codeBranch = body.codeBranch as string;
   }
 
   const taken = `The slug "${slug}" is already used by another project in this organization.`;
@@ -89,19 +112,94 @@ orgProjects.post("/", async (c) => {
   try {
     const [project] = await db
       .insert(projects)
-      .values({ orgId: c.var.org.id, name, slug, description, designSystem: DEFAULT_DESIGN_SYSTEM })
+      .values({ orgId: c.var.org.id, name, slug, description, designSystem: DEFAULT_DESIGN_SYSTEM,
+                ...(codeBranch ? { codeBranch } : {}) })
       .returning({
         id: projects.id,
         name: projects.name,
         slug: projects.slug,
         description: projects.description,
+        codeBranch: projects.codeBranch,
         createdAt: projects.createdAt,
       });
-    return c.json({ project: { ...project, apiKey: null } }, 201);
+    const warning = codeBranch ? await branchWarning(c.env, codeBranch) : undefined;
+    return c.json({ project: { ...project, apiKey: null }, warning }, 201);
   } catch (err) {
     if (isUniqueViolation(err)) return c.json({ error: taken }, 409);
     throw err;
   }
+});
+
+/**
+ * PATCH /api/orgs/:orgId/projects/:projectId — { codeBranch?, pinnedVersion? }
+ * `codeBranch` is what the publish script builds. `pinnedVersion` rolls this
+ * project back to a published release; null follows the newest again. Neither
+ * touches a running VM — they apply on its next install or update.
+ */
+orgProjects.patch("/:projectId", async (c) => {
+  const project = await findProject(c, c.req.param("projectId"));
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  const body = await c.req.json<{ codeBranch?: unknown; pinnedVersion?: unknown }>().catch(() => null);
+  const patch: { codeBranch?: string; pinnedVersion?: string | null; updatedAt: Date } = { updatedAt: new Date() };
+
+  if (body?.codeBranch !== undefined) {
+    const branchError = codeBranchError(body.codeBranch);
+    if (branchError) return c.json({ error: branchError }, 400);
+    patch.codeBranch = body.codeBranch as string;
+  }
+  if (body?.pinnedVersion !== undefined) {
+    if (body.pinnedVersion === null || body.pinnedVersion === "") {
+      patch.pinnedVersion = null;
+    } else {
+      const version = cleanName(body.pinnedVersion);
+      if (!version) return c.json({ error: "Pinned version must be a non-empty string." }, 400);
+      const [release] = await c.var.db
+        .select({ id: projectReleases.id })
+        .from(projectReleases)
+        .where(and(eq(projectReleases.projectId, project.id), eq(projectReleases.version, version)))
+        .limit(1);
+      // Pinning to something unpublished would break that project's next install.
+      if (!release) return c.json({ error: `Version "${version}" is not published for this project.` }, 404);
+      patch.pinnedVersion = version;
+    }
+  }
+  if (patch.codeBranch === undefined && patch.pinnedVersion === undefined) {
+    return c.json({ error: "Nothing to update." }, 400);
+  }
+
+  const [updated] = await c.var.db
+    .update(projects)
+    .set(patch)
+    .where(eq(projects.id, project.id))
+    .returning({ id: projects.id, name: projects.name, slug: projects.slug,
+                 codeBranch: projects.codeBranch, pinnedVersion: projects.pinnedVersion });
+  console.log(`[superadmin] project updated: ${project.id} ${JSON.stringify(patch)} by=${c.var.admin.email}`);
+  return c.json({
+    project: updated,
+    warning: patch.codeBranch ? await branchWarning(c.env, patch.codeBranch) : undefined,
+  });
+});
+
+/** GET /api/orgs/:orgId/projects/:projectId/releases — newest first, for the pin picker. */
+orgProjects.get("/:projectId/releases", async (c) => {
+  const project = await findProject(c, c.req.param("projectId"));
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  const releases = await c.var.db
+    .select({
+      version: projectReleases.version,
+      branch: projectReleases.branch,
+      commit: projectReleases.commit,
+      imageDigest: projectReleases.imageDigest,
+      migrations: projectReleases.migrations,
+      publishedBy: projectReleases.publishedBy,
+      publishedAt: projectReleases.publishedAt,
+    })
+    .from(projectReleases)
+    .where(eq(projectReleases.projectId, project.id))
+    .orderBy(desc(projectReleases.publishedAt))
+    .limit(50);
+  return c.json({ releases });
 });
 
 /**

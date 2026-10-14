@@ -140,8 +140,11 @@ async function main() {
   try {
     await sh("git", ["-C", repo, "worktree", "add", "--detach", tree, sha]);
     console.log("Building image (pristine worktree)…");
+    // The repository name IS the project id: that is what the registry routes
+    // authorise against (src/install/registry.ts), so it must match exactly.
+    const repoTag = `${projectId}:${version}`;
     await sh("docker", ["buildx", "build", "--builder", "ocibuilder",
-      "--output", `type=oci,dest=${join(work, "image.tar")}`, "-t", `superatom-${projectId}:${version}`, tree]);
+      "--output", `type=oci,dest=${join(work, "image.tar")}`, "-t", repoTag, tree]);
 
     const layout = join(work, "oci");
     await sh("mkdir", ["-p", layout]);
@@ -175,7 +178,7 @@ async function main() {
 
     const release = {
       version, branch, commit: sha,
-      image: `superatom-${projectId}:${version}`,
+      image: repoTag,
       imageDigest: mDesc.digest,
       bundleSha256: bundleSha,
       publishedAt: new Date().toISOString(),

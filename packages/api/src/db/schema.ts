@@ -132,6 +132,11 @@ export const projects = pgTable(
     icon: text("icon"),
     designSystem: jsonb("design_system"),
     config: jsonb("config"),
+    // Which superatom-setup-code branch the publish script builds for this project.
+    // A build input, not a delivery one: the VM pulls an image, never a git ref.
+    codeBranch: varchar("code_branch", { length: 255 }).notNull().default("main"),
+    // Set to roll back; null means the newest row in project_releases.
+    pinnedVersion: varchar("pinned_version", { length: 255 }),
     createdBy: uuid("created_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -140,6 +145,44 @@ export const projects = pgTable(
   },
   (table) => [uniqueIndex("projects_org_slug_idx").on(table.orgId, table.slug)]
 );
+
+/**
+ * One row per published release: the image, the engine it expects and the bundle
+ * that goes with it, pinned together so a rollback cannot mix versions. Written
+ * by the publish script; read by redeem/update to tell a VM what to run.
+ */
+export const projectReleases = pgTable(
+  "project_releases",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    version: varchar("version", { length: 255 }).notNull(),
+    branch: varchar("branch", { length: 255 }).notNull(),
+    commit: varchar("commit", { length: 40 }).notNull(),
+    // Repository and tag; the registry host comes from config, so an image stays
+    // valid if the host ever changes.
+    image: varchar("image", { length: 512 }).notNull(),
+    imageDigest: varchar("image_digest", { length: 71 }).notNull(),
+    bundleSha256: varchar("bundle_sha256", { length: 64 }).notNull(),
+    // Null means "whatever engine/current.json publishes".
+    engineVersion: varchar("engine_version", { length: 32 }),
+    composeVersion: varchar("compose_version", { length: 32 }),
+    // Migration count in this release, so a rollback across a schema change can warn.
+    migrations: integer("migrations"),
+    publishedBy: varchar("published_by", { length: 255 }),
+    publishedAt: timestamp("published_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_releases_version_idx").on(table.projectId, table.version),
+    index("project_releases_latest_idx").on(table.projectId, table.publishedAt),
+  ]
+);
+
+export const projectReleasesRelations = relations(projectReleases, ({ one }) => ({
+  project: one(projects, { fields: [projectReleases.projectId], references: [projects.id] }),
+}));
 
 export const projectsRelations = relations(projects, ({ one, many }) => ({
   organization: one(organizations, {

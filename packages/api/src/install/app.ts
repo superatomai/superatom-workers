@@ -1,7 +1,7 @@
 import { Hono } from "hono";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { createDb, type Database } from "../db";
-import { apiKeys, installTokens, organizations, projects } from "../db/schema";
+import { apiKeys, installTokens, organizations, projectReleases, projects } from "../db/schema";
 import type { Env } from "../types";
 // Same generator/hash the websocket worker validates against — one key format.
 import { generateApiKey, getKeyPrefix, hashApiKey } from "../../../websocket/src/api-keys/service";
@@ -13,7 +13,9 @@ import {
   issueProxyKey,
   latestCommit,
   sha256Hex,
+  signBundle,
   signDownload,
+  verifyBundle,
   verifyDownload,
 } from "./lib";
 import { isUniqueViolation } from "../superadmin/lib/validate";
@@ -88,6 +90,7 @@ async function usableToken(db: Database, rawToken: unknown) {
       redeemedAt: installTokens.redeemedAt,
       revokedAt: installTokens.revokedAt,
       projectId: projects.id,
+      pinnedVersion: projects.pinnedVersion,
       orgId: organizations.id,
       orgSlug: organizations.slug,
     })
@@ -117,6 +120,50 @@ async function usableToken(db: Database, rawToken: unknown) {
 }
 
 /**
+ * The release a project should run: its pinned version, else the newest published.
+ * Throws when nothing is published, so a token is never spent on a project that
+ * has no image to install.
+ */
+async function currentRelease(db: Database, projectId: string, pinned: string | null) {
+  const [release] = await db
+    .select()
+    .from(projectReleases)
+    .where(
+      pinned
+        ? and(eq(projectReleases.projectId, projectId), eq(projectReleases.version, pinned))
+        : eq(projectReleases.projectId, projectId)
+    )
+    .orderBy(desc(projectReleases.publishedAt))
+    .limit(1);
+  if (!release) {
+    throw new InstallError(
+      409,
+      pinned
+        ? `This project is pinned to version "${pinned}", which is not published. Pick another version in the super-admin console.`
+        : "No release has been published for this project yet. Publish one, then install."
+    );
+  }
+  return release;
+}
+
+/** What a VM needs to pull and run a release. The registry is this worker's /v2. */
+async function releaseLines(c: any, projectId: string, release: any) {
+  const host = c.env.INSTALL_REGISTRY_HOST ?? new URL(c.req.url).host;
+  const bundleKey = `bundles/${projectId}/${release.version}/bundle.tar.gz`;
+  return {
+    RELEASE_VERSION: release.version,
+    IMAGE: `${host}/${release.image}`,
+    IMAGE_DIGEST: release.imageDigest,
+    REGISTRY_HOST: host,
+    BUNDLE_URL: `${new URL(c.req.url).origin}/api/bundle/${await signBundle(c.env, bundleKey)}`,
+    BUNDLE_SHA256: release.bundleSha256,
+    ENGINE_VERSION: release.engineVersion ?? undefined,
+    COMPOSE_VERSION: release.composeVersion ?? undefined,
+    CODE_COMMIT: release.commit.slice(0, 12),
+  };
+}
+
+/**
  * POST /api/token-info {token} — checks a token without using it, so the installer can
  * prepare the install folder before spending the one-time token.
  */
@@ -124,6 +171,8 @@ install.post("/api/token-info", async (c) => {
   if (await limited(c.env, `token-info:${clientIp(c)}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
   const body = await c.req.json<{ token?: unknown }>().catch(() => null);
   const row = await usableToken(c.var.db, body?.token);
+  // Checked here as well, so a missing release costs no token.
+  await currentRelease(c.var.db, row.projectId, row.pinnedVersion);
   return c.text(envLines({ INSTALL_NAME: row.installName }));
 });
 
@@ -148,6 +197,8 @@ install.post("/api/redeem", async (c) => {
     .where(and(eq(installTokens.projectId, row.projectId), eq(installTokens.llmClientId, row.installName)))
     .limit(1);
 
+  // Before any mutation: a project with nothing published must not consume the token.
+  const release = await currentRelease(db, row.projectId, row.pinnedVersion);
   const sha = await latestCommit(c.env);
   const { proxyKey, created } = await issueProxyKey(c.env, row.installName, row.llmBudgetCents, !!ownClient);
   if (created) {
@@ -179,8 +230,10 @@ install.post("/api/redeem", async (c) => {
   return c.text(
     envLines({
       INSTALL_NAME: row.installName,
+      ...(await releaseLines(c, row.projectId, release)),
+      // Transitional: the current installer still downloads source and builds.
+      // Drops out once install.sh pulls the image instead.
       CODE_URL: await codeUrl(c, sha, row.projectId),
-      CODE_COMMIT: sha.slice(0, 12),
       SUPERATOM_API_KEY: apiKey,
       SUPERATOM_PROJECT_ID: row.projectId,
       SA_API_URL: c.env.INSTALL_SA_API_URL,
@@ -207,15 +260,24 @@ install.post("/api/update", async (c) => {
   const projectId = typeof body?.projectId === "string" ? body.projectId : "";
   if (!apiKey.startsWith("sa_live_") || !UUID.test(projectId)) return c.text("Invalid API key for this project", 401);
 
+  // api_keys.project_id is varchar, projects.id is uuid — hence the cast.
   const [key] = await c.var.db
-    .select({ id: apiKeys.id })
+    .select({ id: apiKeys.id, pinnedVersion: projects.pinnedVersion })
     .from(apiKeys)
+    .innerJoin(projects, and(eq(projects.id, projectId), eq(apiKeys.projectId, sql`${projects.id}::text`)))
     .where(and(eq(apiKeys.projectId, projectId), eq(apiKeys.keyHash, await hashApiKey(apiKey)), eq(apiKeys.isActive, true)))
     .limit(1);
   if (!key) return c.text("Invalid API key for this project", 401);
 
+  const release = await currentRelease(c.var.db, projectId, key.pinnedVersion);
   const sha = await latestCommit(c.env);
-  return c.text(envLines({ CODE_URL: await codeUrl(c, sha, projectId), CODE_COMMIT: sha.slice(0, 12) }));
+  return c.text(
+    envLines({
+      ...(await releaseLines(c, projectId, release)),
+      // Transitional, as in redeem.
+      CODE_URL: await codeUrl(c, sha, projectId),
+    })
+  );
 });
 
 /** GET /api/code/<signed link> — the code tarball at the signed commit, streamed from GitHub. */
@@ -229,6 +291,22 @@ install.get("/api/code/:link", async (c) => {
       "Content-Type": "application/gzip",
       "Content-Disposition": `attachment; filename="superatom-${sha.slice(0, 12)}.tar.gz"`,
       "Cache-Control": "no-store",
+    },
+  });
+});
+
+/** GET /api/bundle/<signed link> — the release's compose file and setup.sh. */
+install.get("/api/bundle/:link", async (c) => {
+  if (await limited(c.env, `bundle:${clientIp(c)}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
+  const key = await verifyBundle(c.env, c.req.param("link"));
+  if (!key) return c.text("This download link is invalid or has expired. Re-run the installer.", 403);
+  const obj = await c.env.INSTALL_ARTIFACTS?.get(key);
+  if (!obj) return c.text("The deploy bundle for this release is missing. Re-publish it.", 404);
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": "application/gzip",
+      "Content-Length": String(obj.size),
+      "Content-Disposition": 'attachment; filename="bundle.tar.gz"',
     },
   });
 });

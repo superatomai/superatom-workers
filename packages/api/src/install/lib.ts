@@ -54,6 +54,24 @@ export async function latestCommit(env: Env): Promise<string> {
   return sha;
 }
 
+/**
+ * Whether `ref` exists on the code repo. null when it could not be checked (no
+ * token, GitHub down), so callers stay silent rather than warn wrongly.
+ */
+export async function branchExists(env: Env, ref: string): Promise<boolean | null> {
+  if (!env.GITHUB_CODE_TOKEN) return null;
+  try {
+    const res = await fetch(
+      `${githubApi(env)}/repos/${env.INSTALL_CODE_REPO}/branches/${ref.split("/").map(encodeURIComponent).join("/")}`,
+      { headers: githubHeaders(env, "application/vnd.github+json") }
+    );
+    if (res.status === 404) return false;
+    return res.ok ? true : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Streams the repo tarball at `sha` (GitHub's layout: one top-level directory). */
 export async function fetchTarball(env: Env, sha: string): Promise<Response> {
   const res = await fetch(`${githubApi(env)}/repos/${env.INSTALL_CODE_REPO}/tarball/${sha}`, {
@@ -103,6 +121,30 @@ export async function signDownload(env: Env, sha: string, projectId: string): Pr
     .setIssuedAt()
     .setExpirationTime(`${DOWNLOAD_TTL_SECONDS}s`)
     .sign(downloadKey(env));
+}
+
+/** A short-lived link to one deploy bundle object in the artifacts bucket. */
+export async function signBundle(env: Env, objectKey: string): Promise<string> {
+  return new SignJWT({})
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(objectKey)
+    .setAudience("install-bundle")
+    .setIssuedAt()
+    .setExpirationTime(`${DOWNLOAD_TTL_SECONDS}s`)
+    .sign(downloadKey(env));
+}
+
+/** The bundle object key a link grants, or null if invalid/expired. */
+export async function verifyBundle(env: Env, token: string): Promise<string | null> {
+  try {
+    const { payload } = await jwtVerify(token, downloadKey(env), { audience: "install-bundle", algorithms: ["HS256"] });
+    // Only keys this worker writes: bundles/<uuid>/<version>/bundle.tar.gz
+    return typeof payload.sub === "string" && /^bundles\/[0-9a-f-]{36}\/[A-Za-z0-9._-]{1,128}\/bundle\.tar\.gz$/.test(payload.sub)
+      ? payload.sub
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Returns the commit sha a download link grants, or null if invalid/expired. */
