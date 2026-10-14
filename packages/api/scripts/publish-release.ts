@@ -2,7 +2,10 @@
  * Publishes a client release: builds the project's branch into an image, writes it
  * into the registry bucket, and uploads the deploy bundle the VM needs.
  *
- *   pnpm publish-release --project <projectId> --branch <branch> [--version <v>] [--repo <path>]
+ *   pnpm publish-release --env dev|prod --project <projectId> [--branch <b>] [--version <v>] [--repo <path>]
+ *
+ * The branch defaults to the project's code_branch. The release row is written
+ * only after every artifact is uploaded, so a row always has an image behind it.
  *
  * Uploads go through R2's S3 API, not wrangler: `wrangler r2 object put` fails with
  * 502 on objects of a few hundred MB, which image layers routinely are.
@@ -18,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { AwsClient } from "aws4fetch";
+import { neon } from "@neondatabase/serverless";
 
 const run = promisify(execFile);
 const BUCKET = "superatom-install";
@@ -115,17 +119,56 @@ async function upload(key: string, file: string, contentType: string): Promise<s
   return `${mb} MB`;
 }
 
+/** The control-plane database for one environment, from the same files the migrations use. */
+function db(env: string) {
+  const file = join(import.meta.dirname ?? __dirname, "..", env === "prod" ? ".env" : ".dev.vars");
+  if (!existsSync(file)) fail(`${file} not found — cannot reach the ${env} database`);
+  const line = readFileSync(file, "utf8").split("\n").find((l) => l.startsWith("DATABASE_URL="));
+  if (!line) fail(`${file} has no DATABASE_URL`);
+  return neon(line.slice("DATABASE_URL=".length).trim());
+}
+
+/** Engine versions this release expects, pinned from the mirror's current pointer. */
+async function engineVersions(): Promise<{ docker: string | null; compose: string | null }> {
+  const { client, base } = s3();
+  const res = await client.fetch(`${base}/engine/current.json`);
+  if (!res.ok) return { docker: null, compose: null };
+  const j = (await res.json()) as { docker?: string; compose?: string };
+  return { docker: j.docker ?? null, compose: j.compose ?? null };
+}
+
+/** Client-database migrations in this release, so a rollback across one can warn. */
+function migrationCount(tree: string): number | null {
+  try {
+    const journal = JSON.parse(
+      readFileSync(join(tree, "database", "postgres", "drizzle", "migrations", "meta", "_journal.json"), "utf8"));
+    return Array.isArray(journal.entries) ? journal.entries.length : null;
+  } catch {
+    return null;
+  }
+}
+
 function sh(cmd: string, args: string[], cwd?: string) {
   return run(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024 });
 }
 
 async function main() {
   const projectId = arg("project");
-  const branch = arg("branch");
+  const env = arg("env");
   const repo = arg("repo") ?? DEFAULT_REPO;
   if (!projectId || !UUID.test(projectId)) fail("--project <projectId> (a uuid) is required");
-  if (!branch) fail("--branch <branch> is required");
+  if (env !== "dev" && env !== "prod") fail("--env dev|prod is required (which control-plane database)");
   if (!existsSync(join(repo, "Dockerfile"))) fail(`${repo} has no Dockerfile — pass --repo <path to superatom-setup-code>`);
+
+  // Fail before the build if the project is unknown, and take its branch unless told otherwise.
+  const sql = db(env);
+  const [project] = await sql`select name, slug, code_branch from projects where id = ${projectId}`;
+  if (!project) fail(`project ${projectId} does not exist in the ${env} database`);
+  const branch = arg("branch") ?? (project.code_branch as string);
+  if (arg("branch") && arg("branch") !== project.code_branch) {
+    console.log(`note: building ${branch}, but the project's code_branch is "${project.code_branch}"`);
+  }
+  console.log(`${env}: ${project.name} (${project.slug})`);
 
   // Always build what is pushed, never a working tree.
   await sh("git", ["-C", repo, "fetch", "origin", branch, "--quiet"]).catch(() =>
@@ -176,15 +219,39 @@ async function main() {
     const bundleSha = createHash("sha256").update(await readFile(bundle)).digest("hex");
     console.log(`  ✓ bundles/${projectId}/${version}/bundle.tar.gz ${what}`);
 
+    const engine = await engineVersions();
+    const migrations = migrationCount(tree);
+    const publishedBy =
+      (await sh("git", ["-C", repo, "config", "user.email"]).catch(() => ({ stdout: "" }))).stdout.trim() ||
+      process.env.USER || "unknown";
+
+    // Last, so a row never points at artifacts that are not there.
     const release = {
       version, branch, commit: sha,
       image: repoTag,
       imageDigest: mDesc.digest,
       bundleSha256: bundleSha,
-      publishedAt: new Date().toISOString(),
+      engineVersion: engine.docker,
+      composeVersion: engine.compose,
+      migrations,
+      publishedBy,
     };
-    console.log(`\n✔ published\n${JSON.stringify(release, null, 2)}`);
-    console.log("\nNot yet registered in project_releases (schema step still to come).");
+    try {
+      await sql`insert into project_releases
+        (project_id, version, branch, commit, image, image_digest, bundle_sha256,
+         engine_version, compose_version, migrations, published_by)
+        values (${projectId}, ${version}, ${branch}, ${sha}, ${repoTag}, ${mDesc.digest}, ${bundleSha},
+                ${engine.docker}, ${engine.compose}, ${migrations}, ${publishedBy})`;
+    } catch (err: any) {
+      // (project_id, version) is unique: a published version is immutable.
+      if (String(err?.message ?? "").includes("project_releases_version_idx")) {
+        fail(`version ${version} is already published for this project. Publish a new version instead.\n` +
+             `  Artifacts were uploaded; they are content-addressed, so nothing is duplicated.`);
+      }
+      throw err;
+    }
+    console.log(`\n✔ published and registered in ${env}\n${JSON.stringify(release, null, 2)}`);
+    console.log(`\nA VM installs it with: curl -fsSL https://${env === "prod" ? "" : "dev."}install.superatom.ai | sh`);
   } finally {
     await sh("git", ["-C", repo, "worktree", "remove", "--force", tree]).catch(() => {});
     rmSync(work, { recursive: true, force: true });
