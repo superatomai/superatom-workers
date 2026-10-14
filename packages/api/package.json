@@ -20,7 +20,8 @@
     "db:studio": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 drizzle-kit studio",
     "superadmin": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/super-admins.ts",
     "mirror-engine": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/mirror-engine.ts",
-    "publish-release": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/publish-release.ts"
+    "publish-release": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/publish-release.ts",
+    "mirror-base-images": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/mirror-base-images.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",

@@ -10,8 +10,10 @@ import { hashApiKey } from "../../../websocket/src/api-keys/service";
  * *.superatom.ai. Pulls are authenticated with the project's API key and scoped
  * to that project's repository, which a bucket on a public domain cannot do.
  *
- * Repository name IS the project id. Only reads exist: releases are published by
- * writing objects into the bucket, never by `docker push`.
+ * Repository name IS the project id, except for `base`: the third-party images the
+ * stack runs (postgres, chroma), mirrored once and readable by any active key.
+ * Only reads exist: releases are published by writing objects into the bucket,
+ * never by `docker push`.
  */
 type RegistryApp = Hono<{ Bindings: Env; Variables: { db: Database } }>;
 
@@ -19,6 +21,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const TAG = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 const IMMUTABLE = "public, max-age=31536000, immutable";
+// Shared, not client code: mirrored public images, so any active key may read it.
+const SHARED_REPO = "base";
 
 function key(repo: string, kind: "blobs" | "manifests", ref: string): string {
   return `registry/${repo}/${kind}/${ref}`;
@@ -49,6 +53,16 @@ function basicKey(c: any): string | null {
   }
 }
 
+/** True when this key is active for any project. */
+async function anyActiveKey(db: Database, apiKey: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: apiKeys.id })
+    .from(apiKeys)
+    .where(and(eq(apiKeys.keyHash, await hashApiKey(apiKey)), eq(apiKeys.isActive, true)))
+    .limit(1);
+  return !!row;
+}
+
 /** True when this key is active for `repo` (the project id). */
 async function mayPull(db: Database, repo: string, apiKey: string): Promise<boolean> {
   const [row] = await db
@@ -67,20 +81,23 @@ function bucket(c: any) {
 const ping = async (c: any) => {
   const apiKey = basicKey(c);
   if (!apiKey) return challenge(c);
-  const [row] = await c.var.db
-    .select({ id: apiKeys.id })
-    .from(apiKeys)
-    .where(and(eq(apiKeys.keyHash, await hashApiKey(apiKey)), eq(apiKeys.isActive, true)))
-    .limit(1);
-  if (!row) return challenge(c);
+  if (!(await anyActiveKey(c.var.db, apiKey))) return challenge(c);
   return c.json({}, 200, { "Docker-Distribution-API-Version": "registry/2.0" });
 };
 
 /** Shared gate: valid repo name, a credential, and that credential scoped to this repo. */
 async function gate(c: any, repo: string): Promise<Response | null> {
-  if (!UUID.test(repo)) return c.json(ociError("NAME_UNKNOWN", "repository name not known"), 404);
+  if (repo !== SHARED_REPO && !UUID.test(repo)) {
+    return c.json(ociError("NAME_UNKNOWN", "repository name not known"), 404);
+  }
   const apiKey = basicKey(c);
   if (!apiKey) return challenge(c);
+  if (repo === SHARED_REPO) {
+    // Any active key: these are public upstream images, mirrored for offline VMs.
+    return (await anyActiveKey(c.var.db, apiKey))
+      ? null
+      : c.json(ociError("DENIED", "not authorised for this repository"), 403);
+  }
   if (!(await mayPull(c.var.db, repo, apiKey))) {
     // Deny rather than 404, so a wrong key never maps the existence of other repos.
     return c.json(ociError("DENIED", "not authorised for this repository"), 403);
