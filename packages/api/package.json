@@ -19,7 +19,8 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "superadmin": "tsx scripts/super-admins.ts",
-    "mirror-engine": "tsx scripts/mirror-engine.ts"
+    "mirror-engine": "tsx scripts/mirror-engine.ts",
+    "publish-release": "tsx scripts/publish-release.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",
