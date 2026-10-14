@@ -7,15 +7,23 @@
  * The branch defaults to the project's code_branch. The release row is written
  * only after every artifact is uploaded, so a row always has an image behind it.
  *
+ * The bundle carries the release's whole source tree plus a generated RELEASE.md, so
+ * a client VM can be debugged against the exact code its image was built from, and
+ * can be rebuilt from the Dockerfile if a pull ever fails.
+ *
+ * --local builds the working tree instead of origin/<branch>, for testing before a
+ * push. Versions are suffixed -local and prod is refused, so an unpushed tree can
+ * never become a client's release.
+ *
  * Uploads go through R2's S3 API, not wrangler: `wrangler r2 object put` fails with
  * 502 on objects of a few hundred MB, which image layers routinely are.
  *
- * The build always runs from a pristine worktree of origin/<branch>, so nothing
- * uncommitted or unpushed can end up in a client's image.
+ * Without --local the build runs from a pristine worktree of origin/<branch>, so
+ * nothing uncommitted or unpushed can end up in a client's image.
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, createReadStream, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -152,37 +160,147 @@ function sh(cmd: string, args: string[], cwd?: string) {
   return run(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024 });
 }
 
+/**
+ * The bundle is the release's tracked source tree plus RELEASE.md: git decides what is
+ * in it, so an untracked secret (a stray backend/.env.local) can never be shipped.
+ */
+async function makeBundle(
+  repo: string, tree: string, sha: string, bundle: string, local: boolean,
+): Promise<void> {
+  const tar = bundle.replace(/\.gz$/, "");
+  if (local) {
+    // Tracked paths, working-tree content — the only way --local differs from a commit.
+    const list = `${tar}.files`;
+    writeFileSync(list, (await sh("git", ["-C", repo, "ls-files", "-z"])).stdout);
+    await sh("tar", ["-cf", tar, "-C", tree, "--null", "-T", list]);
+  } else {
+    await sh("git", ["-C", repo, "archive", "--format=tar", "-o", tar, sha]);
+  }
+  await sh("tar", ["-rf", tar, "-C", tree, "RELEASE.md"]);
+  await sh("gzip", ["-9f", tar]);
+}
+
+type Prev = { version: string; commit: string } | undefined;
+
+/** The commit log between two releases, or why it could not be produced. */
+export async function changeLog(repo: string, commit: string, prev: Prev): Promise<string> {
+  const git = async (args: string[]) =>
+    (await sh("git", ["-C", repo, ...args]).catch(() => ({ stdout: "" }))).stdout.trimEnd();
+
+  if (!prev) return "First release for this project — nothing to compare against.";
+  if (prev.commit === commit) return `Same commit as \`${prev.version}\`; only release metadata differs.`;
+
+  const log = await git(["log", "--oneline", "--no-decorate", `${prev.commit}..${commit}`]);
+  const stat = await git(["diff", "--stat", prev.commit, commit]);
+  if (!log && !stat) {
+    return `Could not diff against \`${prev.version}\` (${prev.commit.slice(0, 12)}) — that commit is ` +
+      "not in the publishing clone, or the two branches are unrelated.";
+  }
+  const parts = [`Since \`${prev.version}\` (${prev.commit.slice(0, 12)}):`];
+  if (log) parts.push("```\n" + log + "\n```");
+  else parts.push("_No new commits — this release is at or behind the previous one._");
+  if (stat) parts.push("```\n" + stat + "\n```");
+  return parts.join("\n\n");
+}
+
+/** RELEASE.md: what this release is and what changed, for debugging on the VM itself. */
+export async function releaseNotes(
+  repo: string, r: Record<string, unknown>, prev: Prev, local: boolean,
+): Promise<string> {
+  // Untracked files count too: --local copies the whole tree into the build context.
+  const status = local
+    ? (await sh("git", ["-C", repo, "status", "--porcelain"]).catch(() => ({ stdout: "" }))).stdout
+        .split("\n").filter(Boolean)
+    : [];
+  const untracked = status.filter((l) => l.startsWith("??")).length;
+  const modified = status.length - untracked;
+
+  const table = [
+    "| | |",
+    "|---|---|",
+    `| branch | \`${r.branch}\` |`,
+    `| commit | \`${r.commit}\` |`,
+    `| image | \`${r.image}\` |`,
+    `| digest | \`${r.imageDigest}\` |`,
+    `| docker / compose | ${r.engineVersion ?? "?"} / ${r.composeVersion ?? "?"} |`,
+    `| client migrations | ${r.migrations ?? "?"} |`,
+    `| published | ${new Date().toISOString()} by ${r.publishedBy} |`,
+  ].join("\n");
+
+  return [
+    `# Release ${r.version}`,
+    table,
+    status.length
+      ? `> ⚠ Built with \`--local\` from a working tree with ${modified} modified and ` +
+        `${untracked} untracked path(s). The commit above does **not** fully describe ` +
+        "what is in the image."
+      : "",
+    "## Changes",
+    await changeLog(repo, r.commit as string, prev),
+    "## Debugging this VM",
+    "The source beside this file is the tree this release's image was built from, so " +
+    "reading it here matches what the container runs. It is not mounted into the " +
+    "container: the backend runs the code baked into the image.",
+    "```\ndocker compose logs -f backend          # logs\n" +
+    "docker compose exec backend sh          # a shell in the running release\n```",
+    "## Rebuilding from source",
+    "If the release image cannot be pulled, the stack can be built from the Dockerfile " +
+    "here instead:",
+    "```\ndocker compose up -d --build\n```",
+    "This needs outbound internet (npmjs.com, deb.debian.org, docker.io) and produces an " +
+    "image that is **not** the published release — its dependency resolution differs. Use " +
+    "it to get a client running again, then re-pull once the registry is reachable.",
+  ].filter(Boolean).join("\n\n") + "\n";
+}
+
 async function main() {
   const projectId = arg("project");
   const env = arg("env");
   const repo = arg("repo") ?? DEFAULT_REPO;
   if (!projectId || !UUID.test(projectId)) fail("--project <projectId> (a uuid) is required");
   if (env !== "dev" && env !== "prod") fail("--env dev|prod is required (which control-plane database)");
+  const local = process.argv.includes("--local");
+  if (local && env === "prod") fail("--local cannot publish to prod: the tree is not pushed.");
   if (!existsSync(join(repo, "Dockerfile"))) fail(`${repo} has no Dockerfile — pass --repo <path to superatom-setup-code>`);
 
   // Fail before the build if the project is unknown, and take its branch unless told otherwise.
   const sql = db(env);
   const [project] = await sql`select name, slug, code_branch from projects where id = ${projectId}`;
   if (!project) fail(`project ${projectId} does not exist in the ${env} database`);
+  // Read before the build: RELEASE.md diffs this release against it.
+  const [prevRow] = await sql`select version, commit from project_releases
+    where project_id = ${projectId} order by published_at desc limit 1`;
+  const prev = prevRow ? { version: prevRow.version as string, commit: prevRow.commit as string } : undefined;
   const branch = arg("branch") ?? (project.code_branch as string);
   if (arg("branch") && arg("branch") !== project.code_branch) {
     console.log(`note: building ${branch}, but the project's code_branch is "${project.code_branch}"`);
   }
   console.log(`${env}: ${project.name} (${project.slug})`);
 
-  // Always build what is pushed, never a working tree.
-  await sh("git", ["-C", repo, "fetch", "origin", branch, "--quiet"]).catch(() =>
-    fail(`origin/${branch} does not exist in ${repo}`));
-  const sha = (await sh("git", ["-C", repo, "rev-parse", `origin/${branch}`])).stdout.trim();
-  const version = arg("version") ??
-    `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-")}-${sha.slice(0, 12)}`;
+  let sha: string;
+  if (local) {
+    sha = (await sh("git", ["-C", repo, "rev-parse", "HEAD"])).stdout.trim();
+    console.log("⚠ --local: building the working tree, not origin/" + branch);
+  } else {
+    // Normally build only what is pushed, never a working tree.
+    await sh("git", ["-C", repo, "fetch", "origin", branch, "--quiet"]).catch(() =>
+      fail(`origin/${branch} does not exist in ${repo}`));
+    sha = (await sh("git", ["-C", repo, "rev-parse", `origin/${branch}`])).stdout.trim();
+  }
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
+  const version = arg("version") ?? `${stamp}-${sha.slice(0, 12)}${local ? "-local" : ""}`;
   console.log(`project ${projectId}\nbranch  ${branch} @ ${sha.slice(0, 12)}\nversion ${version}\n`);
 
   const work = mkdtempSync(join(tmpdir(), "publish-"));
   const tree = join(work, "src");
   try {
-    await sh("git", ["-C", repo, "worktree", "add", "--detach", tree, sha]);
-    console.log("Building image (pristine worktree)…");
+    if (local) {
+      await sh("cp", ["-a", `${repo}/.`, tree]);
+      console.log("Building image (working tree copy)…");
+    } else {
+      await sh("git", ["-C", repo, "worktree", "add", "--detach", tree, sha]);
+      console.log("Building image (pristine worktree)…");
+    }
     // The repository name IS the project id: that is what the registry routes
     // authorise against (src/install/registry.ts), so it must match exactly.
     const repoTag = `${projectId}:${version}`;
@@ -212,30 +330,32 @@ async function main() {
       console.log(`  ✓ manifests/${ref}`);
     }
 
-    console.log("\nUploading the deploy bundle…");
-    const bundle = join(work, "bundle.tar.gz");
-    await sh("tar", ["-czf", bundle, "-C", tree, "docker-compose.yml", "setup.sh"]);
-    const what = await upload(`bundles/${projectId}/${version}/bundle.tar.gz`, bundle, "application/gzip");
-    const bundleSha = createHash("sha256").update(await readFile(bundle)).digest("hex");
-    console.log(`  ✓ bundles/${projectId}/${version}/bundle.tar.gz ${what}`);
-
     const engine = await engineVersions();
     const migrations = migrationCount(tree);
     const publishedBy =
       (await sh("git", ["-C", repo, "config", "user.email"]).catch(() => ({ stdout: "" }))).stdout.trim() ||
       process.env.USER || "unknown";
-
-    // Last, so a row never points at artifacts that are not there.
-    const release = {
+    const meta = {
       version, branch, commit: sha,
       image: repoTag,
       imageDigest: mDesc.digest,
-      bundleSha256: bundleSha,
       engineVersion: engine.docker,
       composeVersion: engine.compose,
       migrations,
       publishedBy,
     };
+
+    console.log("\nUploading the deploy bundle…");
+    // Written after the build, so the image stays a pure function of the commit.
+    writeFileSync(join(tree, "RELEASE.md"), await releaseNotes(repo, meta, prev, local));
+    const bundle = join(work, "bundle.tar.gz");
+    await makeBundle(repo, tree, sha, bundle, local);
+    const what = await upload(`bundles/${projectId}/${version}/bundle.tar.gz`, bundle, "application/gzip");
+    const bundleSha = createHash("sha256").update(await readFile(bundle)).digest("hex");
+    console.log(`  ✓ bundles/${projectId}/${version}/bundle.tar.gz ${what}`);
+
+    // Last, so a row never points at artifacts that are not there.
+    const release = { ...meta, bundleSha256: bundleSha };
     try {
       await sql`insert into project_releases
         (project_id, version, branch, commit, image, image_digest, bundle_sha256,
@@ -253,9 +373,10 @@ async function main() {
     console.log(`\n✔ published and registered in ${env}\n${JSON.stringify(release, null, 2)}`);
     console.log(`\nA VM installs it with: curl -fsSL https://${env === "prod" ? "" : "dev."}install.superatom.ai | sh`);
   } finally {
-    await sh("git", ["-C", repo, "worktree", "remove", "--force", tree]).catch(() => {});
+    if (!local) await sh("git", ["-C", repo, "worktree", "remove", "--force", tree]).catch(() => {});
     rmSync(work, { recursive: true, force: true });
   }
 }
 
-main().catch((err) => fail(err.message));
+// Guarded so the notes helpers above can be imported and tested on their own.
+if (process.argv[1]?.includes("publish-release")) main().catch((err) => fail(err.message));
