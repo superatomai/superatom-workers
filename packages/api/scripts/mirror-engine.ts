@@ -1,12 +1,15 @@
 /**
- * Mirrors the Docker Engine static binaries and the compose plugin into R2, so a
- * client VM installs them from *.superatom.ai instead of download.docker.com.
+ * Mirrors the Docker Engine static binaries and the compose and buildx plugins into
+ * R2, so a client VM installs them from *.superatom.ai instead of download.docker.com.
  *
- *   pnpm mirror-engine --docker 29.9.0 --compose 5.6.0
+ *   pnpm mirror-engine --docker 29.9.0 --compose 5.6.0 --buildx 0.38.0
+ *
+ * buildx is in the engine tarball's place, not the registry: it has to exist before
+ * Docker can build anything, and Docker's static bundle does not ship it.
  *
  * Docker publishes no checksum for the static tarball, so we compute ours at
- * mirror time; compose publishes one, which we verify. current.json is written
- * LAST, so a half-finished mirror is never pointed at.
+ * mirror time; compose and buildx publish theirs, which we verify. current.json is
+ * written LAST, so a half-finished mirror is never pointed at.
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -20,6 +23,8 @@ const run = promisify(execFile);
 const BUCKET = "superatom-install";
 const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "91e1058d99235b9c34602fb0c28916d3";
 const ARCHES = ["x86_64", "aarch64"] as const;
+// buildx's release assets are named with Go's arch, not the engine tarball's.
+const BUILDX_ARCH: Record<string, string> = { x86_64: "amd64", aarch64: "arm64" };
 // pnpm hoists wrangler to the workspace root, so look there too.
 const HERE = import.meta.dirname ?? __dirname;
 const WRANGLER = [
@@ -73,8 +78,13 @@ async function putText(key: string, text: string, contentType: string, dir: stri
 async function main() {
   const docker = arg("docker");
   const compose = arg("compose");
-  if (!docker || !compose) fail("Usage: pnpm mirror-engine --docker <version> --compose <version>");
-  if (!/^\d+\.\d+\.\d+$/.test(docker) || !/^\d+\.\d+\.\d+$/.test(compose)) fail("Versions must be x.y.z");
+  const buildx = arg("buildx");
+  if (!docker || !compose || !buildx) {
+    fail("Usage: pnpm mirror-engine --docker <version> --compose <version> --buildx <version>");
+  }
+  for (const v of [docker, compose, buildx]) {
+    if (!/^\d+\.\d+\.\d+$/.test(v)) fail(`Versions must be x.y.z (got ${v})`);
+  }
 
   const dir = mkdtempSync(join(tmpdir(), "mirror-engine-"));
   try {
@@ -98,13 +108,29 @@ async function main() {
       console.log(`  checksum verified against upstream`);
       await put(`engine/compose/${compose}/${arch}`, bin, "application/octet-stream");
       await putText(`engine/compose/${compose}/${arch}.sha256`, `${got}\n`, "text/plain", dir);
+
+      console.log(`\nBuildx ${buildx} (${arch})`);
+      const asset = `buildx-v${buildx}.linux-${BUILDX_ARCH[arch]}`;
+      const bx = join(dir, `buildx-${arch}`);
+      const bxGot = await download(
+        `https://github.com/docker/buildx/releases/download/v${buildx}/${asset}`, bx);
+      // One checksums.txt per release, lines of "<sha> *<asset>".
+      const sums = await (await fetch(
+        `https://github.com/docker/buildx/releases/download/v${buildx}/checksums.txt`)).text();
+      const bxWant = sums.split("\n").map((l) => l.trim())
+        .find((l) => l.endsWith(asset))?.split(/\s+/)[0];
+      if (!bxWant) fail(`buildx ${buildx}: ${asset} is not listed in upstream checksums.txt`);
+      if (bxWant !== bxGot) fail(`buildx ${arch} checksum mismatch: upstream ${bxWant}, downloaded ${bxGot}`);
+      console.log(`  checksum verified against upstream`);
+      await put(`engine/buildx/${buildx}/${arch}`, bx, "application/octet-stream");
+      await putText(`engine/buildx/${buildx}/${arch}.sha256`, `${bxGot}\n`, "text/plain", dir);
     }
 
     // Last: nothing is served until the pointer moves.
     await putText("engine/current.json",
-      JSON.stringify({ docker, compose, mirroredAt: new Date().toISOString() }) + "\n",
+      JSON.stringify({ docker, compose, buildx, mirroredAt: new Date().toISOString() }) + "\n",
       "application/json", dir);
-    console.log(`\n✔ mirrored docker ${docker} + compose ${compose} for ${ARCHES.join(", ")}`);
+    console.log(`\n✔ mirrored docker ${docker} + compose ${compose} + buildx ${buildx} for ${ARCHES.join(", ")}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

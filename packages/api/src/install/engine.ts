@@ -3,7 +3,7 @@ import type { Env } from "../types";
 import { InstallError, envLines } from "./lib";
 
 /**
- * Docker Engine and compose binaries, mirrored into R2 so a VM whose only
+ * Docker Engine, compose and buildx binaries, mirrored into R2 so a VM whose only
  * allowed egress is *.superatom.ai can still install Docker — which cannot come
  * from the registry, since Docker is what pulls from it.
  *
@@ -12,14 +12,15 @@ import { InstallError, envLines } from "./lib";
  */
 const engine = new Hono<{ Bindings: Env }>();
 
-const KIND = new Set(["docker", "compose"]);
+const KIND = new Set(["docker", "compose", "buildx"]);
 const ARCH = new Set(["x86_64", "aarch64"]);
 const VERSION = /^\d+\.\d+\.\d+$/;
 // Version-keyed and immutable, so the edge may keep them for a year.
 const IMMUTABLE = "public, max-age=31536000, immutable";
 const POINTER_TTL_MS = 60_000;
 
-let pointer: { body: { docker: string; compose: string }; at: number } | null = null;
+type Pointer = { docker: string; compose: string; buildx?: string };
+let pointer: { body: Pointer; at: number } | null = null;
 
 function bucket(env: Env): R2Bucket {
   if (!env.INSTALL_ARTIFACTS) throw new InstallError(503, "Installer is not configured (artifacts).");
@@ -31,18 +32,24 @@ async function current(env: Env) {
   if (pointer && Date.now() - pointer.at < POINTER_TTL_MS) return pointer.body;
   const obj = await bucket(env).get("engine/current.json");
   if (!obj) throw new InstallError(503, "No Docker Engine version is published yet.");
-  const parsed = await obj.json<{ docker?: unknown; compose?: unknown }>();
+  const parsed = await obj.json<{ docker?: unknown; compose?: unknown; buildx?: unknown }>();
   if (typeof parsed.docker !== "string" || typeof parsed.compose !== "string") {
     throw new InstallError(503, "The published Docker Engine version is unreadable.");
   }
-  pointer = { body: { docker: parsed.docker, compose: parsed.compose }, at: Date.now() };
+  // buildx may be absent: a mirror written before it was added still serves docker.
+  const buildx = typeof parsed.buildx === "string" ? parsed.buildx : undefined;
+  pointer = { body: { docker: parsed.docker, compose: parsed.compose, buildx }, at: Date.now() };
   return pointer.body;
 }
 
 /** GET /api/engine — the versions to install. */
 engine.get("/", async (c) => {
-  const { docker, compose } = await current(c.env);
-  return c.text(envLines({ DOCKER_VERSION: docker, COMPOSE_VERSION: compose }), 200, {
+  const { docker, compose, buildx } = await current(c.env);
+  return c.text(envLines({
+    DOCKER_VERSION: docker,
+    COMPOSE_VERSION: compose,
+    ...(buildx ? { BUILDX_VERSION: buildx } : {}),
+  }), 200, {
     "Content-Type": "text/plain; charset=utf-8",
     "Cache-Control": "public, max-age=60",
   });
@@ -51,7 +58,8 @@ engine.get("/", async (c) => {
 /** The object for one kind/version/arch, or null when the path is not one we serve. */
 function keyFor(kind: string, ver: string, arch: string): string | null {
   if (!KIND.has(kind) || !ARCH.has(arch) || !VERSION.test(ver)) return null;
-  return kind === "docker" ? `engine/docker/${ver}/${arch}.tgz` : `engine/compose/${ver}/${arch}`;
+  // Only docker ships as an archive; the plugins are bare binaries.
+  return kind === "docker" ? `engine/docker/${ver}/${arch}.tgz` : `engine/${kind}/${ver}/${arch}`;
 }
 
 async function serve(c: any, key: string, contentType: string) {
