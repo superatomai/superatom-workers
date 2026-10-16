@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { createDb, type Database } from "../db";
-import { apiKeys, installTokens, organizations, projectReleases, projects } from "../db/schema";
+import { apiKeys, installTokens, organizations, projectInstalls, projectReleases, projects } from "../db/schema";
 import type { Env } from "../types";
 // Same generator/hash the websocket worker validates against — one key format.
 import { generateApiKey, getKeyPrefix, hashApiKey } from "../../../websocket/src/api-keys/service";
@@ -124,13 +124,21 @@ async function usableToken(db: Database, rawToken: unknown) {
  * Throws when nothing is published, so a token is never spent on a project that
  * has no image to install.
  */
-async function currentRelease(db: Database, projectId: string, pinned: string | null) {
+/**
+ * The release an install should be running: a super-admin pin wins, then the version
+ * an admin approved for that install, then the newest. A VM never silently follows
+ * "newest" once a target exists, so publishing a release does not deploy it.
+ */
+async function currentRelease(
+  db: Database, projectId: string, pinned: string | null, target?: string | null,
+) {
+  const want = pinned ?? target ?? null;
   const [release] = await db
     .select()
     .from(projectReleases)
     .where(
-      pinned
-        ? and(eq(projectReleases.projectId, projectId), eq(projectReleases.version, pinned))
+      want
+        ? and(eq(projectReleases.projectId, projectId), eq(projectReleases.version, want))
         : eq(projectReleases.projectId, projectId)
     )
     .orderBy(desc(projectReleases.publishedAt))
@@ -140,10 +148,43 @@ async function currentRelease(db: Database, projectId: string, pinned: string | 
       409,
       pinned
         ? `This project is pinned to version "${pinned}", which is not published. Pick another version in the super-admin console.`
-        : "No release has been published for this project yet. Publish one, then install."
+        : target
+          ? `Version "${target}" is no longer published for this project. Choose another version to update to.`
+          : "No release has been published for this project yet. Publish one, then install."
     );
   }
   return release;
+}
+
+/** The project behind a `Bearer sa_live_…` key, or null. Used by the VM's own endpoints. */
+async function projectFromKey(
+  c: any, projectId: string,
+): Promise<{ pinnedVersion: string | null } | null> {
+  const auth = c.req.header("Authorization") ?? "";
+  const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!apiKey.startsWith("sa_live_") || !UUID.test(projectId)) return null;
+  // api_keys.project_id is varchar, projects.id is uuid — hence the cast.
+  const [key] = await c.var.db
+    .select({ pinnedVersion: projects.pinnedVersion })
+    .from(apiKeys)
+    .innerJoin(projects, and(eq(projects.id, projectId), eq(apiKeys.projectId, sql`${projects.id}::text`)))
+    .where(and(
+      eq(apiKeys.projectId, projectId),
+      eq(apiKeys.keyHash, await hashApiKey(apiKey)),
+      eq(apiKeys.isActive, true),
+    ))
+    .limit(1);
+  return key ?? null;
+}
+
+/** The install row for this VM, if it has reported itself before. */
+async function installRow(db: Database, projectId: string, installName: string) {
+  const [row] = await db
+    .select()
+    .from(projectInstalls)
+    .where(and(eq(projectInstalls.projectId, projectId), eq(projectInstalls.installName, installName)))
+    .limit(1);
+  return row ?? null;
 }
 
 /** What a VM needs to pull and run a release. The registry is this worker's /v2. */
@@ -249,27 +290,23 @@ install.post("/api/redeem", async (c) => {
   );
 });
 
-/** POST /api/update {projectId} + Bearer <project API key> — latest code for an existing install. */
+/**
+ * POST /api/update {projectId, installName?} + Bearer <project API key> — the release
+ * this install should be running. With an installName we answer with its approved
+ * target; without one (an install made before targets existed) we answer as before.
+ */
 install.post("/api/update", async (c) => {
   const ip = clientIp(c);
   if (await limited(c.env, `update:${ip}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
 
-  const auth = c.req.header("Authorization") ?? "";
-  const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  const body = await c.req.json<{ projectId?: unknown }>().catch(() => null);
+  const body = await c.req.json<{ projectId?: unknown; installName?: unknown }>().catch(() => null);
   const projectId = typeof body?.projectId === "string" ? body.projectId : "";
-  if (!apiKey.startsWith("sa_live_") || !UUID.test(projectId)) return c.text("Invalid API key for this project", 401);
-
-  // api_keys.project_id is varchar, projects.id is uuid — hence the cast.
-  const [key] = await c.var.db
-    .select({ id: apiKeys.id, pinnedVersion: projects.pinnedVersion })
-    .from(apiKeys)
-    .innerJoin(projects, and(eq(projects.id, projectId), eq(apiKeys.projectId, sql`${projects.id}::text`)))
-    .where(and(eq(apiKeys.projectId, projectId), eq(apiKeys.keyHash, await hashApiKey(apiKey)), eq(apiKeys.isActive, true)))
-    .limit(1);
+  const installName = typeof body?.installName === "string" ? body.installName.slice(0, 255) : "";
+  const key = await projectFromKey(c, projectId);
   if (!key) return c.text("Invalid API key for this project", 401);
 
-  const release = await currentRelease(c.var.db, projectId, key.pinnedVersion);
+  const row = installName ? await installRow(c.var.db, projectId, installName) : null;
+  const release = await currentRelease(c.var.db, projectId, key.pinnedVersion, row?.targetVersion);
   const sha = await latestCommit(c.env);
   return c.text(
     envLines({
@@ -278,6 +315,43 @@ install.post("/api/update", async (c) => {
       CODE_URL: await codeUrl(c, sha, projectId),
     })
   );
+});
+
+/**
+ * POST /api/installed {projectId, installName, releaseVersion, imageDigest?, error?}
+ * + Bearer <project API key> — what this VM is now running. Also the heartbeat, so
+ * the UI can tell "behind" from "we have not heard from it".
+ */
+install.post("/api/installed", async (c) => {
+  if (await limited(c.env, `installed:${clientIp(c)}`)) {
+    return c.text("Too many attempts. Wait a minute and retry.", 429);
+  }
+  const body = await c.req
+    .json<{ projectId?: unknown; installName?: unknown; releaseVersion?: unknown; imageDigest?: unknown; error?: unknown }>()
+    .catch(() => null);
+  const projectId = typeof body?.projectId === "string" ? body.projectId : "";
+  const installName = typeof body?.installName === "string" ? body.installName.trim().slice(0, 255) : "";
+  if (!installName) return c.text("installName is required", 400);
+  if (!(await projectFromKey(c, projectId))) return c.text("Invalid API key for this project", 401);
+
+  const str = (v: unknown, max: number) => (typeof v === "string" && v ? v.slice(0, max) : null);
+  const values = {
+    releaseVersion: str(body?.releaseVersion, 255),
+    imageDigest: str(body?.imageDigest, 71),
+    // Cleared whenever the updater reports without one, so a fixed install stops
+    // showing yesterday's failure.
+    lastError: str(body?.error, 2000),
+    lastSeenAt: new Date(),
+    updatedAt: new Date(),
+  };
+  await c.var.db
+    .insert(projectInstalls)
+    .values({ projectId, installName, ...values })
+    .onConflictDoUpdate({
+      target: [projectInstalls.projectId, projectInstalls.installName],
+      set: values,
+    });
+  return c.text("ok");
 });
 
 /** GET /api/code/<signed link> — the code tarball at the signed commit, streamed from GitHub. */
