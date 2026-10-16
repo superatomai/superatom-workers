@@ -48,6 +48,7 @@ releaseRouter.get("/status", async (c) => {
   const brief = (r: Release) => ({
     version: r.version, branch: r.branch, commit: r.commit.slice(0, 12),
     migrations: r.migrations, publishedBy: r.publishedBy, publishedAt: r.publishedAt,
+    notes: r.notes,
   });
 
   return c.json({

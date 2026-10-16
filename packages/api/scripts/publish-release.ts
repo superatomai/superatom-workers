@@ -348,6 +348,8 @@ async function main() {
     console.log("\nUploading the deploy bundle…");
     // Written after the build, so the image stays a pure function of the commit.
     writeFileSync(join(tree, "RELEASE.md"), await releaseNotes(repo, meta, prev, local));
+    // The same log goes in the release row, so the UI needs no access to the bundle.
+    const notes = await changeLog(repo, sha, prev);
     const bundle = join(work, "bundle.tar.gz");
     await makeBundle(repo, tree, sha, bundle, local);
     const what = await upload(`bundles/${projectId}/${version}/bundle.tar.gz`, bundle, "application/gzip");
@@ -359,9 +361,9 @@ async function main() {
     try {
       await sql`insert into project_releases
         (project_id, version, branch, commit, image, image_digest, bundle_sha256,
-         engine_version, compose_version, migrations, published_by)
+         engine_version, compose_version, migrations, published_by, notes)
         values (${projectId}, ${version}, ${branch}, ${sha}, ${repoTag}, ${mDesc.digest}, ${bundleSha},
-                ${engine.docker}, ${engine.compose}, ${migrations}, ${publishedBy})`;
+                ${engine.docker}, ${engine.compose}, ${migrations}, ${publishedBy}, ${notes})`;
     } catch (err: any) {
       // (project_id, version) is unique: a published version is immutable.
       if (String(err?.message ?? "").includes("project_releases_version_idx")) {

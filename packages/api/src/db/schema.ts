@@ -172,6 +172,9 @@ export const projectReleases = pgTable(
     // Migration count in this release, so a rollback across a schema change can warn.
     migrations: integer("migrations"),
     publishedBy: varchar("published_by", { length: 255 }),
+    // The commit log since the project's previous release, as RELEASE.md shows it.
+    // Stored so the UI can say what changed without fetching the bundle from R2.
+    notes: text("notes"),
     publishedAt: timestamp("published_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
