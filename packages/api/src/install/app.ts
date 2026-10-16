@@ -177,6 +177,21 @@ async function projectFromKey(
   return key ?? null;
 }
 
+/** Records that this install is alive, and what it says it is running. */
+async function touchInstall(
+  db: Database, projectId: string, installName: string, current: string | null,
+): Promise<void> {
+  const seen = { lastSeenAt: new Date(), updatedAt: new Date() };
+  const values = current ? { ...seen, releaseVersion: current } : seen;
+  await db
+    .insert(projectInstalls)
+    .values({ projectId, installName, ...values })
+    .onConflictDoUpdate({
+      target: [projectInstalls.projectId, projectInstalls.installName],
+      set: values,
+    });
+}
+
 /** The install row for this VM, if it has reported itself before. */
 async function installRow(db: Database, projectId: string, installName: string) {
   const [row] = await db
@@ -299,13 +314,19 @@ install.post("/api/update", async (c) => {
   const ip = clientIp(c);
   if (await limited(c.env, `update:${ip}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
 
-  const body = await c.req.json<{ projectId?: unknown; installName?: unknown }>().catch(() => null);
+  const body = await c.req
+    .json<{ projectId?: unknown; installName?: unknown; currentVersion?: unknown }>()
+    .catch(() => null);
   const projectId = typeof body?.projectId === "string" ? body.projectId : "";
-  const installName = typeof body?.installName === "string" ? body.installName.slice(0, 255) : "";
+  const installName = typeof body?.installName === "string" ? body.installName.trim().slice(0, 255) : "";
+  const current = typeof body?.currentVersion === "string" ? body.currentVersion.slice(0, 255) : "";
   const key = await projectFromKey(c, projectId);
   if (!key) return c.text("Invalid API key for this project", 401);
 
   const row = installName ? await installRow(c.var.db, projectId, installName) : null;
+  // The updater's poll doubles as the heartbeat, so a quiet install still needs
+  // only one request per tick to stay visibly alive.
+  if (installName) await touchInstall(c.var.db, projectId, installName, current || null);
   const release = await currentRelease(c.var.db, projectId, key.pinnedVersion, row?.targetVersion);
   const sha = await latestCommit(c.env);
   return c.text(
