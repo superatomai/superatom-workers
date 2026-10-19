@@ -3,6 +3,11 @@
  * into the registry bucket, and uploads the deploy bundle the VM needs.
  *
  *   pnpm publish-release --env dev|prod --project <projectId> [--branch <b>] [--version <v>] [--repo <path>]
+ *   pnpm publish-release --env dev|prod --baseline [--branch main]
+ *
+ * --baseline builds the platform release every new client starts on, into the shared
+ * "base" repo. It writes no project row: projects point at it when they are created,
+ * so onboarding needs no per-client build.
  *
  * The branch defaults to the project's code_branch. The release row is written
  * only after every artifact is uploaded, so a row always has an image behind it.
@@ -40,6 +45,8 @@ const DEFAULT_REPO = join(process.env.HOME ?? "", "superatom", "superatom-setup-
 const PART_SIZE = 64 * 1024 * 1024;
 const MULTIPART_ABOVE = 100 * 1024 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Shared repo every active project key may pull from; must match src/install/registry.ts.
+const BASE_REPO = "base";
 
 function fail(message: string): never {
   console.error(`\n✖ ${message}`);
@@ -134,6 +141,15 @@ function db(env: string) {
   const line = readFileSync(file, "utf8").split("\n").find((l) => l.startsWith("DATABASE_URL="));
   if (!line) fail(`${file} has no DATABASE_URL`);
   return neon(line.slice("DATABASE_URL=".length).trim());
+}
+
+/** The baseline release a new project starts on, or null if none is published. */
+async function baselinePointer(): Promise<{ version: string; commit: string } | null> {
+  const { client, base } = s3();
+  const res = await client.fetch(`${base}/registry/${BASE_REPO}/current-release.json`);
+  if (!res.ok) return null;
+  const j = (await res.json()) as { version?: string; commit?: string };
+  return j.version && j.commit ? { version: j.version, commit: j.commit } : null;
 }
 
 /** Engine versions this release expects, pinned from the mirror's current pointer. */
@@ -257,25 +273,42 @@ async function main() {
   const projectId = arg("project");
   const env = arg("env");
   const repo = arg("repo") ?? DEFAULT_REPO;
-  if (!projectId || !UUID.test(projectId)) fail("--project <projectId> (a uuid) is required");
+  // A baseline is the platform build every new client starts on: one image in the
+  // shared "base" repo instead of one per project.
+  const baseline = process.argv.includes("--baseline");
+  if (!baseline && (!projectId || !UUID.test(projectId))) {
+    fail("--project <projectId> (a uuid) is required, or --baseline");
+  }
+  if (baseline && projectId) fail("--baseline publishes for every project; drop --project");
   if (env !== "dev" && env !== "prod") fail("--env dev|prod is required (which control-plane database)");
   const local = process.argv.includes("--local");
   if (local && env === "prod") fail("--local cannot publish to prod: the tree is not pushed.");
   if (!existsSync(join(repo, "Dockerfile"))) fail(`${repo} has no Dockerfile — pass --repo <path to superatom-setup-code>`);
 
-  // Fail before the build if the project is unknown, and take its branch unless told otherwise.
   const sql = db(env);
-  const [project] = await sql`select name, slug, code_branch from projects where id = ${projectId}`;
-  if (!project) fail(`project ${projectId} does not exist in the ${env} database`);
-  // Read before the build: RELEASE.md diffs this release against it.
-  const [prevRow] = await sql`select version, commit from project_releases
-    where project_id = ${projectId} order by published_at desc limit 1`;
-  const prev = prevRow ? { version: prevRow.version as string, commit: prevRow.commit as string } : undefined;
-  const branch = arg("branch") ?? (project.code_branch as string);
-  if (arg("branch") && arg("branch") !== project.code_branch) {
-    console.log(`note: building ${branch}, but the project's code_branch is "${project.code_branch}"`);
+  let branch: string;
+  let prev: Prev;
+
+  if (baseline) {
+    branch = arg("branch") ?? "main";
+    // Diff against the baseline currently published, not against a project.
+    const current = await baselinePointer();
+    prev = current ? { version: current.version, commit: current.commit } : undefined;
+    console.log(`${env}: baseline (shared "${BASE_REPO}" repo, every project may pull it)`);
+  } else {
+    // Fail before the build if the project is unknown, and take its branch unless told otherwise.
+    const [project] = await sql`select name, slug, code_branch from projects where id = ${projectId}`;
+    if (!project) fail(`project ${projectId} does not exist in the ${env} database`);
+    // Read before the build: RELEASE.md diffs this release against it.
+    const [prevRow] = await sql`select version, commit from project_releases
+      where project_id = ${projectId} order by published_at desc limit 1`;
+    prev = prevRow ? { version: prevRow.version as string, commit: prevRow.commit as string } : undefined;
+    branch = arg("branch") ?? (project.code_branch as string);
+    if (arg("branch") && arg("branch") !== project.code_branch) {
+      console.log(`note: building ${branch}, but the project's code_branch is "${project.code_branch}"`);
+    }
+    console.log(`${env}: ${project.name} (${project.slug})`);
   }
-  console.log(`${env}: ${project.name} (${project.slug})`);
 
   let sha: string;
   if (local) {
@@ -289,7 +322,9 @@ async function main() {
   }
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
   const version = arg("version") ?? `${stamp}-${sha.slice(0, 12)}${local ? "-local" : ""}`;
-  console.log(`project ${projectId}\nbranch  ${branch} @ ${sha.slice(0, 12)}\nversion ${version}\n`);
+  // Everything below writes under this repo: a project id, or the shared baseline.
+  const repoName = baseline ? BASE_REPO : projectId!;
+  console.log(`repo    ${repoName}\nbranch  ${branch} @ ${sha.slice(0, 12)}\nversion ${version}\n`);
 
   const work = mkdtempSync(join(tmpdir(), "publish-"));
   const tree = join(work, "src");
@@ -303,7 +338,7 @@ async function main() {
     }
     // The repository name IS the project id: that is what the registry routes
     // authorise against (src/install/registry.ts), so it must match exactly.
-    const repoTag = `${projectId}:${version}`;
+    const repoTag = `${repoName}:${version}`;
     await sh("docker", ["buildx", "build", "--builder", "ocibuilder",
       "--output", `type=oci,dest=${join(work, "image.tar")}`, "-t", repoTag, tree]);
 
@@ -317,7 +352,7 @@ async function main() {
 
     console.log("\nUploading blobs…");
     for (const d of [manifest.config, ...manifest.layers]) {
-      const key = `registry/${projectId}/blobs/${d.digest}`;
+      const key = `registry/${repoName}/blobs/${d.digest}`;
       if (await exists(key)) { console.log(`  = ${d.digest.slice(0, 19)}… already present`); continue; }
       const what = await upload(key, join(layout, "blobs", "sha256", d.digest.split(":")[1]), "application/octet-stream");
       console.log(`  ✓ ${d.digest.slice(0, 19)}… ${what}`);
@@ -326,7 +361,7 @@ async function main() {
     // By tag AND by digest: the client resolves the tag, then re-fetches by digest.
     const manifestBody = await readFile(manifestFile);
     for (const ref of [version, mDesc.digest]) {
-      await putSmall(`registry/${projectId}/manifests/${ref}`, manifestBody, mDesc.mediaType);
+      await putSmall(`registry/${repoName}/manifests/${ref}`, manifestBody, mDesc.mediaType);
       console.log(`  ✓ manifests/${ref}`);
     }
 
@@ -352,12 +387,20 @@ async function main() {
     const notes = await changeLog(repo, sha, prev);
     const bundle = join(work, "bundle.tar.gz");
     await makeBundle(repo, tree, sha, bundle, local);
-    const what = await upload(`bundles/${projectId}/${version}/bundle.tar.gz`, bundle, "application/gzip");
+    const what = await upload(`bundles/${repoName}/${version}/bundle.tar.gz`, bundle, "application/gzip");
     const bundleSha = createHash("sha256").update(await readFile(bundle)).digest("hex");
-    console.log(`  ✓ bundles/${projectId}/${version}/bundle.tar.gz ${what}`);
+    console.log(`  ✓ bundles/${repoName}/${version}/bundle.tar.gz ${what}`);
 
     // Last, so a row never points at artifacts that are not there.
     const release = { ...meta, bundleSha256: bundleSha };
+    if (baseline) {
+      await putSmall(`registry/${BASE_REPO}/current-release.json`,
+        Buffer.from(JSON.stringify({ ...release, notes }, null, 2) + "\n"), "application/json");
+      console.log(`  ✓ registry/${BASE_REPO}/current-release.json`);
+      console.log(`\n✔ baseline published\n${JSON.stringify(release, null, 2)}`);
+      console.log("\nNew projects start on this release; existing ones move to it from the super-admin console.");
+      return;
+    }
     try {
       await sql`insert into project_releases
         (project_id, version, branch, commit, image, image_digest, bundle_sha256,

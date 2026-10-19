@@ -128,6 +128,12 @@ async function usableToken(db: Database, rawToken: unknown) {
  * The release an install should be running: a super-admin pin wins, then the version
  * an admin approved for that install, then the newest. A VM never silently follows
  * "newest" once a target exists, so publishing a release does not deploy it.
+ *
+ * Null means this project has no releases at all — a normal state while a client is
+ * being onboarded. Callers fall back to the source-tarball contract rather than
+ * failing, so deploying this code cannot break an install that predates releases.
+ * A pin or target naming a version that is NOT published is a misconfiguration, and
+ * still 409s: silently serving a different version would be worse.
  */
 async function currentRelease(
   db: Database, projectId: string, pinned: string | null, target?: string | null,
@@ -143,17 +149,15 @@ async function currentRelease(
     )
     .orderBy(desc(projectReleases.publishedAt))
     .limit(1);
-  if (!release) {
+  if (!release && want) {
     throw new InstallError(
       409,
       pinned
         ? `This project is pinned to version "${pinned}", which is not published. Pick another version in the super-admin console.`
-        : target
-          ? `Version "${target}" is no longer published for this project. Choose another version to update to.`
-          : "No release has been published for this project yet. Publish one, then install."
+        : `Version "${target}" is no longer published for this project. Choose another version to update to.`
     );
   }
-  return release;
+  return release ?? null;
 }
 
 /** The project behind a `Bearer sa_live_…` key, or null. Used by the VM's own endpoints. */
@@ -203,9 +207,11 @@ async function installRow(db: Database, projectId: string, installName: string) 
 }
 
 /** What a VM needs to pull and run a release. The registry is this worker's /v2. */
-async function releaseLines(c: any, projectId: string, release: any) {
+async function releaseLines(c: any, release: any) {
   const host = c.env.INSTALL_REGISTRY_HOST ?? new URL(c.req.url).host;
-  const bundleKey = `bundles/${projectId}/${release.version}/bundle.tar.gz`;
+  // "<repo>:<tag>" — the repo is a project id, or "base" for a shared baseline.
+  const repo = String(release.image).split(":")[0];
+  const bundleKey = `bundles/${repo}/${release.version}/bundle.tar.gz`;
   return {
     RELEASE_VERSION: release.version,
     IMAGE: `${host}/${release.image}`,
@@ -227,7 +233,8 @@ install.post("/api/token-info", async (c) => {
   if (await limited(c.env, `token-info:${clientIp(c)}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
   const body = await c.req.json<{ token?: unknown }>().catch(() => null);
   const row = await usableToken(c.var.db, body?.token);
-  // Checked here as well, so a missing release costs no token.
+  // Checked here as well, so a bad pin costs no token. No release at all is fine:
+  // the install falls back to the source tarball.
   await currentRelease(c.var.db, row.projectId, row.pinnedVersion);
   return c.text(envLines({ INSTALL_NAME: row.installName }));
 });
@@ -286,9 +293,8 @@ install.post("/api/redeem", async (c) => {
   return c.text(
     envLines({
       INSTALL_NAME: row.installName,
-      ...(await releaseLines(c, row.projectId, release)),
-      // Transitional: the current installer still downloads source and builds.
-      // Drops out once install.sh pulls the image instead.
+      ...(release ? await releaseLines(c, release) : { CODE_COMMIT: sha.slice(0, 12) }),
+      // Transitional: an installer older than releases downloads source and builds.
       CODE_URL: await codeUrl(c, sha, row.projectId),
       SUPERATOM_API_KEY: apiKey,
       SUPERATOM_PROJECT_ID: row.projectId,
@@ -331,7 +337,7 @@ install.post("/api/update", async (c) => {
   const sha = await latestCommit(c.env);
   return c.text(
     envLines({
-      ...(await releaseLines(c, projectId, release)),
+      ...(release ? await releaseLines(c, release) : { CODE_COMMIT: sha.slice(0, 12) }),
       // Transitional, as in redeem.
       CODE_URL: await codeUrl(c, sha, projectId),
     })

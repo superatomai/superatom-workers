@@ -6,6 +6,7 @@ import type { SuperAdminVariables } from "../types";
 import { DEFAULT_DESIGN_SYSTEM } from "../../routes/projects";
 // Same generator/hash the websocket worker validates against — one key format.
 import { generateApiKey, getKeyPrefix, hashApiKey } from "../../../../websocket/src/api-keys/service";
+import { assignBaseline, readBaseline } from "../../lib/baseline";
 import { cleanName, codeBranchError, isUniqueViolation, isUuid, projectSlugError } from "../lib/validate";
 import { branchExists } from "../../install/lib";
 import { projectReleases } from "../../db/schema";
@@ -78,6 +79,33 @@ orgProjects.get("/", async (c) => {
 });
 
 /** POST /api/orgs/:orgId/projects — { name, slug, description? } */
+/**
+ * POST /:projectId/baseline — point an existing project at the current baseline, so
+ * it moves from building source to pulling the platform image. Deliberate rather
+ * than automatic: it changes what that client's next update installs.
+ */
+orgProjects.post("/:projectId/baseline", async (c) => {
+  const projectId = c.req.param("projectId");
+  if (!isUuid(projectId)) return c.json({ error: "Unknown project." }, 404);
+  const db = c.var.db;
+  const [project] = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.orgId, c.var.org.id)))
+    .limit(1);
+  if (!project) return c.json({ error: "Unknown project." }, 404);
+
+  const baseline = await readBaseline(c.env);
+  if (!baseline) {
+    return c.json(
+      { error: "No baseline is published yet. Run `pnpm publish-release --baseline` first." },
+      409
+    );
+  }
+  const version = await assignBaseline(db, c.env, projectId);
+  return c.json({ version, commit: baseline.commit.slice(0, 12), branch: baseline.branch });
+});
+
 orgProjects.post("/", async (c) => {
   const body = await c.req
     .json<{ name?: unknown; slug?: unknown; description?: unknown; codeBranch?: unknown }>()
@@ -122,8 +150,15 @@ orgProjects.post("/", async (c) => {
         codeBranch: projects.codeBranch,
         createdAt: projects.createdAt,
       });
+    // So `curl … | sh` works for this project straight away, with no per-client
+    // build. Best-effort: with no baseline published the install still works from
+    // the source tarball.
+    const baselineVersion = await assignBaseline(db, c.env, project.id).catch((err) => {
+      console.error("[projects] baseline assignment failed:", err);
+      return null;
+    });
     const warning = codeBranch ? await branchWarning(c.env, codeBranch) : undefined;
-    return c.json({ project: { ...project, apiKey: null }, warning }, 201);
+    return c.json({ project: { ...project, apiKey: null }, warning, baselineVersion }, 201);
   } catch (err) {
     if (isUniqueViolation(err)) return c.json({ error: taken }, 409);
     throw err;

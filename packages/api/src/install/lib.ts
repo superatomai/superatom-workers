@@ -138,8 +138,8 @@ export async function signBundle(env: Env, objectKey: string): Promise<string> {
 export async function verifyBundle(env: Env, token: string): Promise<string | null> {
   try {
     const { payload } = await jwtVerify(token, downloadKey(env), { audience: "install-bundle", algorithms: ["HS256"] });
-    // Only keys this worker writes: bundles/<uuid>/<version>/bundle.tar.gz
-    return typeof payload.sub === "string" && /^bundles\/[0-9a-f-]{36}\/[A-Za-z0-9._-]{1,128}\/bundle\.tar\.gz$/.test(payload.sub)
+    // Only keys this worker writes: bundles/<uuid|base>/<version>/bundle.tar.gz
+    return typeof payload.sub === "string" && /^bundles\/(?:base|[0-9a-f-]{36})\/[A-Za-z0-9._-]{1,128}\/bundle\.tar\.gz$/.test(payload.sub)
       ? payload.sub
       : null;
   } catch {
