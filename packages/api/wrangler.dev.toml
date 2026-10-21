@@ -47,6 +47,8 @@ INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
 INSTALL_CODE_REF = "dev"
 # Where a VM docker-logins and pulls its image from (this worker serves /v2).
 INSTALL_REGISTRY_HOST = "dev.install.superatom.ai"
+# Picks the baseline pointer; dev and prod share the artifacts bucket.
+INSTALL_ENV = "dev"
 INSTALL_SA_API_URL = "https://sa-api-dev.ashish-91e.workers.dev"
 INSTALL_WS_URL = "wss://sa-websocket-dev.ashish-91e.workers.dev/websocket"
 # Dev UIs have no per-org subdomains ("dev" is a reserved slug in the platform UI).

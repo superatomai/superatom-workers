@@ -5,6 +5,17 @@ import type { Env } from "../types";
 /** Shared repo every active project key may pull; must match src/install/registry.ts. */
 const BASE_REPO = "base";
 
+/**
+ * dev and prod share the artifacts bucket. Every other object in it is immutable and
+ * environment-independent (content- or version-addressed), but this pointer is
+ * mutable and per-environment, so it is the one key that must be namespaced.
+ */
+function pointerKey(env: Env): string | null {
+  const name = env.INSTALL_ENV;
+  if (name !== "dev" && name !== "prod") return null;
+  return `registry/${BASE_REPO}/current-release.${name}.json`;
+}
+
 export interface Baseline {
   version: string;
   branch: string;
@@ -24,8 +35,13 @@ export interface Baseline {
  * One image in the shared "base" repo, so onboarding needs no per-client build.
  */
 export async function readBaseline(env: Env): Promise<Baseline | null> {
-  if (!env.INSTALL_ARTIFACTS) return null;
-  const obj = await env.INSTALL_ARTIFACTS.get(`registry/${BASE_REPO}/current-release.json`);
+  const key = pointerKey(env);
+  if (!env.INSTALL_ARTIFACTS || !key) {
+    // Fail closed: no baseline is better than another environment's.
+    if (!key) console.warn("[baseline] INSTALL_ENV is not set to dev or prod; no baseline served");
+    return null;
+  }
+  const obj = await env.INSTALL_ARTIFACTS.get(key);
   if (!obj) return null;
   const j = await obj.json<Partial<Baseline>>();
   return j.version && j.branch && j.commit && j.image && j.imageDigest && j.bundleSha256

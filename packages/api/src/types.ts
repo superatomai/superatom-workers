@@ -65,6 +65,8 @@ export type Env = {
   INSTALL_SA_API_URL: string;
   // Host a VM runs `docker login`/`docker pull` against (this worker serves /v2).
   INSTALL_REGISTRY_HOST?: string;
+  /** "dev" | "prod" — picks the baseline pointer; dev and prod share the bucket. */
+  INSTALL_ENV?: string;
   // Client UI links for the install summary; "{slug}" is replaced with the org slug.
   INSTALL_PLATFORM_UI_URL: string;
   INSTALL_USER_UI_URL: string;

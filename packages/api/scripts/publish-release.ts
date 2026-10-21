@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { AwsClient } from "aws4fetch";
-import { neon } from "@neondatabase/serverless";
+import { neon, neonConfig } from "@neondatabase/serverless";
 
 const run = promisify(execFile);
 const BUCKET = "superatom-install";
@@ -140,13 +140,18 @@ function db(env: string) {
   if (!existsSync(file)) fail(`${file} not found — cannot reach the ${env} database`);
   const line = readFileSync(file, "utf8").split("\n").find((l) => l.startsWith("DATABASE_URL="));
   if (!line) fail(`${file} has no DATABASE_URL`);
+  // SA_NEON_VIA_POOLER=1 where the driver's default api.<region>.neon.tech endpoint
+  // has no resolvable A record; the pooler host in the URL serves the same /sql.
+  if (process.env.SA_NEON_VIA_POOLER === "1") {
+    neonConfig.fetchEndpoint = (host: string) => `https://${host}/sql`;
+  }
   return neon(line.slice("DATABASE_URL=".length).trim());
 }
 
 /** The baseline release a new project starts on, or null if none is published. */
-async function baselinePointer(): Promise<{ version: string; commit: string } | null> {
+async function baselinePointer(env: string): Promise<{ version: string; commit: string } | null> {
   const { client, base } = s3();
-  const res = await client.fetch(`${base}/registry/${BASE_REPO}/current-release.json`);
+  const res = await client.fetch(`${base}/registry/${BASE_REPO}/current-release.${env}.json`);
   if (!res.ok) return null;
   const j = (await res.json()) as { version?: string; commit?: string };
   return j.version && j.commit ? { version: j.version, commit: j.commit } : null;
@@ -292,7 +297,7 @@ async function main() {
   if (baseline) {
     branch = arg("branch") ?? "main";
     // Diff against the baseline currently published, not against a project.
-    const current = await baselinePointer();
+    const current = await baselinePointer(env);
     prev = current ? { version: current.version, commit: current.commit } : undefined;
     console.log(`${env}: baseline (shared "${BASE_REPO}" repo, every project may pull it)`);
   } else {
@@ -394,9 +399,11 @@ async function main() {
     // Last, so a row never points at artifacts that are not there.
     const release = { ...meta, bundleSha256: bundleSha };
     if (baseline) {
-      await putSmall(`registry/${BASE_REPO}/current-release.json`,
-        Buffer.from(JSON.stringify({ ...release, notes }, null, 2) + "\n"), "application/json");
-      console.log(`  ✓ registry/${BASE_REPO}/current-release.json`);
+      // Per environment: dev and prod share the bucket, and this pointer is the one
+      // mutable, environment-specific object in it.
+      const pointer = `registry/${BASE_REPO}/current-release.${env}.json`;
+      await putSmall(pointer, Buffer.from(JSON.stringify({ ...release, notes }, null, 2) + "\n"), "application/json");
+      console.log(`  ✓ ${pointer}`);
       console.log(`\n✔ baseline published\n${JSON.stringify(release, null, 2)}`);
       console.log("\nNew projects start on this release; existing ones move to it from the super-admin console.");
       return;

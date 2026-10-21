@@ -21,10 +21,12 @@ type Release = typeof projectReleases.$inferSelect;
 /** unknown | in_sync | updating | failed | update_available */
 export function statusOf(inst: Install, newest: Release | undefined, pinned: string | null): string {
   if (!inst.releaseVersion) return "unknown";
+  // A recorded error outranks the version match. The previous order asked "has it
+  // reached its target?" first, so a failed update that had already written its
+  // marker reported success. The updater clears lastError on its next good report.
+  if (inst.lastError && inst.targetVersion) return "failed";
   if (pinned) return inst.releaseVersion === pinned ? "in_sync" : "updating";
-  if (inst.targetVersion && inst.targetVersion !== inst.releaseVersion) {
-    return inst.lastError ? "failed" : "updating";
-  }
+  if (inst.targetVersion && inst.targetVersion !== inst.releaseVersion) return "updating";
   return newest && inst.releaseVersion !== newest.version ? "update_available" : "in_sync";
 }
 
