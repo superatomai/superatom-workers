@@ -76,6 +76,30 @@ function s3(): { client: AwsClient; base: string } {
   };
 }
 
+/**
+ * R2 drops a connection now and then, and a single lost part failed the whole
+ * publish — hundreds of MB of re-upload. Retries transient faults only: a 4xx is
+ * ours to handle, not something waiting will fix.
+ */
+async function fetchRetry(what: string, run: () => Promise<Response>, attempts = 4): Promise<Response> {
+  let last: unknown;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await run();
+      if (res.ok || res.status < 500) return res;
+      last = new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      last = err;
+    }
+    if (i < attempts) {
+      const wait = 2 ** (i - 1) * 1000;
+      console.log(`\n  ⟳ ${what}: ${(last as Error).message} — retrying in ${wait / 1000}s`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw last;
+}
+
 async function exists(key: string): Promise<boolean> {
   const { client, base } = s3();
   const res = await client.fetch(`${base}/${key}`, { method: "HEAD" });
@@ -84,42 +108,56 @@ async function exists(key: string): Promise<boolean> {
 
 async function putSmall(key: string, body: Buffer, contentType: string): Promise<void> {
   const { client, base } = s3();
-  const res = await client.fetch(`${base}/${key}`, {
+  const res = await fetchRetry(`PUT ${key}`, () => client.fetch(`${base}/${key}`, {
     method: "PUT", body, headers: { "Content-Type": contentType },
-  });
+  }));
   if (!res.ok) fail(`PUT ${key} -> ${res.status} ${(await res.text()).slice(0, 200)}`);
 }
 
 /** Multipart upload, for layers too big for a single request. */
 async function putLarge(key: string, file: string, contentType: string): Promise<void> {
   const { client, base } = s3();
-  const start = await client.fetch(`${base}/${key}?uploads`, { method: "POST", headers: { "Content-Type": contentType } });
+  const start = await fetchRetry(`multipart start ${key}`, () =>
+    client.fetch(`${base}/${key}?uploads`, { method: "POST", headers: { "Content-Type": contentType } }));
   if (!start.ok) fail(`multipart start ${key} -> ${start.status}`);
   const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(await start.text())?.[1];
   if (!uploadId) fail(`no UploadId for ${key}`);
 
   const size = statSync(file).size;
   const parts: { n: number; etag: string }[] = [];
+  // R2 keeps the parts of an unfinished upload and bills for them, so a publish
+  // that dies mid-flight must abort rather than strand hundreds of MB.
+  const abort = () =>
+    client.fetch(`${base}/${key}?uploadId=${uploadId}`, { method: "DELETE" }).then(() => {}, () => {});
   const fh = await import("node:fs/promises").then((m) => m.open(file, "r"));
   try {
     for (let offset = 0, n = 1; offset < size; offset += PART_SIZE, n++) {
       const length = Math.min(PART_SIZE, size - offset);
       const buf = Buffer.alloc(length);
       await fh.read(buf, 0, length, offset);
-      const res = await client.fetch(`${base}/${key}?partNumber=${n}&uploadId=${uploadId}`, { method: "PUT", body: buf });
-      if (!res.ok) fail(`part ${n} of ${key} -> ${res.status}`);
+      const res = await fetchRetry(`part ${n} of ${key}`, () =>
+        client.fetch(`${base}/${key}?partNumber=${n}&uploadId=${uploadId}`, { method: "PUT", body: buf }));
+      if (!res.ok) { await abort(); fail(`part ${n} of ${key} -> ${res.status}`); }
       const etag = res.headers.get("ETag");
       if (!etag) fail(`part ${n} of ${key} returned no ETag`);
       parts.push({ n, etag });
       process.stdout.write(`\r    part ${n} (${((offset + length) / size * 100).toFixed(0)}%)`);
     }
+  } catch (err) {
+    await abort();
+    throw err;
   } finally {
     await fh.close();
   }
   const body = `<CompleteMultipartUpload>${parts
     .map((p) => `<Part><PartNumber>${p.n}</PartNumber><ETag>${p.etag}</ETag></Part>`).join("")}</CompleteMultipartUpload>`;
-  const done = await client.fetch(`${base}/${key}?uploadId=${uploadId}`, { method: "POST", body });
-  if (!done.ok) fail(`multipart complete ${key} -> ${done.status} ${(await done.text()).slice(0, 200)}`);
+  const done = await fetchRetry(`multipart complete ${key}`, () =>
+    client.fetch(`${base}/${key}?uploadId=${uploadId}`, { method: "POST", body }));
+  if (!done.ok) {
+    const detail = (await done.text()).slice(0, 200);
+    await abort();
+    fail(`multipart complete ${key} -> ${done.status} ${detail}`);
+  }
   process.stdout.write("\r");
 }
 
