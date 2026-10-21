@@ -1,7 +1,7 @@
 {
   "name": "sa-api",
   "version": "1.0.0",
-  "description": "SuperAtom REST API — org management, user management, app permissions, auth",
+  "description": "SuperAtom REST API \u2014 org management, user management, app permissions, auth",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
@@ -13,12 +13,15 @@
     "tail:dev": "wrangler tail --config wrangler.dev.toml",
     "type-check": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
-    "db:migrate:dev": "DATABASE_URL=$(grep -E '^DATABASE_URL=' .dev.vars | cut -d= -f2-) drizzle-kit migrate",
-    "db:migrate:prod": "DATABASE_URL=$(grep -E '^DATABASE_URL=' .env | cut -d= -f2-) drizzle-kit migrate",
-    "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio",
-    "superadmin": "tsx scripts/super-admins.ts"
+    "db:migrate": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 drizzle-kit migrate",
+    "db:migrate:dev": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 DATABASE_URL=$(grep -E '^DATABASE_URL=' .dev.vars | cut -d= -f2-) drizzle-kit migrate",
+    "db:migrate:prod": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 DATABASE_URL=$(grep -E '^DATABASE_URL=' .env | cut -d= -f2-) drizzle-kit migrate",
+    "db:push": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 drizzle-kit push",
+    "db:studio": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 drizzle-kit studio",
+    "superadmin": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/super-admins.ts",
+    "mirror-engine": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/mirror-engine.ts",
+    "publish-release": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/publish-release.ts",
+    "mirror-base-images": "NODE_OPTIONS=--network-family-autoselection-attempt-timeout=3000 tsx scripts/mirror-base-images.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",

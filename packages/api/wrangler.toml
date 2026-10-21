@@ -32,6 +32,13 @@ bucket_name = "sa-frontend-builds"
 # Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
 # MUST be the same namespace in sa-api and sa-websocket: sa-api signs with it,
 # sa-websocket verifies with it. Keys: org:<orgId>, org:__global.
+# Docker Engine/compose mirrors and per-release deploy bundles, served by the
+# install host to VMs that can only reach *.superatom.ai.
+# Fill with: pnpm mirror-engine --docker <ver> --compose <ver>
+[[r2_buckets]]
+binding = "INSTALL_ARTIFACTS"
+bucket_name = "superatom-install"
+
 [[kv_namespaces]]
 binding = "JWT_SECRETS"
 id = "1669d6442bf34757a223bd7d6548d14c"
@@ -44,6 +51,8 @@ SUPERADMIN_HOST = "superadmin.superatom.ai"
 INSTALL_HOST = "install.superatom.ai"
 INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
 INSTALL_CODE_REF = "main"
+# Where a VM docker-logins and pulls its image from (this worker serves /v2).
+INSTALL_REGISTRY_HOST = "install.superatom.ai"
 INSTALL_SA_API_URL = "https://sa-api.superatom.ai"
 INSTALL_PLATFORM_UI_URL = "https://{slug}.platform.superatom.ai"
 INSTALL_USER_UI_URL = "https://{slug}.superatom.ai"

@@ -132,6 +132,11 @@ export const projects = pgTable(
     icon: text("icon"),
     designSystem: jsonb("design_system"),
     config: jsonb("config"),
+    // Which superatom-setup-code branch the publish script builds for this project.
+    // A build input, not a delivery one: the VM pulls an image, never a git ref.
+    codeBranch: varchar("code_branch", { length: 255 }).notNull().default("main"),
+    // Set to roll back; null means the newest row in project_releases.
+    pinnedVersion: varchar("pinned_version", { length: 255 }),
     createdBy: uuid("created_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -140,6 +145,81 @@ export const projects = pgTable(
   },
   (table) => [uniqueIndex("projects_org_slug_idx").on(table.orgId, table.slug)]
 );
+
+/**
+ * One row per published release: the image, the engine it expects and the bundle
+ * that goes with it, pinned together so a rollback cannot mix versions. Written
+ * by the publish script; read by redeem/update to tell a VM what to run.
+ */
+export const projectReleases = pgTable(
+  "project_releases",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    version: varchar("version", { length: 255 }).notNull(),
+    branch: varchar("branch", { length: 255 }).notNull(),
+    commit: varchar("commit", { length: 40 }).notNull(),
+    // Repository and tag; the registry host comes from config, so an image stays
+    // valid if the host ever changes.
+    image: varchar("image", { length: 512 }).notNull(),
+    imageDigest: varchar("image_digest", { length: 71 }).notNull(),
+    bundleSha256: varchar("bundle_sha256", { length: 64 }).notNull(),
+    // Null means "whatever engine/current.json publishes".
+    engineVersion: varchar("engine_version", { length: 32 }),
+    composeVersion: varchar("compose_version", { length: 32 }),
+    // Migration count in this release, so a rollback across a schema change can warn.
+    migrations: integer("migrations"),
+    publishedBy: varchar("published_by", { length: 255 }),
+    // The commit log since the project's previous release, as RELEASE.md shows it.
+    // Stored so the UI can say what changed without fetching the bundle from R2.
+    notes: text("notes"),
+    publishedAt: timestamp("published_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_releases_version_idx").on(table.projectId, table.version),
+    index("project_releases_latest_idx").on(table.projectId, table.publishedAt),
+  ]
+);
+
+export const projectReleasesRelations = relations(projectReleases, ({ one }) => ({
+  project: one(projects, { fields: [projectReleases.projectId], references: [projects.id] }),
+}));
+
+/**
+ * One row per installed copy of a project — a client VM. The VM reports what it is
+ * running and reads targetVersion to know where to converge. Nothing derivable is
+ * stored (behind / in sync / updating), so the row cannot go stale.
+ */
+export const projectInstalls = pgTable(
+  "project_installs",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Matches install_tokens.install_name: one project can run on several VMs.
+    installName: varchar("install_name", { length: 255 }).notNull(),
+    // What the VM last reported running; null until it reports for the first time.
+    releaseVersion: varchar("release_version", { length: 255 }),
+    imageDigest: varchar("image_digest", { length: 71 }),
+    // What an admin approved. The updater only ever moves towards this, so
+    // publishing a release does not deploy it.
+    targetVersion: varchar("target_version", { length: 255 }),
+    targetSetBy: varchar("target_set_by", { length: 255 }),
+    targetSetAt: timestamp("target_set_at", { withTimezone: true }),
+    // The updater's last failure, cleared on its next successful report.
+    lastError: text("last_error"),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.projectId, table.installName] })]
+);
+
+export const projectInstallsRelations = relations(projectInstalls, ({ one }) => ({
+  project: one(projects, { fields: [projectInstalls.projectId], references: [projects.id] }),
+}));
 
 export const projectsRelations = relations(projects, ({ one, many }) => ({
   organization: one(organizations, {

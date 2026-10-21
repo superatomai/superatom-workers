@@ -21,6 +21,13 @@ bucket_name = "sa-source-files-dev"
 # Create ONCE, from packages/api (not here — that would make a second store):
 #   npx wrangler kv namespace create JWT_SECRETS --config wrangler.dev.toml
 # then paste the same id into this file and the other worker's wrangler.dev.toml.
+# Docker Engine/compose mirrors and per-release deploy bundles, served by the
+# install host to VMs that can only reach *.superatom.ai.
+# Fill with: pnpm mirror-engine --docker <ver> --compose <ver>
+[[r2_buckets]]
+binding = "INSTALL_ARTIFACTS"
+bucket_name = "superatom-install"
+
 [[kv_namespaces]]
 binding = "JWT_SECRETS"
 id = "9c9a0b9db2e346b98150dc0f2f9a27df"
@@ -38,6 +45,8 @@ SUPERADMIN_HOST = "dev.superadmin.superatom.ai"
 INSTALL_HOST = "dev.install.superatom.ai"
 INSTALL_CODE_REPO = "superatomai/superatom-setup-code"
 INSTALL_CODE_REF = "dev"
+# Where a VM docker-logins and pulls its image from (this worker serves /v2).
+INSTALL_REGISTRY_HOST = "dev.install.superatom.ai"
 INSTALL_SA_API_URL = "https://sa-api-dev.ashish-91e.workers.dev"
 INSTALL_WS_URL = "wss://sa-websocket-dev.ashish-91e.workers.dev/websocket"
 # Dev UIs have no per-org subdomains ("dev" is a reserved slug in the platform UI).

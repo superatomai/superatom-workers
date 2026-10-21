@@ -39,6 +39,20 @@ export function projectSlugError(slug: unknown): string | null {
   return null;
 }
 
+/**
+ * A superatom-setup-code branch name. Deliberately narrower than git allows:
+ * the publish script and the GitHub API both take it as a path segment.
+ */
+export function codeBranchError(branch: unknown): string | null {
+  if (typeof branch !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.length > 255) {
+    return "Code branch must be 1–255 letters, digits, dot, underscore, hyphen or slash, starting with a letter or digit.";
+  }
+  if (branch.includes("..") || branch.includes("//") || branch.endsWith("/") || branch.endsWith(".")) {
+    return "Code branch cannot contain \"..\" or \"//\", or end with \"/\" or \".\".";
+  }
+  return null;
+}
+
 /** Postgres unique-constraint violation, however the driver wraps it. */
 export function isUniqueViolation(err: unknown): boolean {
   const e = err as { code?: string; cause?: { code?: string } } | null;
