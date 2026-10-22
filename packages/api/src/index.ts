@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createDb } from "./db";
-import { isAllowedOrigin } from "./lib/origins";
+// Parked with the allowlist CORS policy below — restore both together.
+// import { isAllowedOrigin } from "./lib/origins";
 import { serveUi } from "./lib/serve-ui";
 import superadminApp from "./superadmin/app";
 import installApp from "./install/app";
@@ -29,60 +30,82 @@ import sdkAuthRoutes from "./routes/sdk-auth";
 import graphRoutes from "./routes/graph";
 import releaseRoutes from "./routes/releases";
 
-/**
- * SDK sign-in is called from CUSTOMER sites, whose origins we do not know. It is
- * safe to answer any origin here and only here: the endpoint reads no cookies and
- * is authenticated solely by the signed customer token in the body, so a page on
- * another site gains nothing it could not do from a server anyway. Every other
- * route keeps the first-party allowlist below.
- */
-const SDK_EXCHANGE_PATH = "/auth/sdk/exchange";
-
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
 // ─── CORS ────────────────────────────────────────────────
 /**
- * Only first-party origins may read authenticated responses.
+ * Any origin may call us.
  *
- * The previous bare `cors()` defaulted to `Access-Control-Allow-Origin: *` on
- * every route — including /auth/me — so any website could read the response.
- * Auth is Bearer-header based rather than cookie based, so this was token
- * replay rather than cookie CSRF: a JWT lifted from localStorage could be used
- * to exfiltrate user and org data straight from an attacker's own page.
+ * The SDK runs on CUSTOMER sites, whose domains we do not know in advance, and
+ * every route it needs is one a first-party allowlist would block. Keeping a
+ * list meant a deploy on our side each time a client shipped on a new domain,
+ * so there is no list: an origin check is not what protects these routes.
  *
- * Matches subdomains at ANY depth under superatom.ai, because the product uses
- * several levels:
- *   runtime   — live.superatom.ai, <client>.superatom.ai, dev.live.superatom.ai
- *   admin     — platform.superatom.ai, <client>.platform.superatom.ai, dev.platform…
- *   analytics — analytics.superatom.ai
- * A single-label pattern would silently break the admin UI for every client and
- * both dev environments.
+ * What protects them is the Bearer token. CORS only decides whether a BROWSER
+ * PAGE may read a response — it is no obstacle to curl or a server, so an
+ * attacker holding a token was never stopped by it, and one without a token
+ * gains nothing from being answered.
  *
- * The allowlist itself lives in lib/origins.ts, shared with SSO redirect
- * validation so the two cannot drift apart.
+ * THE ONE THING THIS DEPENDS ON: the refresh token is the only credential a
+ * browser attaches by itself, and its cookie is `sameSite: "Lax"`
+ * (lib/refresh-cookie.ts). That is what stops another site POSTing to
+ * /auth/refresh in a signed-in user's browser — the cookie is simply not sent.
+ * Change it to "None" and open CORS turns into a readable session token on any
+ * page the user visits. Keep it Lax, or put /auth/refresh back behind an
+ * allowlist in the same change.
+ *
+ * SSO redirects are NOT governed by this. lib/origins.ts still validates those
+ * (isAllowedRedirect), because the callback appends `?token=<jwt>` to the URL
+ * it is given, and that must stay first-party.
  */
 app.use(
   "*",
   cors({
-    origin: (origin, c) => {
-      // Non-browser callers (curl, server-to-server) send no Origin at all —
-      // CORS is irrelevant to them, so there is nothing to allow or deny.
-      if (!origin) return undefined;
-
-      if (c.req.path === SDK_EXCHANGE_PATH) return origin;
-
-      // Returning undefined omits Access-Control-Allow-Origin, so the browser
-      // blocks the response. allowHeaders/allowMethods stay at Hono's defaults,
-      // which reflect the request — safe now that origin is bounded.
-      return isAllowedOrigin(origin, c.env) ? origin : undefined;
-    },
-    // Required for the httpOnly refresh cookie to be sent on /auth/refresh.
-    // Only safe because the origin above is now a specific echo rather than "*"
-    // — browsers reject credentials combined with a wildcard origin outright.
+    // The caller's own origin echoed back, never "*": `credentials: true` below
+    // is required for the refresh cookie on /auth/refresh, and browsers reject
+    // credentials combined with a wildcard origin outright.
+    origin: (origin) => origin || undefined,
     credentials: true,
     maxAge: 86400,
   })
 );
+
+/*
+ * THE POLICY THIS REPLACED — kept so going back is one block, not a rewrite.
+ *
+ * First-party origins only, with /auth/sdk/exchange exempted because SDK
+ * sign-in is called from customer sites. The exemption is what made the
+ * asymmetry: sign-in answered any origin while the nine other routes the SDK
+ * calls were blocked, so a client on their own domain signed in and then
+ * failed on the first app fetch.
+ *
+ * To restore: uncomment this, delete the middleware above, and uncomment the
+ * `isAllowedOrigin` import at the top. ALLOWED_ORIGINS and PLATFORM_UI_URL
+ * still feed it — see lib/origins.ts, which is unchanged.
+ *
+ * const SDK_EXCHANGE_PATH = "/auth/sdk/exchange";
+ *
+ * app.use(
+ *   "*",
+ *   cors({
+ *     origin: (origin, c) => {
+ *       // Non-browser callers (curl, server-to-server) send no Origin at all —
+ *       // CORS is irrelevant to them, so there is nothing to allow or deny.
+ *       if (!origin) return undefined;
+ *
+ *       if (c.req.path === SDK_EXCHANGE_PATH) return origin;
+ *
+ *       // Returning undefined omits Access-Control-Allow-Origin, so the browser
+ *       // blocks the response. allowHeaders/allowMethods stay at Hono's defaults,
+ *       // which reflect the request — safe now that origin is bounded.
+ *       return isAllowedOrigin(origin, c.env) ? origin : undefined;
+ *     },
+ *     // Required for the httpOnly refresh cookie to be sent on /auth/refresh.
+ *     credentials: true,
+ *     maxAge: 86400,
+ *   })
+ * );
+ */
 
 // ─── Inject DB into context ──────────────────────────────
 app.use("*", async (c, next) => {
@@ -137,7 +160,7 @@ app.onError((err, c) => {
 
 // ─── Host dispatch ───────────────────────────────────────
 // The super-admin and install hosts get their own apps, so sa-api's credentialed
-// *.superatom.ai CORS and routes never apply there. Everything else is sa-api, unchanged.
+// any-origin CORS and routes never apply there. Everything else is sa-api, unchanged.
 export default {
   fetch(request, env, ctx) {
     const { hostname, pathname } = new URL(request.url);
