@@ -1,26 +1,8 @@
-import { BroadcastClient, BroadcastMessage, Env, DataSourceRecord } from './types';
+import { BroadcastClient, BroadcastMessage, ClientInfo, Env, DataSourceRecord } from './types';
 import { UsageStats } from '../usage/types';
-import { executeQuery } from '../api-keys/service';
+import { KnowledgeGraph } from './knowledge-graph';
 
-// Composition graph replication.
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const ENGINE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-/** Cloudflare caps a WebSocket message at 1 MiB; snapshot parts stay well under it. */
-const SNAPSHOT_PART_BYTES = 512 * 1024;
-
-type GraphHead = { releaseId: number; seq: number; rootHash: string; eventSeq: number };
-type ClientInfo = {
-	clientId: string;
-	type: string;
-	projectId?: string;
-	userId?: string;
-	orgId?: string;
-	role?: string;
-	config?: unknown;
-	authenticated?: boolean;
-};
-
-// Storage keys
+// Storage keys (the knowledge graph keeps its own: see knowledge-graph/versions.ts)
 const STORAGE_KEY_TOTAL_REQUESTS = 'totalRequests';
 const STORAGE_KEY_DAILY_REQUESTS = 'dailyRequests';
 const STORAGE_KEY_DATA_SOURCES = 'dataSources';
@@ -30,6 +12,28 @@ type DailyRequestsMap = Record<string, number>;
 
 // Per-project data-source registry, KEYED BY Data Source ID.
 type DataSourcesMap = Record<string, DataSourceRecord>;
+
+/**
+ * Message tracing — one JSON line per relayed message, filterable by `id` in
+ * Workers Logs, so a request and its reply can be lined up after the fact.
+ *
+ * Metadata only. Payloads carry customer data (rows, prompts, dashboards) and
+ * never go in a log line; the one exception is a reply's error text, cut short,
+ * because that is the thing an investigation actually needs to read.
+ *
+ * Streams and bundle chunks arrive by the hundred per request and are skipped,
+ * except the final bundle chunk — that is the bundle request's answer.
+ */
+const TRACE_SKIP_RE = /_STREAM$|_NARRATION$|^BUNDLE_CSS_CHUNK$|^UI_LOGS$/;
+const TRACE_RES_RE = /_RES$|_ABORTED$|^DS_(ACK|RESULT|ERROR)$|^BUNDLE_CHUNK$/;
+const TRACE_ERROR_MAX = 300;
+
+function traceErrorText(payload: any): string | null {
+	const raw = payload?.error ?? (Array.isArray(payload?.errors) && payload.errors.length ? payload.errors : null);
+	if (raw == null) return payload?.success === false ? 'success=false' : null;
+	const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
+	return text.length > TRACE_ERROR_MAX ? `${text.slice(0, TRACE_ERROR_MAX)}…` : text;
+}
 
 /**
  * Decode the base64 config header the worker set from the verified session.
@@ -55,12 +59,26 @@ export class Broadcaster implements DurableObject {
 	private clients: Map<string, BroadcastClient> = new Map();
 	private projectId: string;
 	private lastActivity: number;
+	/** Engine replication and per-user graph versions; graph messages and sa-api's notices are handed to it. */
+	private graph: KnowledgeGraph;
 
 	constructor(state: DurableObjectState, env: Env) {
 		this.state = state;
 		this.env = env;
 		this.lastActivity = Date.now();
 		this.projectId = state.id.name || 'unknown';
+		this.graph = new KnowledgeGraph({
+			env,
+			storage: state.storage,
+			projectId: () => this.projectId,
+			engineSockets: () => {
+				this.syncClientsFromWebSockets();
+				return [...this.clients.entries()]
+					.filter(([, c]) => c.type === 'data-agent' && c.socket.readyState === WebSocket.OPEN && this.isAuthenticated(c.socket))
+					.map(([id, c]) => [id, c.socket] as [string, WebSocket]);
+			},
+			sendError: (clientId, message) => this.sendError(clientId, message),
+		});
 	}
 
 	/**
@@ -252,216 +270,6 @@ export class Broadcaster implements DurableObject {
 		if (changed) await this.saveDataSources(records);
 	}
 
-	/** Composition graph: sa-api says a new release is live; each engine socket gets a GRAPH_RELEASE (a hint — engines also catch up on reconnect). */
-	private async handleGraphRelease(request: Request): Promise<Response> {
-		const json = (body: unknown, status = 200) =>
-			new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
-
-		if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
-
-		let notice: any;
-		try {
-			notice = await request.json();
-		} catch {
-			return json({ error: 'Invalid JSON body' }, 400);
-		}
-		const { releaseId, seq, rootHash, eventSeq } = notice ?? {};
-		if (![releaseId, seq, eventSeq].every((n) => Number.isInteger(n) && n > 0) || typeof rootHash !== 'string' || !rootHash) {
-			return json({ error: 'Expected { releaseId, seq, eventSeq, rootHash }' }, 400);
-		}
-
-		this.syncClientsFromWebSockets();
-		let sent = 0;
-		for (const [clientId, client] of this.clients.entries()) {
-			if (client.type !== 'data-agent' || client.socket.readyState !== WebSocket.OPEN) continue;
-			if (!this.isAuthenticated(client.socket)) continue;
-			try {
-				client.socket.send(JSON.stringify({
-					id: crypto.randomUUID(),
-					type: 'GRAPH_RELEASE',
-					from: { type: 'system' },
-					to: { type: 'data-agent', id: clientId },
-					payload: { projectId: this.projectId, releaseId, seq, rootHash, eventSeq, timestamp: Date.now() },
-				} as BroadcastMessage));
-				sent++;
-			} catch (error) {
-				console.error(`Broadcaster ${this.projectId}: failed to send GRAPH_RELEASE to ${clientId}:`, error);
-			}
-		}
-
-		console.log(`Broadcaster ${this.projectId}: GRAPH_RELEASE seq=${seq} event=${eventSeq} → ${sent} engine socket(s)`);
-		return json({ ok: true, sent });
-	}
-
-	/** Composition graph queries are scoped by the socket's project, which must be a real project id. */
-	private graphProjectId(clientInfo: ClientInfo): string | null {
-		const id = clientInfo.projectId || this.projectId;
-		return UUID_RE.test(id) ? id : null;
-	}
-
-	/** Engines (authenticated data-agent sockets) are the only ones that replicate the graph. */
-	private isEngine(clientInfo: ClientInfo): boolean {
-		return clientInfo.type === 'data-agent' && clientInfo.authenticated === true;
-	}
-
-	/** The release this project's engines should run: the target of its latest release event. */
-	private async currentGraphRelease(projectId: string): Promise<GraphHead | null> {
-		const rows = await executeQuery<any>(
-			this.env.DATABASE_URL,
-			`SELECT r.id::int AS release_id, r.seq::int AS seq, r.root_hash, e.event_seq::text AS event_seq
-			   FROM graph_release_events e
-			   JOIN graph_releases r ON r.id = e.to_release_id
-			  WHERE e.project_id = $1::uuid
-			  ORDER BY e.event_seq DESC
-			  LIMIT 1`,
-			[projectId],
-		);
-		if (!rows.length) return null;
-		const r = rows[0];
-		return { releaseId: Number(r.release_id), seq: Number(r.seq), rootHash: String(r.root_hash), eventSeq: Number(r.event_seq) };
-	}
-
-	/** Record what an engine runs (graph_engine_state); an `error` sticks until the engine is in sync again. */
-	private async recordEngine(
-		projectId: string,
-		engineId: string,
-		s: { status: 'in_sync' | 'behind' | 'error'; releaseId?: number | null; rootHash?: string | null; error?: string | null; acked?: boolean },
-	): Promise<void> {
-		await executeQuery(
-			this.env.DATABASE_URL,
-			`INSERT INTO graph_engine_state
-			        (project_id, engine_id, org_id, applied_release_id, applied_root_hash, status, last_error, last_seen_at, last_ack_at)
-			 SELECT $1::uuid, $2, p.org_id, $3::int, $4, $5, $6, now(), CASE WHEN $7::boolean THEN now() END
-			   FROM projects p WHERE p.id = $1::uuid
-			 ON CONFLICT (project_id, engine_id) DO UPDATE SET
-			   status = CASE WHEN EXCLUDED.status = 'behind' AND graph_engine_state.status = 'error'
-			                 THEN 'error' ELSE EXCLUDED.status END,
-			   last_error = CASE WHEN EXCLUDED.status = 'behind' THEN graph_engine_state.last_error
-			                     ELSE EXCLUDED.last_error END,
-			   applied_release_id = COALESCE(EXCLUDED.applied_release_id, graph_engine_state.applied_release_id),
-			   applied_root_hash = COALESCE(EXCLUDED.applied_root_hash, graph_engine_state.applied_root_hash),
-			   last_seen_at = now(),
-			   last_ack_at = COALESCE(EXCLUDED.last_ack_at, graph_engine_state.last_ack_at)`,
-			[projectId, engineId, s.releaseId ?? null, s.rootHash ?? null, s.status, s.error ?? null, !!s.acked],
-		);
-	}
-
-	/** GRAPH_HELLO — an engine reports its release; answered with GRAPH_NONE, GRAPH_IN_SYNC or GRAPH_SNAPSHOT parts. */
-	private async handleGraphHello(ws: WebSocket, clientInfo: ClientInfo, msg: BroadcastMessage): Promise<void> {
-		if (!this.isEngine(clientInfo)) {
-			this.sendError(clientInfo.clientId, 'GRAPH_HELLO is only accepted from an engine connection authenticated with the project API key');
-			return;
-		}
-		const projectId = this.graphProjectId(clientInfo);
-		const p = msg.payload ?? {};
-		const engineId = typeof p.engineId === 'string' && ENGINE_ID_RE.test(p.engineId) ? p.engineId : null;
-		if (!projectId || !engineId) {
-			this.sendError(clientInfo.clientId, 'GRAPH_HELLO needs a valid project and payload.engineId');
-			return;
-		}
-
-		const send = (type: string, payload: unknown) =>
-			ws.send(JSON.stringify({
-				id: crypto.randomUUID(),
-				type,
-				from: { type: 'system' },
-				to: { type: 'data-agent', id: clientInfo.clientId },
-				payload,
-			} as BroadcastMessage));
-
-		try {
-			const current = await this.currentGraphRelease(projectId);
-			if (!current) {
-				await this.recordEngine(projectId, engineId, { status: 'in_sync' });
-				send('GRAPH_NONE', { projectId });
-				return;
-			}
-			if (p.haveRootHash === current.rootHash) {
-				await this.recordEngine(projectId, engineId, { status: 'in_sync', releaseId: current.releaseId, rootHash: current.rootHash });
-				send('GRAPH_IN_SYNC', current);
-				return;
-			}
-			await this.recordEngine(projectId, engineId, { status: 'behind' });
-			await this.sendGraphSnapshot(projectId, current, send);
-		} catch (error) {
-			console.error(`Broadcaster ${this.projectId}: GRAPH_HELLO failed:`, error);
-			this.sendError(clientInfo.clientId, 'Could not read the graph release; the engine will retry');
-		}
-	}
-
-	/** The whole release, with every item's content, split into parts under the message size limit. */
-	private async sendGraphSnapshot(projectId: string, head: GraphHead, send: (type: string, payload: unknown) => void): Promise<void> {
-		const rows = await executeQuery<any>(
-			this.env.DATABASE_URL,
-			`SELECT v.entity, v.entity_id::int AS id, v.rev::int AS rev, v.hash, v.content::text AS content
-			   FROM graph_releases r
-			   CROSS JOIN LATERAL jsonb_to_recordset(r.items) AS x(entity text, id int, rev int)
-			   JOIN graph_revisions v ON v.entity = x.entity AND v.entity_id = x.id AND v.rev = x.rev
-			  WHERE r.id = $1 AND r.project_id = $2::uuid AND v.project_id = $2::uuid`,
-			[head.releaseId, projectId],
-		);
-		const items = rows.map((r) => ({
-			entity: r.entity,
-			id: Number(r.id),
-			rev: Number(r.rev),
-			hash: String(r.hash),
-			content: JSON.parse(r.content),
-		}));
-
-		const encoder = new TextEncoder();
-		const parts: (typeof items)[] = [];
-		let current: typeof items = [];
-		let bytes = 0;
-		for (const item of items) {
-			const size = encoder.encode(JSON.stringify(item)).length;
-			if (current.length && bytes + size > SNAPSHOT_PART_BYTES) {
-				parts.push(current);
-				current = [];
-				bytes = 0;
-			}
-			current.push(item);
-			bytes += size;
-		}
-		parts.push(current); // an empty release still sends one (empty) part
-
-		parts.forEach((list, part) => send('GRAPH_SNAPSHOT', { ...head, part, totalParts: parts.length, items: list }));
-		console.log(`Broadcaster ${projectId}: GRAPH_SNAPSHOT release ${head.seq} (${items.length} items, ${parts.length} part(s))`);
-	}
-
-	/** GRAPH_ACK / GRAPH_NACK — what the engine did with a release, recorded for the platform. */
-	private async handleGraphAck(clientInfo: ClientInfo, msg: BroadcastMessage): Promise<void> {
-		if (!this.isEngine(clientInfo)) return;
-		const projectId = this.graphProjectId(clientInfo);
-		const p = msg.payload ?? {};
-		const engineId = typeof p.engineId === 'string' && ENGINE_ID_RE.test(p.engineId) ? p.engineId : null;
-		if (!projectId || !engineId) return;
-
-		try {
-			if (msg.type === 'GRAPH_NACK') {
-				await this.recordEngine(projectId, engineId, { status: 'error', error: String(p.error ?? 'unknown error').slice(0, 2000) });
-				console.warn(`Broadcaster ${projectId}: engine ${engineId} refused release ${p.seq}: ${p.error}`);
-				return;
-			}
-			// Only record a release that really is this project's, with that content.
-			if (!Number.isInteger(p.releaseId) || typeof p.rootHash !== 'string') return;
-			const match = await executeQuery<any>(
-				this.env.DATABASE_URL,
-				`SELECT 1 FROM graph_releases WHERE id = $1 AND project_id = $2::uuid AND root_hash = $3`,
-				[p.releaseId, projectId, p.rootHash],
-			);
-			if (!match.length) return;
-			const current = await this.currentGraphRelease(projectId);
-			await this.recordEngine(projectId, engineId, {
-				status: current && current.rootHash === p.rootHash ? 'in_sync' : 'behind',
-				releaseId: p.releaseId,
-				rootHash: p.rootHash,
-				acked: true,
-			});
-		} catch (error) {
-			console.error(`Broadcaster ${this.projectId}: ${msg.type} could not be recorded:`, error);
-		}
-	}
-
 	private async getRegistry(): Promise<Response> {
 		this.syncClientsFromWebSockets();
 		const records = await this.loadDataSources();
@@ -494,10 +302,9 @@ export class Broadcaster implements DurableObject {
 
 		this.projectId = urlProjectId;
 
-		// Reached only via sa-api's DO binding; the worker refuses this path from outside.
-		if (url.pathname === '/graph-release') {
-			return this.handleGraphRelease(request);
-		}
+		// The knowledge graph's notices from sa-api (/graph-release, /graph-changes).
+		const graphResponse = this.graph.handleRequest(url.pathname, request);
+		if (graphResponse) return graphResponse;
 
 		if (url.pathname === '/websocket') {
 			return this.handleWebSocketUpgrade(request);
@@ -645,18 +452,65 @@ export class Broadcaster implements DurableObject {
 	}
 
 
-	private broadcastToOthers(senderId: string, message: any): void {
+	/** Returns how many sockets the message was handed to. */
+	private broadcastToOthers(senderId: string, message: any): number {
 		const messageStr = typeof message === 'string' ? message : JSON.stringify(message);
+		let delivered = 0;
 
 		for (const [clientId, client] of this.clients.entries()) {
 			if (clientId !== senderId && client.socket.readyState === WebSocket.OPEN) {
 				try {
 					client.socket.send(messageStr);
+					delivered++;
 				} catch (error) {
 					console.error(`Broadcaster ${this.projectId}: Failed to send to client ${clientId}:`, error);
 				}
 			}
 		}
+		return delivered;
+	}
+
+	/**
+	 * One trace line for a relayed message — see TRACE_SKIP_RE above.
+	 *
+	 * `delivered` is sockets the DO handed it to, not proof the far end read it:
+	 * a send into a dead socket the DO still holds as open also counts.
+	 */
+	private traceMessage(clientInfo: ClientInfo, msg: any, chars: number, to: string, delivered: number): void {
+		const type = typeof msg?.type === 'string' ? msg.type : 'unknown';
+		if (TRACE_SKIP_RE.test(type)) return;
+		if (type === 'BUNDLE_CHUNK' && !msg.payload?.isComplete) return;
+
+		const id = typeof msg?.id === 'string' ? msg.id : null;
+		const kind = TRACE_RES_RE.test(type) ? 'res' : 'req';
+		const error = kind === 'res' ? traceErrorText(msg.payload) : null;
+
+		const line: Record<string, unknown> = {
+			ev: 'ws_msg',
+			kind,
+			id,
+			// Bundle chunks are ids like `<reqId>-chunk-3`; this is the request they answer.
+			reqId: id ? id.replace(/-(css-)?chunk-\d+$/, '') : null,
+			type,
+			projectId: clientInfo.projectId || this.projectId,
+			fromType: clientInfo.type,
+			fromSocket: clientInfo.clientId,
+			userId: clientInfo.userId ?? null,
+			to,
+			delivered,
+			chars,
+		};
+		if (type === 'DATA_REQ' || type === 'DATA_RES') {
+			line.collection = msg.payload?.collection ?? null;
+			line.op = msg.payload?.op ?? null;
+		}
+		if (kind === 'res') line.status = error ? 'error' : 'ok';
+		if (error) line.error = error;
+
+		const text = JSON.stringify(line);
+		if (error) console.error(text);
+		else if (delivered === 0) console.warn(text);
+		else console.log(text);
 	}
 
 
@@ -893,13 +747,8 @@ export class Broadcaster implements DurableObject {
 			return;
 		}
 
-		// Composition graph replication — answered by the DO, never relayed.
-		if (ws_json_message.type === 'GRAPH_HELLO') {
-			await this.handleGraphHello(ws, clientInfo, ws_json_message);
-			return;
-		}
-		if (ws_json_message.type === 'GRAPH_ACK' || ws_json_message.type === 'GRAPH_NACK') {
-			await this.handleGraphAck(clientInfo, ws_json_message);
+		// Knowledge graph messages (replication, per-user versions) — answered here, never relayed.
+		if (await this.graph.handleMessage(ws, clientInfo, ws_json_message)) {
 			return;
 		}
 
@@ -931,16 +780,20 @@ export class Broadcaster implements DurableObject {
 		delete ws_json_message.authContext;
 
 		if (clientInfo.authenticated && clientInfo.userId) {
+			// The graph this user's questions use; absent means the live release.
+			const graphVersion = await this.graph.versionFor(clientInfo.userId);
 			ws_json_message.authContext = {
 				userId: clientInfo.userId,
 				...(clientInfo.orgId ? { orgId: clientInfo.orgId } : {}),
 				...(clientInfo.role ? { role: clientInfo.role } : {}),
 				...(clientInfo.config != null ? { config: clientInfo.config } : {}),
+				...(graphVersion !== undefined ? { graphVersion } : {}),
 			};
 		}
 
 		const targetType = ws_json_message.to?.type;
 		const targetId = ws_json_message.to?.id;
+		let delivered = 0;
 
 		if (targetId || targetType) {
 			// Route based on to.type
@@ -951,6 +804,7 @@ export class Broadcaster implements DurableObject {
 				if (targetClient && targetClient.socket.readyState === WebSocket.OPEN) {
 					try {
 						targetClient.socket.send(messageToSend);
+						delivered++;
 					} catch (error) {
 						console.error(`Broadcaster ${this.projectId}: Failed to send to target:`, error);
 					}
@@ -961,6 +815,7 @@ export class Broadcaster implements DurableObject {
 						if (client.type === targetType) {
 							try {
 								client.socket.send(messageToSend);
+								delivered++;
 							} catch (error) {
 								console.error(`Broadcaster ${this.projectId}: Failed to send to client ${clientId}:`, error);
 							}
@@ -974,8 +829,16 @@ export class Broadcaster implements DurableObject {
 		}
 		// If to is not present then broadcast to others
 		else {
-			this.broadcastToOthers(senderId, ws_json_message);
+			delivered = this.broadcastToOthers(senderId, ws_json_message);
 		}
+
+		this.traceMessage(
+			clientInfo,
+			ws_json_message,
+			messageStr.length,
+			targetId ? `id:${targetId}` : targetType ? `type:${targetType}` : 'broadcast',
+			delivered,
+		);
 	}
 
 	/**

@@ -77,10 +77,28 @@ async function withDbRetry<T>(
       ]);
     } catch (err) {
       lastErr = err;
-      console.warn(`db:${label} attempt ${attempt + 1} failed`, err);
+      console.warn(JSON.stringify({ ev: "db_retry", label, attempt: attempt + 1, error: errorInfo(err) }));
     }
   }
   throw lastErr;
+}
+
+/**
+ * An error as plain fields, for a one-line JSON log. Logged as the object
+ * itself, an Error often shows up in Cloudflare observability as `{}` — the
+ * message, its cause (where Postgres and fetch put the real reason) and the
+ * code are what say why.
+ */
+function errorInfo(err: unknown) {
+  const e = err as { name?: string; message?: string; code?: string; cause?: { message?: string; code?: string }; stack?: string };
+  return {
+    name: e?.name,
+    message: e?.message ?? String(err),
+    code: e?.code,
+    cause: e?.cause?.message,
+    causeCode: e?.cause?.code,
+    at: e?.stack?.split("\n").slice(1, 4).map((l) => l.trim()),
+  };
 }
 
 /**
@@ -125,6 +143,9 @@ auth.post("/login", async (c) => {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
+  // Which part of the login was running, for the log when it fails (the user sees one message for all of them).
+  let step = "find user";
+  let userId: string | undefined;
   try {
     let matchedUsers: (typeof users.$inferSelect)[] = [];
 
@@ -168,6 +189,8 @@ auth.post("/login", async (c) => {
 
     // Log into the first matched user; also return all their orgs
     const user = validUsers[0];
+    userId = user.id;
+    step = "load orgs";
 
     const allOrgIds = validUsers.map((u) => u.orgId).filter(Boolean) as string[];
     // Role lives on the per-org user row, not on organizations — the caller
@@ -191,8 +214,10 @@ auth.post("/login", async (c) => {
     // One id for this login session: the JWT carries it as `sid` and the refresh
     // token's family is created with it, so logout can end exactly this session.
     const sessionId = crypto.randomUUID();
+    step = "sign access token";
     const token = await mintAccessToken(user, c.env.JWT_SECRETS, sessionId);
 
+    step = "issue refresh token";
     const refresh = await issueRefreshToken(db, user.id, {
       familyId: sessionId,
       userAgent: c.req.header("User-Agent"),
@@ -213,7 +238,8 @@ auth.post("/login", async (c) => {
       orgs,
     });
   } catch (err) {
-    console.error("login failed", err);
+    // One JSON line, so Cloudflare observability can filter on ev/step. No email or password.
+    console.error(JSON.stringify({ ev: "login_failed", step, orgSlug: orgSlug ?? null, userId: userId ?? null, error: errorInfo(err) }));
     return c.json(
       { error: "Login is temporarily unavailable. Please try again." },
       503

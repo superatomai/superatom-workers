@@ -58,6 +58,8 @@ function conceptContent(c: ConceptRow) {
     aliases: c.aliases,
     description: c.description,
     sourceId: c.sourceId,
+    // Only when off, so every concept published before this field keeps its hash.
+    ...(c.active ? {} : { active: false }),
   };
 }
 
@@ -73,6 +75,21 @@ export async function currentRelease(q: Q, projectId: string): Promise<{ release
   if (!event) return null;
   const [release] = await q.select().from(graphReleases).where(eq(graphReleases.id, event.toReleaseId)).limit(1);
   return release ? { release, eventSeq: Number(event.eventSeq) } : null;
+}
+
+/**
+ * The newest release. The working copy always builds on it, whatever is live:
+ * making an older release live (rollback) only changes what chats use, so the
+ * draft, publishing and discarding are all counted against this one.
+ */
+export async function latestRelease(q: Q, projectId: string): Promise<ReleaseRow | null> {
+  const [row] = await q
+    .select()
+    .from(graphReleases)
+    .where(eq(graphReleases.projectId, projectId))
+    .orderBy(desc(graphReleases.seq))
+    .limit(1);
+  return row ?? null;
 }
 
 export async function getRelease(q: Q, projectId: string, seq: number): Promise<ReleaseRow> {
@@ -217,14 +234,14 @@ async function buildRelease(q: Q, s: Scope) {
     .map(({ entity, id, rev, hash }) => ({ entity, id, rev, hash }))
     .sort((a, b) => a.entity.localeCompare(b.entity) || a.id - b.id);
   const rootHash = await sha256Hex(canonicalJson(items));
-  const current = await currentRelease(q, s.projectId);
-  return { built, items, rootHash, newRevisions, current };
+  const [current, newest] = await Promise.all([currentRelease(q, s.projectId), latestRelease(q, s.projectId)]);
+  return { built, items, rootHash, newRevisions, current, latest: newest };
 }
 
-/** What publishing now would change against the live release. Writes nothing. */
+/** The draft: what publishing now would change against the latest release. Writes nothing. */
 export async function pendingChanges(q: Q, s: Scope) {
-  const { built, current } = await buildRelease(q, s);
-  const live = (current?.release.items as ReleaseItem[] | undefined) ?? [];
+  const { built, current, latest } = await buildRelease(q, s);
+  const live = (latest?.items as ReleaseItem[] | undefined) ?? [];
   const liveByKey = new Map(live.map((i) => [itemKey(i), i]));
   const builtKeys = new Set(built.map(itemKey));
   const nameOf = (i: { content: unknown }) => (i.content as { name?: string })?.name ?? null;
@@ -239,7 +256,7 @@ export async function pendingChanges(q: Q, s: Scope) {
   ]);
   const liveJson = new Map(liveContent.map((r) => [`${r.entity}:${r.id}`, canonicalJson(r.content)]));
   const changed = hashDiffers.filter((i) => liveJson.get(itemKey(i)) !== canonicalJson(i.content));
-  const by = await changedBy(q, s.projectId, current?.release.createdAt ?? null);
+  const by = await changedBy(q, s.projectId, latest?.createdAt ?? null);
   const row = (i: { entity: string; id: number }, name: string | null) => ({
     entity: i.entity as ReleaseItem["entity"],
     id: i.id,
@@ -248,6 +265,8 @@ export async function pendingChanges(q: Q, s: Scope) {
   });
   return {
     current: current ? { seq: current.release.seq } : null,
+    // What the draft is counted against (differs from `current` after a rollback).
+    base: latest ? { seq: latest.seq } : null,
     added: added.map((i) => row(i, nameOf(i))),
     changed: changed.map((i) => row(i, nameOf(i))),
     removed: removedNamed.map((i) => row(i, nameOf(i))),
@@ -272,21 +291,22 @@ async function changedBy(q: Q, projectId: string, since: Date | null): Promise<M
 }
 
 /**
- * Discard the draft: put the working copy back to the live release. Items the
- * draft added are removed, items it deleted come back, changed ones get their
- * live content. Every reset is in the edit history (via "discard"). Nothing is
- * published and open change requests are left alone. Run in a transaction.
+ * Discard the draft: put the working copy back to the latest release (what the
+ * draft builds on, see latestRelease). Items the draft added are removed, items
+ * it deleted come back, changed ones get that release's content. Every reset
+ * is in the edit history (via "discard"). Nothing is published and open change
+ * requests are left alone. Run in a transaction.
  */
 export async function discardDraft(q: Q, s: Scope) {
   await lockProject(q, s.projectId);
-  const current = await currentRelease(q, s.projectId);
-  if (!current) throw new HttpError(409, "Nothing is published yet, so there's no version to go back to");
-  const counts = await resetWorkingCopy(q, s, current.release.items as ReleaseItem[], "discard");
-  return { version: current.release.seq, ...counts };
+  const latest = await latestRelease(q, s.projectId);
+  if (!latest) throw new HttpError(409, "Nothing is published yet, so there's no version to go back to");
+  const counts = await resetWorkingCopy(q, s, latest.items as ReleaseItem[], "discard");
+  return { version: latest.seq, ...counts };
 }
 
 /** Put the working copy back to a release's items (see discardDraft). The project must be locked. */
-async function resetWorkingCopy(q: Q, s: Scope, items: ReleaseItem[], via: "discard" | "rollback") {
+async function resetWorkingCopy(q: Q, s: Scope, items: ReleaseItem[], via: "discard") {
   const live = await releaseContent(q, s.projectId, items);
   const liveIds = { node: new Set<number>(), concept: new Set<number>() };
   for (const i of live) liveIds[i.entity as "node" | "concept"].add(i.id);
@@ -339,7 +359,9 @@ async function resetWorkingCopy(q: Q, s: Scope, items: ReleaseItem[], via: "disc
   for (const item of live.filter((i) => i.entity === "concept")) {
     const row = rows.concepts.find((c) => c.id === item.id);
     if (!row) continue;
-    const target = { ...conceptFieldsOf(row), ...(item.content as Partial<ReturnType<typeof conceptFieldsOf>>) };
+    const content = item.content as Partial<ReturnType<typeof conceptFieldsOf>>;
+    // A release leaves `active` out when on (see conceptContent).
+    const target = { ...conceptFieldsOf(row), ...content, active: content.active ?? true };
     if (canonicalJson(conceptFieldsOf(row)) !== canonicalJson(target)) {
       await writeConcept(q, s, row, target, how);
       if (!restored.has(`concept:${item.id}`)) counts.reverted++;
@@ -367,12 +389,17 @@ async function resetWorkingCopy(q: Q, s: Scope, items: ReleaseItem[], via: "disc
   return counts;
 }
 
-/** Publish the working copy as the next release. Run in a transaction. */
+/** Publish the working copy as the next release, built on the latest one. Run in a transaction. */
 export async function publish(q: Q, s: Scope, notes: string | null) {
   await lockProject(q, s.projectId);
-  const { items, rootHash, newRevisions, current } = await buildRelease(q, s);
-  if (current && current.release.rootHash === rootHash) {
-    throw new HttpError(409, "Nothing to publish: the graph is the same as the current release");
+  const { items, rootHash, newRevisions, current, latest } = await buildRelease(q, s);
+  if (latest && latest.rootHash === rootHash) {
+    throw new HttpError(
+      409,
+      current?.release.id === latest.id
+        ? "Nothing to publish: the graph is the same as the current release"
+        : `Nothing to publish: the graph is the same as version ${latest.seq}. Make it live instead`,
+    );
   }
 
   // 5. Write revisions, release and event.
@@ -391,7 +418,8 @@ export async function publish(q: Q, s: Scope, notes: string | null) {
       seq: Number(maxSeq) + 1,
       items,
       rootHash,
-      parentReleaseId: current?.release.id ?? null,
+      // Built on the latest release, even when an older one is live.
+      parentReleaseId: latest?.id ?? null,
       notes,
       createdBy: s.userId,
     })
@@ -407,15 +435,16 @@ export async function publish(q: Q, s: Scope, notes: string | null) {
     actor: s.userId,
   });
 
-  const changes = await diffItems(q, s.projectId, (current?.release.items as ReleaseItem[] | undefined) ?? [], items);
+  const changes = await diffItems(q, s.projectId, (latest?.items as ReleaseItem[] | undefined) ?? [], items);
   return { release, eventSeq, changes };
 }
 
 /**
- * Make an earlier release live again: one more event, and the working copy is
- * put back to that release, so the page shows it with no draft. Releases are
- * never deleted, so the newer one can be made live again. Unpublished edits are
- * dropped (the UI lists them first). Run in a transaction.
+ * Make an earlier release live again: one more event. Only what's live changes,
+ * like a deploy rollback: the working copy stays on the latest release, so
+ * editing goes on from there and the draft is still counted against the latest
+ * (see latestRelease). Releases are never deleted, so the newer one can be made
+ * live again. Run in a transaction.
  */
 export async function rollback(q: Q, s: Scope, toSeq: number, reason: string) {
   await lockProject(q, s.projectId);
@@ -435,8 +464,22 @@ export async function rollback(q: Q, s: Scope, toSeq: number, reason: string) {
     reason,
     actor: s.userId,
   });
-  await resetWorkingCopy(q, s, target.items as ReleaseItem[], "rollback");
   return { release: target, eventSeq, from: current.release.seq };
+}
+
+/** Tell the project's DO the working copy changed, so engines pull the new changes (a hint, like notifyRelease). */
+export async function notifyChanges(env: Env, projectId: string): Promise<void> {
+  if (!env.BROADCASTER) return;
+  try {
+    const stub = env.BROADCASTER.get(env.BROADCASTER.idFromName(projectId));
+    await stub.fetch(`https://do/graph-changes?projectId=${encodeURIComponent(projectId)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId }),
+    });
+  } catch (err) {
+    console.warn("[graph] changes notice failed:", (err as Error)?.message ?? err);
+  }
 }
 
 /** Tell the project's DO a new release is live (a hint — engines also catch up on reconnect). No-op without BROADCASTER. */
