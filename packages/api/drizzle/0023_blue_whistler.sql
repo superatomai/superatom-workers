@@ -1,0 +1,1 @@
+ALTER TABLE "concepts" ADD COLUMN "active" boolean DEFAULT true NOT NULL;

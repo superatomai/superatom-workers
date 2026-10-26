@@ -137,6 +137,9 @@ export const projects = pgTable(
     codeBranch: varchar("code_branch", { length: 255 }).notNull().default("main"),
     // Set to roll back; null means the newest row in project_releases.
     pinnedVersion: varchar("pinned_version", { length: 255 }),
+    // Per program name, the version to run instead of the newest published one —
+    // e.g. { "home": "0.1.0" } rolls home back. A name not listed runs its newest.
+    programPins: jsonb("program_pins").$type<Record<string, string>>().notNull().default({}),
     createdBy: uuid("created_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -185,6 +188,52 @@ export const projectReleases = pgTable(
 
 export const projectReleasesRelations = relations(projectReleases, ({ one }) => ({
   project: one(projects, { fields: [projectReleases.projectId], references: [projects.id] }),
+}));
+
+/**
+ * One row per uploaded program build — the catalogue (architecture doc §11).
+ *
+ * A project has many programs, each one job's server side and/or UI, versioned
+ * apart from the engine and from each other. A build is its archive,
+ * programs/<projectId>/<hash>.tar.gz in the install bucket; the hash is the
+ * archive's sha256, so every hop can check what it got.
+ *
+ * An uploaded build is a draft until it is published (published_at set). What a
+ * project runs, per program name: its pin in projects.program_pins, else its
+ * newest published build.
+ */
+export const projectPrograms = pgTable(
+  "project_programs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // The program's name and version, from its program.json.
+    name: varchar("name", { length: 255 }).notNull(),
+    version: varchar("version", { length: 255 }).notNull(),
+    hash: varchar("hash", { length: 64 }).notNull(),
+    // The archive's size, checked with the hash.
+    bytes: integer("bytes").notNull(),
+    // The program repository's commit it was built from.
+    commit: varchar("commit", { length: 40 }).notNull(),
+    builtBy: varchar("built_by", { length: 255 }),
+    uploadedAt: timestamp("uploaded_at", { withTimezone: true }).defaultNow().notNull(),
+    // Null while a draft.
+    publishedBy: varchar("published_by", { length: 255 }),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    notes: text("notes"),
+  },
+  (table) => [
+    uniqueIndex("project_programs_version_idx").on(table.projectId, table.name, table.version),
+    // One row per build: the same archive cannot be registered twice.
+    uniqueIndex("project_programs_hash_idx").on(table.projectId, table.hash),
+    index("project_programs_latest_idx").on(table.projectId, table.name, table.publishedAt),
+  ]
+);
+
+export const projectProgramsRelations = relations(projectPrograms, ({ one }) => ({
+  project: one(projects, { fields: [projectPrograms.projectId], references: [projects.id] }),
 }));
 
 /**
@@ -733,6 +782,9 @@ export const concepts = pgTable(
     supersedes: integer("supersedes"),
     // Parity with the engine: rows here are always verified.
     verified: boolean("verified").default(true).notNull(),
+    // Off: answers leave it out (its domain links stay, so turning it back on puts it back).
+    // Versioned like any field. Not the engine's review status, which is a separate thing.
+    active: boolean("active").default(true).notNull(),
     editVersion: integer("edit_version").default(1).notNull(),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
     updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
@@ -868,6 +920,8 @@ export const graphChanges = pgTable(
     projectId: uuid("project_id")
       .notNull()
       .references(() => projects.id, { onDelete: "cascade" }),
+    // 1, 2, 3 … per project with no gaps, in commit order (from graph_change_heads); engines follow it.
+    seq: bigint("seq", { mode: "number" }).notNull(),
     // node | concept
     entity: varchar("entity", { length: 8 }).notNull(),
     // graph_nodes.id or concepts.id per `entity` (not an FK: history outlives the row).
@@ -887,8 +941,23 @@ export const graphChanges = pgTable(
   (table) => [
     index("graph_changes_item_idx").on(table.entity, table.entityId, table.changedAt),
     index("graph_changes_project_idx").on(table.projectId, table.changedAt),
+    uniqueIndex("graph_changes_project_seq_idx").on(table.projectId, table.seq),
   ]
 );
+
+// ─── Graph Change Heads ──────────────────────────────────
+// The last graph_changes.seq per project. Taking the next number locks this row
+// until the edit commits, so numbers are handed out in commit order with no gaps.
+
+export const graphChangeHeads = pgTable("graph_change_heads", {
+  projectId: uuid("project_id")
+    .primaryKey()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  orgId: uuid("org_id")
+    .notNull()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  seq: bigint("seq", { mode: "number" }).notNull(),
+});
 
 // ─── Graph Revisions ─────────────────────────────────────
 // Append-only: an immutable copy of an item each time a release includes a change to it.
@@ -1001,6 +1070,8 @@ export const graphEngineState = pgTable(
       onDelete: "set null",
     }),
     appliedRootHash: varchar("applied_root_hash", { length: 64 }),
+    // Last working-copy change (graph_changes.seq) it applied to its draft.
+    appliedChangeSeq: bigint("applied_change_seq", { mode: "number" }),
     // in_sync | behind | error
     status: varchar("status", { length: 12 }).notNull(),
     // Error from the last GRAPH_NACK.
