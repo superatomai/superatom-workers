@@ -12,7 +12,24 @@ export interface MessageAuthContext {
 	role?: string;
 	/** Verified data-access config from the users table — see VerifiedSession.config. */
 	config?: unknown;
+	/** The knowledge graph this user's questions use: "draft" or a release seq. Absent = the live release. */
+	graphVersion?: 'draft' | number;
 }
+
+/**
+ * Who sent a message, read from the socket's attachment (it survives
+ * hibernation). Identity fields are set only for a verified session.
+ */
+export type ClientInfo = {
+	clientId: string;
+	type: string;
+	projectId?: string;
+	userId?: string;
+	orgId?: string;
+	role?: string;
+	config?: unknown;
+	authenticated?: boolean;
+};
 
 export interface BroadcastMessage {
     id:string
