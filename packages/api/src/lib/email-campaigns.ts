@@ -7,6 +7,7 @@ import type { Database } from "../db";
 import {
   appPermissions,
   apps,
+  emailAttachments,
   emailCampaigns,
   emailSends,
   emailSubscriptionEvents,
@@ -18,17 +19,27 @@ import type { Env } from "../types";
 import {
   RESEND_BATCH_LIMIT,
   fromAddress,
+  sendEmail,
   sendEmailBatch,
   signUnsubscribeToken,
   unsubscribeHeaders,
   type EmailMessage,
 } from "./email";
+import { signObjectUrl } from "./r2-objects";
 import { isRecurring, nextRun, parseSchedule } from "./email-schedule";
 
 export const DAILY_ORG_LIMIT = 2000;
 export const ANNOUNCEMENTS = "announcements";
 // A "sending" campaign untouched this long lost its worker; the cron resumes it.
 const STALE_MS = 10 * 60 * 1000;
+// Per invocation, then the rest is handed to the next cron tick. Keeps a run inside
+// the Worker's time and subrequest limits; "Send now" gets the short budget.
+export const CRON_BUDGET_MS = 4 * 60 * 1000;
+export const REQUEST_BUDGET_MS = 20 * 1000;
+const MAX_SENDS_PER_RUN = 600;
+// Emails with files go one by one (batch can't attach); Resend allows ~2 requests/second.
+const SINGLE_SEND_INTERVAL_MS = 550;
+const ATTACHMENT_URL_TTL_SECONDS = 6 * 60 * 60;
 
 export type Audience =
   | { type: "all" | "admins" | "members" }
@@ -251,20 +262,43 @@ export async function processDueCampaigns(env: Env, db: Database): Promise<void>
     .limit(10);
   for (const { id } of due) {
     try {
-      await processCampaign(env, db, id);
+      await processCampaign(env, db, id, CRON_BUDGET_MS);
     } catch (err) {
       console.error(`[email] campaign ${id} failed:`, err);
     }
   }
 }
 
-/** Sends one campaign to completion. The claim UPDATE makes concurrent runs a no-op. */
-export async function processCampaign(env: Env, db: Database, campaignId: string): Promise<void> {
+/** Ready files of a campaign; a recurring email's run uses its parent's. */
+export async function readyAttachments(db: Database, campaignId: string) {
+  return db
+    .select()
+    .from(emailAttachments)
+    .where(and(eq(emailAttachments.campaignId, campaignId), eq(emailAttachments.status, "ready")))
+    .orderBy(emailAttachments.createdAt);
+}
+
+/** Signed links Resend fetches the files from. */
+export async function attachmentLinks(env: Env, rows: Array<{ fileName: string; r2Key: string }>) {
+  return Promise.all(
+    rows.map(async (a) => ({
+      filename: a.fileName,
+      path: await signObjectUrl(env, a.r2Key, "GET", ATTACHMENT_URL_TTL_SECONDS, {}, env.EMAIL_ATTACHMENTS_BUCKET_NAME),
+    }))
+  );
+}
+
+/**
+ * Sends a campaign, within `budgetMs`. The claim UPDATE makes concurrent runs a no-op;
+ * anything left when the budget runs out goes back to "scheduled" for the next cron tick.
+ */
+export async function processCampaign(env: Env, db: Database, campaignId: string, budgetMs = CRON_BUDGET_MS): Promise<void> {
+  const started = Date.now();
   const [head] = await db
     .select({ schedule: emailCampaigns.schedule })
     .from(emailCampaigns)
     .where(eq(emailCampaigns.id, campaignId));
-  if (head && isRecurring(parseSchedule(head.schedule))) return runRecurring(env, db, campaignId);
+  if (head && isRecurring(parseSchedule(head.schedule))) return runRecurring(env, db, campaignId, budgetMs);
 
   const now = new Date();
   const [campaign] = await db
@@ -331,48 +365,63 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
   const orgName = org?.name ?? "Your organization";
   const from = fromAddress(env, orgName);
 
+  const files = await attachmentLinks(env, await readyAttachments(db, campaign.parentId ?? campaignId));
+  const buildMessage = async (r: { email: string; userId: string | null }): Promise<EmailMessage> => {
+    const url = r.userId ? unsubscribeUrl(env, await signUnsubscribeToken(env, r.userId, campaign.category)) : undefined;
+    return {
+      from,
+      to: [r.email],
+      subject: campaign.subject,
+      html: buildEmailHtml({ orgName, bodyMarkdown: campaign.bodyMarkdown, unsubscribeUrl: url }),
+      replyTo: author?.email,
+      headers: url ? unsubscribeHeaders(url) : undefined,
+      tags: [{ name: "campaign", value: campaignId }],
+      ...(files.length ? { attachments: files } : {}),
+    };
+  };
+
+  let sentThisRun = 0;
   for (;;) {
+    if (Date.now() - started > budgetMs || sentThisRun >= MAX_SENDS_PER_RUN) {
+      // Hand the rest to the next cron tick (it claims "scheduled" campaigns that are due).
+      await db
+        .update(emailCampaigns)
+        .set({ status: "scheduled", scheduledAt: new Date(), updatedAt: new Date() })
+        .where(eq(emailCampaigns.id, campaignId));
+      return;
+    }
     const batch = await db
       .select({ id: emailSends.id, email: emailSends.email, userId: emailSends.userId })
       .from(emailSends)
       .where(and(eq(emailSends.campaignId, campaignId), eq(emailSends.status, "pending")))
       .orderBy(emailSends.id)
-      .limit(RESEND_BATCH_LIMIT);
+      .limit(files.length ? 25 : RESEND_BATCH_LIMIT);
     if (batch.length === 0) break;
 
-    const messages: EmailMessage[] = await Promise.all(
-      batch.map(async (r) => {
-        const url = r.userId ? unsubscribeUrl(env, await signUnsubscribeToken(env, r.userId, campaign.category)) : undefined;
-        return {
-          from,
-          to: [r.email],
-          subject: campaign.subject,
-          html: buildEmailHtml({ orgName, bodyMarkdown: campaign.bodyMarkdown, unsubscribeUrl: url }),
-          replyTo: author?.email,
-          headers: url ? unsubscribeHeaders(url) : undefined,
-          tags: [{ name: "campaign", value: campaignId }],
-        };
-      })
-    );
-
-    const result = await sendEmailBatch(env, messages, `campaign-${campaignId}-${await digest(batch.map((r) => r.id).join(","))}`);
-    if (result.notConfigured) return void (await fail(result.error!));
-
-    if (result.success) {
-      const ids = result.ids ?? [];
-      const values = sql.join(
-        batch.map((r, i) => sql`(${r.id}::uuid, ${ids[i] ?? null})`),
-        sql`, `
+    const results: Array<{ id: string; resendId?: string; error?: string }> = [];
+    if (!files.length) {
+      const messages = await Promise.all(batch.map(buildMessage));
+      const result = await sendEmailBatch(env, messages, `campaign-${campaignId}-${await digest(batch.map((r) => r.id).join(","))}`);
+      batch.forEach((r, i) =>
+        results.push(result.success ? { id: r.id, resendId: result.ids?.[i] } : { id: r.id, error: result.error ?? "Send failed" })
       );
-      await db.execute(sql`
-        update ${emailSends} set status = 'sent', resend_id = v.rid, sent_at = now()
-        from (values ${values}) as v(id, rid) where ${emailSends.id} = v.id`);
     } else {
-      await db
-        .update(emailSends)
-        .set({ status: "failed", error: result.error ?? "Send failed" })
-        .where(inArray(emailSends.id, batch.map((r) => r.id)));
+      for (const r of batch) {
+        const result = await sendEmail(env, await buildMessage(r), `campaign-${campaignId}-${r.id}`);
+        results.push(result.success ? { id: r.id, resendId: result.ids?.[0] } : { id: r.id, error: result.error ?? "Send failed" });
+        await sleep(SINGLE_SEND_INTERVAL_MS);
+      }
     }
+
+    const values = sql.join(
+      results.map((r) => sql`(${r.id}::uuid, ${r.error ? "failed" : "sent"}, ${r.resendId ?? null}, ${r.error ?? null})`),
+      sql`, `
+    );
+    await db.execute(sql`
+      update ${emailSends} set status = v.status, resend_id = v.rid, error = v.err,
+        sent_at = case when v.status = 'sent' then now() else null end
+      from (values ${values}) as v(id, status, rid, err) where ${emailSends.id} = v.id`);
+    sentThisRun += batch.length;
     // Heartbeat, so the cron doesn't treat a long send as stalled.
     await db.update(emailCampaigns).set({ updatedAt: new Date() }).where(eq(emailCampaigns.id, campaignId));
   }
@@ -400,7 +449,7 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
  * A due recurring email: move it on to its next run, then send this occurrence as a child
  * campaign. Moving scheduledAt is the claim, so a concurrent cron/send can't spawn it twice.
  */
-async function runRecurring(env: Env, db: Database, campaignId: string): Promise<void> {
+async function runRecurring(env: Env, db: Database, campaignId: string, budgetMs: number): Promise<void> {
   const now = new Date();
   const [parent] = await db
     .select()
@@ -437,7 +486,11 @@ async function runRecurring(env: Env, db: Database, campaignId: string): Promise
       createdBy: parent.createdBy,
     })
     .returning({ id: emailCampaigns.id });
-  await processCampaign(env, db, run.id);
+  await processCampaign(env, db, run.id, budgetMs);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function digest(value: string): Promise<string> {

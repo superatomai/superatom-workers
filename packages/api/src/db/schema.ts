@@ -1249,6 +1249,28 @@ export const emailSends = pgTable(
   ]
 );
 
+/** Files sent with an announcement; a recurring email's runs reuse the parent's. Kept in R2. */
+export const emailAttachments = pgTable(
+  "email_attachments",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => emailCampaigns.id, { onDelete: "cascade" }),
+    fileName: varchar("file_name", { length: 255 }).notNull(),
+    contentType: varchar("content_type", { length: 255 }),
+    sizeBytes: integer("size_bytes").notNull(),
+    r2Key: text("r2_key").notNull(),
+    // pending: upload URL handed out | ready: the object is confirmed in R2
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("email_attachments_campaign_idx").on(table.campaignId),
+    check("email_attachments_status_check", sql`${table.status} in ('pending', 'ready')`),
+  ]
+);
+
 export const emailUnsubscribes = pgTable(
   "email_unsubscribes",
   {

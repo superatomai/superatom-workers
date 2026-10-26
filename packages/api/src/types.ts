@@ -78,6 +78,8 @@ export type Env = {
   // Announcement emails: sending address (a var) and the unsubscribe-link signing key (a secret).
   EMAIL_FROM?: string;
   EMAIL_UNSUBSCRIBE_SECRET?: string;
+  /** Private R2 bucket for email attachments, reached through the S3 API like source files. */
+  EMAIL_ATTACHMENTS_BUCKET_NAME?: string;
   // Per-project LLM proxy keys via the llm-proxy worker's admin API; "dummy" skips it (dev).
   LLM_PROXY?: Fetcher;
   LLM_PROXY_ADMIN_SECRET?: string;

@@ -18,6 +18,8 @@ export interface EmailMessage {
   replyTo?: string;
   headers?: Record<string, string>;
   tags?: Array<{ name: string; value: string }>;
+  /** Resend downloads each `path` (a URL) itself. Not allowed in batch sends. */
+  attachments?: Array<{ filename: string; path: string }>;
 }
 
 export interface SendResult {
@@ -48,6 +50,9 @@ export async function sendEmail(env: Env, message: EmailMessage, idempotencyKey?
 /** One Resend call for up to 100 messages; all-or-nothing on Resend's side. */
 export async function sendEmailBatch(env: Env, messages: EmailMessage[], idempotencyKey?: string): Promise<SendResult> {
   if (!messages.length) return { success: true, ids: [] };
+  if (messages.some((m) => m.attachments?.length)) {
+    return { success: false, error: "Resend batch sends don't support attachments" };
+  }
   if (messages.length > RESEND_BATCH_LIMIT) {
     return { success: false, error: `Batch exceeds ${RESEND_BATCH_LIMIT} messages` };
   }
@@ -64,6 +69,7 @@ function toResend(m: EmailMessage) {
     ...(m.replyTo ? { reply_to: m.replyTo } : {}),
     ...(m.headers ? { headers: m.headers } : {}),
     ...(m.tags?.length ? { tags: m.tags } : {}),
+    ...(m.attachments?.length ? { attachments: m.attachments } : {}),
   };
 }
 

@@ -19,13 +19,14 @@ export function r2S3Client(env: Env): AwsClient {
 	});
 }
 
-export function objectUrl(env: Env, key: string): string {
-	return `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_SOURCE_FILES_BUCKET_NAME}/${encodeURI(key)}`;
+/** `bucket` defaults to the source-files bucket; other features pass their own. */
+export function objectUrl(env: Env, key: string, bucket = env.R2_SOURCE_FILES_BUCKET_NAME): string {
+	return `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${bucket}/${encodeURI(key)}`;
 }
 
 /** Deletes one object. A key that is already gone counts as deleted. */
-export async function deleteObject(env: Env, key: string): Promise<void> {
-	const res = await r2S3Client(env).fetch(objectUrl(env, key), { method: "DELETE" });
+export async function deleteObject(env: Env, key: string, bucket?: string): Promise<void> {
+	const res = await r2S3Client(env).fetch(objectUrl(env, key, bucket), { method: "DELETE" });
 	if (!res.ok && res.status !== 404) {
 		throw new Error(`R2 DELETE failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
 	}
@@ -41,8 +42,9 @@ export async function signObjectUrl(
 	method: "GET" | "PUT",
 	ttlSeconds: number,
 	query: Record<string, string> = {},
+	bucket?: string,
 ): Promise<string> {
-	const url = new URL(objectUrl(env, key));
+	const url = new URL(objectUrl(env, key, bucket));
 	url.searchParams.set("X-Amz-Expires", String(ttlSeconds));
 	for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
 	const signed = await r2S3Client(env).sign(url.toString(), { method, aws: { signQuery: true } });
@@ -61,8 +63,8 @@ export type ObjectCheck =
  * HEAD: its Content-Range ("bytes 0-0/<total>") always carries the size, where a
  * HEAD's Content-Length can come back empty. An empty object can't be ranged at all (416).
  */
-export async function checkObject(env: Env, key: string): Promise<ObjectCheck> {
-	const probe = await r2S3Client(env).fetch(objectUrl(env, key), {
+export async function checkObject(env: Env, key: string, bucket?: string): Promise<ObjectCheck> {
+	const probe = await r2S3Client(env).fetch(objectUrl(env, key, bucket), {
 		method: "GET",
 		headers: { Range: "bytes=0-0" },
 	});

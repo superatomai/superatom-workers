@@ -1,14 +1,18 @@
 import { Hono } from "hono";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import { emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
+import { emailAttachments, emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
+import { checkObject, deleteObject, signObjectUrl } from "../lib/r2-objects";
 import { fromAddress, isEmailConfigured, sendEmail } from "../lib/email";
 import {
   ANNOUNCEMENTS,
   DAILY_ORG_LIMIT,
+  REQUEST_BUDGET_MS,
+  attachmentLinks,
+  readyAttachments,
   buildEmailHtml,
   dailyUsage,
   parseAudience,
@@ -29,6 +33,15 @@ emails.use("*", authMiddleware, adminOnly, orgScopeGuard);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
+const MAX_ATTACHMENTS = 10;
+// Total per email: bigger mails get bounced or spam-filtered (Resend's own cap is 40 MB).
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const UPLOAD_URL_TTL_SECONDS = 15 * 60;
+// Documents, spreadsheets, slides, images and archives; never executables or scripts.
+const ATTACHMENT_EXTENSIONS = [
+  "pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp",
+  "png", "jpg", "jpeg", "gif", "webp", "zip",
+];
 
 type Body = { subject?: unknown; bodyMarkdown?: unknown; audience?: unknown };
 
@@ -105,6 +118,7 @@ emails.get("/", async (c) => {
       createdByName: users.name,
       runCount: sql<number>`(select count(*)::int from email_campaigns r where r.parent_id = ${emailCampaigns.id})`,
       lastRunAt: sql<string | null>`(select max(r.sent_at) from email_campaigns r where r.parent_id = ${emailCampaigns.id})`,
+      attachmentCount: sql<number>`(select count(*)::int from email_attachments f where f.campaign_id = ${emailCampaigns.id} and f.status = 'ready')`,
     })
     .from(emailCampaigns)
     .leftJoin(users, eq(users.id, emailCampaigns.createdBy))
@@ -112,7 +126,13 @@ emails.get("/", async (c) => {
     .orderBy(desc(emailCampaigns.createdAt))
     .limit(200);
   return c.json(
-    rows.map((r) => ({ ...r.campaign, createdByName: r.createdByName, runCount: r.runCount, lastRunAt: r.lastRunAt }))
+    rows.map((r) => ({
+      ...r.campaign,
+      createdByName: r.createdByName,
+      runCount: r.runCount,
+      lastRunAt: r.lastRunAt,
+      attachmentCount: r.attachmentCount,
+    }))
   );
 });
 
@@ -243,7 +263,10 @@ emails.delete("/:id", async (c) => {
   if (campaign.status !== "draft" && campaign.status !== "cancelled") {
     return c.json({ error: `A ${campaign.status} email can't be deleted` }, 409);
   }
-  await c.get("db").delete(emailCampaigns).where(eq(emailCampaigns.id, campaign.id));
+  const db = c.get("db");
+  const files = await db.select({ r2Key: emailAttachments.r2Key }).from(emailAttachments).where(eq(emailAttachments.campaignId, campaign.id));
+  await Promise.all(files.map((f) => deleteObject(c.env, f.r2Key, c.env.EMAIL_ATTACHMENTS_BUCKET_NAME)));
+  await db.delete(emailCampaigns).where(eq(emailCampaigns.id, campaign.id));
   return c.json({ message: "Deleted" });
 });
 
@@ -262,6 +285,7 @@ emails.post("/:id/test", async (c) => {
     to: [me.email],
     subject: `[Test] ${campaign.subject}`,
     html: buildEmailHtml({ orgName, bodyMarkdown: campaign.bodyMarkdown }),
+    attachments: await attachmentLinks(c.env, await readyAttachments(db, campaign.parentId ?? campaign.id)),
   });
   if (!result.success) return c.json({ error: result.error }, result.notConfigured ? 503 : 502);
   return c.json({ message: `Test sent to ${me.email}` });
@@ -288,7 +312,7 @@ emails.post("/:id/send", async (c) => {
     .returning();
   if (!row) return c.json({ error: "Email is already sending" }, 409);
   // If the worker is cut off, the cron resumes it.
-  c.executionCtx.waitUntil(processCampaign(c.env, c.get("db"), row.id).catch((err) => console.error("[email] send now failed:", err)));
+  c.executionCtx.waitUntil(processCampaign(c.env, c.get("db"), row.id, REQUEST_BUDGET_MS).catch((err) => console.error("[email] send now failed:", err)));
   return c.json({ ...row, status: "sending", recipientCount: limit.count }, 202);
 });
 
@@ -345,6 +369,129 @@ emails.post("/:id/cancel", async (c) => {
     .where(and(eq(emailCampaigns.id, campaign.id), eq(emailCampaigns.status, "scheduled")))
     .returning();
   return row ? c.json(row) : c.json({ error: `A ${campaign.status} email can't be cancelled` }, 409);
+});
+
+// ─── Attachments ─────────────────────────────────────────
+// Browser uploads straight to R2: POST (record + upload URL) → PUT to R2 → POST complete.
+
+const editable = (status: string) => status === "draft" || status === "scheduled";
+
+/** GET /orgs/:orgId/emails/:id/attachments — files that finished uploading. */
+emails.get("/:id/attachments", async (c) => {
+  const campaign = await loadCampaign(c, c.req.param("orgId")!, c.req.param("id"));
+  if (!campaign) return c.json({ error: "Email not found" }, 404);
+  const rows = await readyAttachments(c.get("db"), campaign.parentId ?? campaign.id);
+  return c.json(rows.map(({ id, fileName, contentType, sizeBytes }) => ({ id, fileName, contentType, sizeBytes })));
+});
+
+/** POST /orgs/:orgId/emails/:id/attachments { fileName, contentType?, size } → { attachment, uploadUrl } */
+emails.post("/:id/attachments", async (c) => {
+  if (!c.env.EMAIL_ATTACHMENTS_BUCKET_NAME) return c.json({ error: "Attachments are not configured" }, 503);
+  const orgId = c.req.param("orgId")!;
+  const campaign = await loadCampaign(c, orgId, c.req.param("id"));
+  if (!campaign) return c.json({ error: "Email not found" }, 404);
+  if (campaign.parentId || !editable(campaign.status)) {
+    return c.json({ error: `Files can't be added to a ${campaign.status} email` }, 409);
+  }
+  const body = await c.req
+    .json<{ fileName?: unknown; contentType?: unknown; size?: unknown }>()
+    .catch(() => ({}) as { fileName?: unknown; contentType?: unknown; size?: unknown });
+  const fileName = typeof body.fileName === "string" ? body.fileName.replace(/[\\/\x00-\x1f]/g, "_").trim().slice(0, 200) : "";
+  const size = Number(body.size);
+  if (!fileName) return c.json({ error: "fileName is required" }, 400);
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  if (!fileName.includes(".") || !ATTACHMENT_EXTENSIONS.includes(ext)) {
+    return c.json({ error: `This file type can't be attached. Allowed: ${ATTACHMENT_EXTENSIONS.join(", ")}` }, 400);
+  }
+  if (!Number.isInteger(size) || size <= 0) return c.json({ error: "size must be a positive number of bytes" }, 400);
+
+  const db = c.get("db");
+  // Uploads abandoned for over an hour don't count.
+  const existing = await db
+    .select({ sizeBytes: emailAttachments.sizeBytes })
+    .from(emailAttachments)
+    .where(
+      and(
+        eq(emailAttachments.campaignId, campaign.id),
+        sql`(${emailAttachments.status} = 'ready' or ${emailAttachments.createdAt} > now() - interval '1 hour')`
+      )
+    );
+  if (existing.length >= MAX_ATTACHMENTS) return c.json({ error: `At most ${MAX_ATTACHMENTS} files per email` }, 400);
+  const total = existing.reduce((n, f) => n + f.sizeBytes, 0);
+  if (total + size > MAX_ATTACHMENT_BYTES) {
+    return c.json({ error: `Files can total at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB per email` }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  // The key gets a URL-safe name; recipients see the original one.
+  const r2Key = `email-attachments/${orgId}/${campaign.id}/${id}/${fileName.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+  const [row] = await db
+    .insert(emailAttachments)
+    .values({
+      id,
+      campaignId: campaign.id,
+      fileName,
+      contentType: typeof body.contentType === "string" ? body.contentType.slice(0, 255) : null,
+      sizeBytes: size,
+      r2Key,
+    })
+    .returning();
+  const uploadUrl = await signObjectUrl(c.env, r2Key, "PUT", UPLOAD_URL_TTL_SECONDS, {}, c.env.EMAIL_ATTACHMENTS_BUCKET_NAME);
+  return c.json(
+    { attachment: { id: row.id, fileName, contentType: row.contentType, sizeBytes: size }, uploadUrl, expiresIn: UPLOAD_URL_TTL_SECONDS },
+    201
+  );
+});
+
+/** POST /orgs/:orgId/emails/:id/attachments/:attId/complete — confirm the PUT landed, at a size within limits. */
+emails.post("/:id/attachments/:attId/complete", async (c) => {
+  const campaign = await loadCampaign(c, c.req.param("orgId")!, c.req.param("id"));
+  if (!campaign) return c.json({ error: "Email not found" }, 404);
+  const attId = c.req.param("attId");
+  if (!UUID.test(attId)) return c.json({ error: "File not found" }, 404);
+  const db = c.get("db");
+  const [att] = await db
+    .select()
+    .from(emailAttachments)
+    .where(and(eq(emailAttachments.id, attId), eq(emailAttachments.campaignId, campaign.id)));
+  if (!att) return c.json({ error: "File not found" }, 404);
+
+  const bucket = c.env.EMAIL_ATTACHMENTS_BUCKET_NAME;
+  const probe = await checkObject(c.env, att.r2Key, bucket);
+  if (probe.state !== "ok") return c.json({ error: "The upload didn't finish; try again" }, 409);
+  // The size declared up front isn't binding on the PUT, so re-check the real one.
+  const others = await db
+    .select({ n: sql<number>`coalesce(sum(${emailAttachments.sizeBytes}), 0)::int` })
+    .from(emailAttachments)
+    .where(and(eq(emailAttachments.campaignId, campaign.id), eq(emailAttachments.status, "ready")));
+  if ((others[0]?.n ?? 0) + probe.size > MAX_ATTACHMENT_BYTES) {
+    await deleteObject(c.env, att.r2Key, bucket);
+    await db.delete(emailAttachments).where(eq(emailAttachments.id, att.id));
+    return c.json({ error: `Files can total at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB per email` }, 400);
+  }
+  const [row] = await db
+    .update(emailAttachments)
+    .set({ status: "ready", sizeBytes: probe.size, contentType: att.contentType ?? probe.contentType })
+    .where(eq(emailAttachments.id, att.id))
+    .returning();
+  return c.json({ id: row.id, fileName: row.fileName, contentType: row.contentType, sizeBytes: row.sizeBytes });
+});
+
+/** DELETE /orgs/:orgId/emails/:id/attachments/:attId */
+emails.delete("/:id/attachments/:attId", async (c) => {
+  const campaign = await loadCampaign(c, c.req.param("orgId")!, c.req.param("id"));
+  if (!campaign) return c.json({ error: "Email not found" }, 404);
+  if (!editable(campaign.status)) return c.json({ error: `Files can't be removed from a ${campaign.status} email` }, 409);
+  const attId = c.req.param("attId");
+  if (!UUID.test(attId)) return c.json({ error: "File not found" }, 404);
+  const db = c.get("db");
+  const [att] = await db
+    .delete(emailAttachments)
+    .where(and(eq(emailAttachments.id, attId), eq(emailAttachments.campaignId, campaign.id)))
+    .returning();
+  if (!att) return c.json({ error: "File not found" }, 404);
+  await deleteObject(c.env, att.r2Key, c.env.EMAIL_ATTACHMENTS_BUCKET_NAME);
+  return c.json({ message: "Removed" });
 });
 
 /** GET /orgs/:orgId/emails/:id/runs — each send of a recurring email, newest first. */
