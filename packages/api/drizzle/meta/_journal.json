@@ -183,6 +183,13 @@
       "when": 1793015525647,
       "tag": "0025_email_campaigns",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1793016956132,
+      "tag": "0026_email_subscription_admin",
+      "breakpoints": true
     }
   ]
 }

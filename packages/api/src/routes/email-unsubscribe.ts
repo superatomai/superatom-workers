@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import type { Env, AppVariables } from "../types";
 import { eq } from "drizzle-orm";
-import { emailUnsubscribes, users } from "../db/schema";
+import { users } from "../db/schema";
 import { verifyUnsubscribeToken } from "../lib/email";
+import { setSubscription } from "../lib/email-campaigns";
 
 /**
  * Public unsubscribe, mounted at /email. The signed token is the only credential.
@@ -43,7 +44,7 @@ unsubscribe.post("/unsubscribe", async (c) => {
   // A deleted user has no row to reference, and no one left to email.
   const [user] = await db.select({ id: users.id }).from(users).where(eq(users.id, parsed.userId));
   if (user) {
-    await db.insert(emailUnsubscribes).values({ userId: parsed.userId, category: parsed.category }).onConflictDoNothing();
+    await setSubscription(db, { userId: parsed.userId, category: parsed.category, subscribed: false, source: "self" });
   }
   return c.html(page("Unsubscribed", `<h2 style="margin-top: 0;">You're unsubscribed</h2><p style="color: #4b5563;">You won't receive any more announcement emails.</p>`));
 });

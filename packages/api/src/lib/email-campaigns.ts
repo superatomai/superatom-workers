@@ -9,6 +9,7 @@ import {
   apps,
   emailCampaigns,
   emailSends,
+  emailSubscriptionEvents,
   emailUnsubscribes,
   organizations,
   users,
@@ -107,6 +108,35 @@ export async function resolveRecipients(
     seen.add(key);
     return true;
   });
+}
+
+/** Sets one person's subscription and logs the change; one atomic batch. */
+export async function setSubscription(
+  db: Database,
+  p: { userId: string; category: string; subscribed: boolean; source: "self" | "admin"; changedBy?: string | null }
+): Promise<void> {
+  const changedBy = p.changedBy ?? null;
+  const change = p.subscribed
+    ? db
+        .delete(emailUnsubscribes)
+        .where(and(eq(emailUnsubscribes.userId, p.userId), eq(emailUnsubscribes.category, p.category)))
+    : db
+        .insert(emailUnsubscribes)
+        .values({ userId: p.userId, category: p.category, source: p.source, changedBy })
+        .onConflictDoUpdate({
+          target: [emailUnsubscribes.userId, emailUnsubscribes.category],
+          set: { source: p.source, changedBy, createdAt: new Date() },
+        });
+  await db.batch([
+    change,
+    db.insert(emailSubscriptionEvents).values({
+      userId: p.userId,
+      category: p.category,
+      subscribed: p.subscribed,
+      source: p.source,
+      changedBy,
+    }),
+  ]);
 }
 
 /** Emails sent (or queued) for the org in the last 24h, excluding one campaign. */

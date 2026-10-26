@@ -1251,7 +1251,27 @@ export const emailUnsubscribes = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     category: varchar("category", { length: 32 }).notNull(),
+    // self = the person's own unsubscribe link; admin = an org admin turned it off.
+    source: varchar("source", { length: 16 }).notNull().default("self"),
+    changedBy: uuid("changed_by").references(() => users.id, { onDelete: "set null" }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [primaryKey({ columns: [table.userId, table.category] })]
+);
+
+/** Every subscribe/unsubscribe, kept after the current state changes back. */
+export const emailSubscriptionEvents = pgTable(
+  "email_subscription_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    category: varchar("category", { length: 32 }).notNull(),
+    subscribed: boolean("subscribed").notNull(),
+    source: varchar("source", { length: 16 }).notNull(),
+    changedBy: uuid("changed_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index("email_subscription_events_user_idx").on(table.userId, table.createdAt)]
 );

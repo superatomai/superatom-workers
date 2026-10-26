@@ -1,6 +1,7 @@
 import { Hono } from "hono";
-import { and, desc, eq, inArray } from "drizzle-orm";
-import { emailCampaigns, emailSends, organizations, projects, users } from "../db/schema";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
@@ -13,6 +14,7 @@ import {
   parseAudience,
   processCampaign,
   resolveRecipients,
+  setSubscription,
   type Audience,
 } from "../lib/email-campaigns";
 
@@ -111,6 +113,56 @@ emails.get("/usage", async (c) => {
     limit: DAILY_ORG_LIMIT,
     configured: isEmailConfigured(c.env),
   });
+});
+
+/** GET /orgs/:orgId/emails/subscribers — every active user and their announcement subscription. */
+emails.get("/subscribers", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const changer = alias(users, "changer");
+  const rows = await c
+    .get("db")
+    .select({
+      userId: users.id,
+      name: users.name,
+      email: users.email,
+      role: users.role,
+      unsubscribedAt: emailUnsubscribes.createdAt,
+      source: emailUnsubscribes.source,
+      changedByName: changer.name,
+    })
+    .from(users)
+    .leftJoin(
+      emailUnsubscribes,
+      and(eq(emailUnsubscribes.userId, users.id), eq(emailUnsubscribes.category, ANNOUNCEMENTS))
+    )
+    .leftJoin(changer, eq(changer.id, emailUnsubscribes.changedBy))
+    .where(and(eq(users.orgId, orgId), eq(users.isActive, true)))
+    .orderBy(asc(users.name));
+  return c.json(
+    rows.map(({ unsubscribedAt, source, changedByName, ...u }) => ({
+      ...u,
+      subscribed: unsubscribedAt === null,
+      unsubscribedAt,
+      unsubscribedBy: unsubscribedAt === null ? null : source === "admin" ? (changedByName ?? "an admin") : "self",
+    }))
+  );
+});
+
+/** PUT /orgs/:orgId/emails/subscribers/:userId { subscribed } — admin override, logged with who did it. */
+emails.put("/subscribers/:userId", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const userId = c.req.param("userId");
+  const { subscribed } = await c.req.json<{ subscribed?: unknown }>().catch(() => ({}) as { subscribed?: unknown });
+  if (typeof subscribed !== "boolean") return c.json({ error: "subscribed must be true or false" }, 400);
+  if (!UUID.test(userId)) return c.json({ error: "User not found" }, 404);
+  const db = c.get("db");
+  const [user] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.id, userId), eq(users.orgId, orgId)));
+  if (!user) return c.json({ error: "User not found" }, 404);
+  await setSubscription(db, { userId, category: ANNOUNCEMENTS, subscribed, source: "admin", changedBy: c.get("userId") });
+  return c.json({ userId, subscribed });
 });
 
 /** POST /orgs/:orgId/emails/recipients — preview who an audience reaches, before saving. */
