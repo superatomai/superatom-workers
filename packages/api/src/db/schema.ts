@@ -1195,6 +1195,10 @@ export const emailCampaigns = pgTable(
     subject: varchar("subject", { length: 255 }).notNull(),
     bodyMarkdown: text("body_markdown").notNull(),
     status: varchar("status", { length: 16 }).notNull().default("draft"),
+    // EmailSchedule (lib/email-schedule.ts); null = send now. Recurring ones stay "scheduled",
+    // scheduledAt is the next run, and each run is a child row (parentId) holding its own sends.
+    schedule: jsonb("schedule"),
+    parentId: uuid("parent_id").references((): AnyPgColumn => emailCampaigns.id, { onDelete: "cascade" }),
     scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
     sentAt: timestamp("sent_at", { withTimezone: true }),
     recipientCount: integer("recipient_count").notNull().default(0),
@@ -1208,6 +1212,7 @@ export const emailCampaigns = pgTable(
   },
   (table) => [
     index("email_campaigns_org_idx").on(table.orgId, table.createdAt),
+    index("email_campaigns_parent_idx").on(table.parentId, table.createdAt),
     // The cron's "what's due" scan.
     index("email_campaigns_due_idx").on(table.status, table.scheduledAt),
     check(

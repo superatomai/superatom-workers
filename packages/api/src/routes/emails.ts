@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
@@ -17,6 +17,7 @@ import {
   setSubscription,
   type Audience,
 } from "../lib/email-campaigns";
+import { isRecurring, nextRun, parseSchedule, type EmailSchedule } from "../lib/email-schedule";
 
 /**
  * Org announcements: an org admin writes an email and sends it, now or later,
@@ -76,11 +77,17 @@ async function loadCampaign(c: AppContext, orgId: string, id: string) {
 }
 
 /** Recipients that will actually get it, against what's left of today's limit. */
-async function checkLimit(c: AppContext, orgId: string, campaign: { id: string; audience: unknown; category: string }) {
+/** A recurring email is checked per run, so only against the whole daily limit here. */
+async function checkLimit(
+  c: AppContext,
+  orgId: string,
+  campaign: { id: string; audience: unknown; category: string },
+  recurring = false
+) {
   const db = c.get("db");
   const recipients = await resolveRecipients(db, orgId, parseAudience(campaign.audience)!, campaign.category);
   const count = recipients.filter((r) => !r.unsubscribed).length;
-  const used = await dailyUsage(db, orgId, campaign.id);
+  const used = recurring ? 0 : await dailyUsage(db, orgId, campaign.id);
   if (count === 0) return { ok: false as const, error: "No recipients match this audience" };
   if (used + count > DAILY_ORG_LIMIT) {
     return { ok: false as const, error: `This needs ${count} emails, but only ${Math.max(0, DAILY_ORG_LIMIT - used)} of the ${DAILY_ORG_LIMIT} daily limit are left` };
@@ -88,7 +95,7 @@ async function checkLimit(c: AppContext, orgId: string, campaign: { id: string; 
   return { ok: true as const, count };
 }
 
-/** GET /orgs/:orgId/emails — campaigns, newest first. */
+/** GET /orgs/:orgId/emails — campaigns, newest first; a recurring email's runs are nested under it. */
 emails.get("/", async (c) => {
   const orgId = c.req.param("orgId")!;
   const rows = await c
@@ -96,13 +103,17 @@ emails.get("/", async (c) => {
     .select({
       campaign: emailCampaigns,
       createdByName: users.name,
+      runCount: sql<number>`(select count(*)::int from email_campaigns r where r.parent_id = ${emailCampaigns.id})`,
+      lastRunAt: sql<string | null>`(select max(r.sent_at) from email_campaigns r where r.parent_id = ${emailCampaigns.id})`,
     })
     .from(emailCampaigns)
     .leftJoin(users, eq(users.id, emailCampaigns.createdBy))
-    .where(eq(emailCampaigns.orgId, orgId))
+    .where(and(eq(emailCampaigns.orgId, orgId), isNull(emailCampaigns.parentId)))
     .orderBy(desc(emailCampaigns.createdAt))
     .limit(200);
-  return c.json(rows.map((r) => ({ ...r.campaign, createdByName: r.createdByName })));
+  return c.json(
+    rows.map((r) => ({ ...r.campaign, createdByName: r.createdByName, runCount: r.runCount, lastRunAt: r.lastRunAt }))
+  );
 });
 
 /** GET /orgs/:orgId/emails/usage — today's quota, and whether sending is set up at all. */
@@ -272,7 +283,7 @@ emails.post("/:id/send", async (c) => {
   const [row] = await c
     .get("db")
     .update(emailCampaigns)
-    .set({ status: "scheduled", scheduledAt: now, error: null, updatedAt: now })
+    .set({ status: "scheduled", schedule: null, scheduledAt: now, error: null, updatedAt: now })
     .where(and(eq(emailCampaigns.id, campaign.id), inArray(emailCampaigns.status, ["draft", "scheduled"])))
     .returning();
   if (!row) return c.json({ error: "Email is already sending" }, 409);
@@ -281,27 +292,43 @@ emails.post("/:id/send", async (c) => {
   return c.json({ ...row, status: "sending", recipientCount: limit.count }, 202);
 });
 
-/** POST /orgs/:orgId/emails/:id/schedule { scheduledAt } — ISO time, in the future. */
+/**
+ * POST /orgs/:orgId/emails/:id/schedule { schedule } — an EmailSchedule (once or recurring),
+ * or the older { scheduledAt } ISO time for a one-off.
+ */
 emails.post("/:id/schedule", async (c) => {
   const orgId = c.req.param("orgId")!;
   const campaign = await loadCampaign(c, orgId, c.req.param("id"));
   if (!campaign) return c.json({ error: "Email not found" }, 404);
+  if (campaign.parentId) return c.json({ error: "A run of a recurring email can't be scheduled" }, 409);
   if (campaign.status !== "draft" && campaign.status !== "scheduled") {
     return c.json({ error: `A ${campaign.status} email can't be scheduled` }, 409);
   }
-  const { scheduledAt } = await c.req.json<{ scheduledAt?: string }>().catch(() => ({}) as { scheduledAt?: string });
-  const at = scheduledAt ? new Date(scheduledAt) : null;
-  if (!at || Number.isNaN(at.getTime())) return c.json({ error: "scheduledAt must be an ISO date-time" }, 400);
-  if (at.getTime() <= Date.now()) return c.json({ error: "scheduledAt must be in the future" }, 400);
-  if (at.getTime() - Date.now() > MAX_SCHEDULE_AHEAD_MS) return c.json({ error: "scheduledAt must be within a year" }, 400);
-  // Checked against today's usage now; re-checked when it actually sends.
-  const limit = await checkLimit(c, orgId, campaign);
+  const body = await c.req
+    .json<{ scheduledAt?: string; schedule?: unknown }>()
+    .catch(() => ({}) as { scheduledAt?: string; schedule?: unknown });
+
+  let schedule: EmailSchedule | null = null;
+  let at: Date | null;
+  if (body.schedule !== undefined) {
+    schedule = parseSchedule(body.schedule);
+    if (!schedule) return c.json({ error: "schedule is invalid" }, 400);
+    at = nextRun(schedule, new Date());
+    if (!at) return c.json({ error: "That time has already passed" }, 400);
+  } else {
+    at = body.scheduledAt ? new Date(body.scheduledAt) : null;
+    if (!at || Number.isNaN(at.getTime())) return c.json({ error: "scheduledAt must be an ISO date-time" }, 400);
+    if (at.getTime() <= Date.now()) return c.json({ error: "scheduledAt must be in the future" }, 400);
+  }
+  if (at.getTime() - Date.now() > MAX_SCHEDULE_AHEAD_MS) return c.json({ error: "The first send must be within a year" }, 400);
+  // Checked now; re-checked when each send actually goes out.
+  const limit = await checkLimit(c, orgId, campaign, isRecurring(schedule));
   if (!limit.ok) return c.json({ error: limit.error }, 400);
 
   const [row] = await c
     .get("db")
     .update(emailCampaigns)
-    .set({ status: "scheduled", scheduledAt: at, error: null, updatedAt: new Date() })
+    .set({ status: "scheduled", schedule, scheduledAt: at, error: null, updatedAt: new Date() })
     .where(and(eq(emailCampaigns.id, campaign.id), inArray(emailCampaigns.status, ["draft", "scheduled"])))
     .returning();
   return row ? c.json(row) : c.json({ error: "Email is already sending" }, 409);
@@ -318,6 +345,20 @@ emails.post("/:id/cancel", async (c) => {
     .where(and(eq(emailCampaigns.id, campaign.id), eq(emailCampaigns.status, "scheduled")))
     .returning();
   return row ? c.json(row) : c.json({ error: `A ${campaign.status} email can't be cancelled` }, 409);
+});
+
+/** GET /orgs/:orgId/emails/:id/runs — each send of a recurring email, newest first. */
+emails.get("/:id/runs", async (c) => {
+  const campaign = await loadCampaign(c, c.req.param("orgId")!, c.req.param("id"));
+  if (!campaign) return c.json({ error: "Email not found" }, 404);
+  const rows = await c
+    .get("db")
+    .select()
+    .from(emailCampaigns)
+    .where(eq(emailCampaigns.parentId, campaign.id))
+    .orderBy(desc(emailCampaigns.createdAt))
+    .limit(200);
+  return c.json(rows);
 });
 
 /** GET /orgs/:orgId/emails/:id/sends — per-recipient delivery log. */

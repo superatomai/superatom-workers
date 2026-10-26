@@ -23,6 +23,7 @@ import {
   unsubscribeHeaders,
   type EmailMessage,
 } from "./email";
+import { isRecurring, nextRun, parseSchedule } from "./email-schedule";
 
 export const DAILY_ORG_LIMIT = 2000;
 export const ANNOUNCEMENTS = "announcements";
@@ -259,6 +260,12 @@ export async function processDueCampaigns(env: Env, db: Database): Promise<void>
 
 /** Sends one campaign to completion. The claim UPDATE makes concurrent runs a no-op. */
 export async function processCampaign(env: Env, db: Database, campaignId: string): Promise<void> {
+  const [head] = await db
+    .select({ schedule: emailCampaigns.schedule })
+    .from(emailCampaigns)
+    .where(eq(emailCampaigns.id, campaignId));
+  if (head && isRecurring(parseSchedule(head.schedule))) return runRecurring(env, db, campaignId);
+
   const now = new Date();
   const [campaign] = await db
     .update(emailCampaigns)
@@ -278,6 +285,9 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
 
   const fail = (error: string) =>
     db.update(emailCampaigns).set({ status: "failed", error, updatedAt: new Date() }).where(eq(emailCampaigns.id, campaignId));
+  if (!env.RESEND_API_KEY || !env.EMAIL_UNSUBSCRIBE_SECRET) {
+    return void (await fail("Email sending is not configured (RESEND_API_KEY / EMAIL_UNSUBSCRIBE_SECRET)"));
+  }
 
   // First run materialises the recipient list; a resumed run just drains what's pending.
   const [{ n: existing }] = await db
@@ -384,6 +394,50 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
       updatedAt: new Date(),
     })
     .where(eq(emailCampaigns.id, campaignId));
+}
+
+/**
+ * A due recurring email: move it on to its next run, then send this occurrence as a child
+ * campaign. Moving scheduledAt is the claim, so a concurrent cron/send can't spawn it twice.
+ */
+async function runRecurring(env: Env, db: Database, campaignId: string): Promise<void> {
+  const now = new Date();
+  const [parent] = await db
+    .select()
+    .from(emailCampaigns)
+    .where(and(eq(emailCampaigns.id, campaignId), eq(emailCampaigns.status, "scheduled"), lte(emailCampaigns.scheduledAt, now)));
+  if (!parent?.orgId || !parent.scheduledAt) return;
+
+  // Next run counts from now, so a missed run (cron down) is skipped rather than replayed.
+  const next = nextRun(parseSchedule(parent.schedule)!, now);
+  const [claimed] = await db
+    .update(emailCampaigns)
+    .set({ scheduledAt: next, status: next ? "scheduled" : "sent", updatedAt: now })
+    .where(
+      and(
+        eq(emailCampaigns.id, campaignId),
+        eq(emailCampaigns.status, "scheduled"),
+        eq(emailCampaigns.scheduledAt, parent.scheduledAt)
+      )
+    )
+    .returning({ id: emailCampaigns.id });
+  if (!claimed) return;
+
+  const [run] = await db
+    .insert(emailCampaigns)
+    .values({
+      orgId: parent.orgId,
+      parentId: parent.id,
+      audience: parent.audience,
+      category: parent.category,
+      subject: parent.subject,
+      bodyMarkdown: parent.bodyMarkdown,
+      status: "scheduled",
+      scheduledAt: now,
+      createdBy: parent.createdBy,
+    })
+    .returning({ id: emailCampaigns.id });
+  await processCampaign(env, db, run.id);
 }
 
 async function digest(value: string): Promise<string> {
