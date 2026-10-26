@@ -224,8 +224,16 @@ export function renderMarkdown(md: string): string {
   return out.join("\n");
 }
 
-/** Solid colours only: Gmail strips gradient backgrounds. */
-export function buildEmailHtml(p: { orgName: string; bodyMarkdown: string; unsubscribeUrl?: string }): string {
+/** The part of caller-supplied HTML that goes inside our layout: the <body> contents, keeping <style> blocks. */
+export function htmlFragment(html: string): string {
+  const body = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+  if (!body) return html.replace(/<!doctype[^>]*>|<\/?html[^>]*>|<head[^>]*>[\s\S]*?<\/head>/gi, "");
+  const styles = html.slice(0, body.index).match(/<style[^>]*>[\s\S]*?<\/style>/gi) ?? [];
+  return styles.join("\n") + body[1];
+}
+
+/** Solid colours only: Gmail strips gradient backgrounds. `bodyHtml` (API sends) is used as given. */
+export function buildEmailHtml(p: { orgName: string; bodyMarkdown?: string; bodyHtml?: string; unsubscribeUrl?: string }): string {
   const org = escapeHtml(p.orgName);
   const footer = p.unsubscribeUrl
     ? `You're receiving this because you're a member of ${org} on Superatom.<br><a href="${escapeHtml(p.unsubscribeUrl)}" style="color: #6b7280;">Unsubscribe from announcements</a>`
@@ -235,7 +243,7 @@ export function buildEmailHtml(p: { orgName: string; bodyMarkdown: string; unsub
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #f3f4f6; padding: 24px 0;"><tr><td align="center">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px;">
 <tr><td style="padding: 20px 28px; border-bottom: 1px solid #e5e7eb; font-size: 15px; font-weight: 700; color: #111827;">${org}</td></tr>
-<tr><td style="padding: 20px 28px;">${renderMarkdown(p.bodyMarkdown)}</td></tr>
+<tr><td style="padding: 20px 28px;">${p.bodyHtml !== undefined ? htmlFragment(p.bodyHtml) : renderMarkdown(p.bodyMarkdown ?? "")}</td></tr>
 <tr><td style="padding: 16px 28px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #6b7280; line-height: 1.5;">${footer}</td></tr>
 </table></td></tr></table></body></html>`;
 }
@@ -250,13 +258,29 @@ export function unsubscribeUrl(env: Env, token: string): string {
 /** Cron entry: due scheduled campaigns plus "sending" ones whose worker died. */
 export async function processDueCampaigns(env: Env, db: Database): Promise<void> {
   const now = new Date();
+  const stale = new Date(now.getTime() - STALE_MS);
+  // An API send keeps no content to resume from, so one cut off mid-request is closed out instead.
+  const cutOff = await db
+    .update(emailCampaigns)
+    .set({ status: "failed", error: "Interrupted while sending; delivery unknown", updatedAt: now })
+    .where(and(eq(emailCampaigns.source, "api"), eq(emailCampaigns.status, "sending"), lt(emailCampaigns.updatedAt, stale)))
+    .returning({ id: emailCampaigns.id });
+  if (cutOff.length) {
+    await db
+      .update(emailSends)
+      .set({ status: "failed", error: "Interrupted; delivery unknown" })
+      .where(and(inArray(emailSends.campaignId, cutOff.map((r) => r.id)), eq(emailSends.status, "pending")));
+  }
   const due = await db
     .select({ id: emailCampaigns.id })
     .from(emailCampaigns)
     .where(
-      or(
-        and(eq(emailCampaigns.status, "scheduled"), lte(emailCampaigns.scheduledAt, now)),
-        and(eq(emailCampaigns.status, "sending"), lt(emailCampaigns.updatedAt, new Date(now.getTime() - STALE_MS)))
+      and(
+        eq(emailCampaigns.source, "ui"),
+        or(
+          and(eq(emailCampaigns.status, "scheduled"), lte(emailCampaigns.scheduledAt, now)),
+          and(eq(emailCampaigns.status, "sending"), lt(emailCampaigns.updatedAt, stale))
+        )
       )
     )
     .limit(10);
@@ -307,6 +331,7 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
     .where(
       and(
         eq(emailCampaigns.id, campaignId),
+        eq(emailCampaigns.source, "ui"),
         or(
           and(eq(emailCampaigns.status, "scheduled"), lte(emailCampaigns.scheduledAt, now)),
           and(eq(emailCampaigns.status, "sending"), lt(emailCampaigns.updatedAt, new Date(now.getTime() - STALE_MS)))

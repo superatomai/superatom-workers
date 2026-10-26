@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import { emailAttachments, emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
+import { emailApiKeys, emailAttachments, emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
@@ -22,6 +22,7 @@ import {
   type Audience,
 } from "../lib/email-campaigns";
 import { isRecurring, nextRun, parseSchedule, type EmailSchedule } from "../lib/email-schedule";
+import { generateEmailApiKey, hashEmailApiKey } from "../lib/email-api-keys";
 
 /**
  * Org announcements: an org admin writes an email and sends it, now or later,
@@ -37,6 +38,7 @@ const MAX_ATTACHMENTS = 10;
 // Total per email: bigger mails get bounced or spam-filtered (Resend's own cap is 40 MB).
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const UPLOAD_URL_TTL_SECONDS = 15 * 60;
+const MAX_API_KEYS = 20;
 // Documents, spreadsheets, slides, images and archives; never executables or scripts.
 const ATTACHMENT_EXTENSIONS = [
   "pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp",
@@ -196,6 +198,67 @@ emails.put("/subscribers/:userId", async (c) => {
   return c.json({ userId, subscribed });
 });
 
+// ─── API keys ────────────────────────────────────────────
+// Before "/:id" so these paths aren't read as email ids.
+
+/** GET /orgs/:orgId/emails/api-keys — keys for POST /emails/messages, newest first (never the key itself). */
+emails.get("/api-keys", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const rows = await c
+    .get("db")
+    .select({
+      id: emailApiKeys.id,
+      name: emailApiKeys.name,
+      keyPrefix: emailApiKeys.keyPrefix,
+      createdByName: users.name,
+      createdAt: emailApiKeys.createdAt,
+      lastUsedAt: emailApiKeys.lastUsedAt,
+      revokedAt: emailApiKeys.revokedAt,
+    })
+    .from(emailApiKeys)
+    .leftJoin(users, eq(users.id, emailApiKeys.createdBy))
+    .where(eq(emailApiKeys.orgId, orgId))
+    .orderBy(desc(emailApiKeys.createdAt));
+  return c.json(rows);
+});
+
+/** POST /orgs/:orgId/emails/api-keys { name } — the full key is in this response only. */
+emails.post("/api-keys", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const { name } = await c.req.json<{ name?: unknown }>().catch(() => ({}) as { name?: unknown });
+  if (typeof name !== "string" || !name.trim()) return c.json({ error: "name is required" }, 400);
+  if (name.length > 100) return c.json({ error: "name is too long (max 100)" }, 400);
+  // The key acts for its creator, so only an admin of this org (not a super admin passing through) can make one.
+  if (c.get("orgId") !== orgId || c.get("userRole") !== "org_admin") {
+    return c.json({ error: "Only an admin of this organization can create its keys" }, 403);
+  }
+  const db = c.get("db");
+  const [{ n }] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(emailApiKeys)
+    .where(and(eq(emailApiKeys.orgId, orgId), isNull(emailApiKeys.revokedAt)));
+  if (n >= MAX_API_KEYS) return c.json({ error: `At most ${MAX_API_KEYS} active keys; revoke one first` }, 400);
+  const { key, keyPrefix } = generateEmailApiKey();
+  const [row] = await db
+    .insert(emailApiKeys)
+    .values({ orgId, name: name.trim(), keyPrefix, keyHash: await hashEmailApiKey(key), createdBy: c.get("userId") })
+    .returning({ id: emailApiKeys.id, name: emailApiKeys.name, keyPrefix: emailApiKeys.keyPrefix, createdAt: emailApiKeys.createdAt });
+  return c.json({ ...row, key }, 201);
+});
+
+/** DELETE /orgs/:orgId/emails/api-keys/:keyId — revoke; works immediately. */
+emails.delete("/api-keys/:keyId", async (c) => {
+  const keyId = c.req.param("keyId");
+  if (!UUID.test(keyId)) return c.json({ error: "Key not found" }, 404);
+  const [row] = await c
+    .get("db")
+    .update(emailApiKeys)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(emailApiKeys.id, keyId), eq(emailApiKeys.orgId, c.req.param("orgId")!), isNull(emailApiKeys.revokedAt)))
+    .returning({ id: emailApiKeys.id });
+  return row ? c.json({ message: "Revoked" }) : c.json({ error: "Key not found" }, 404);
+});
+
 /** POST /orgs/:orgId/emails/recipients — preview who an audience reaches, before saving. */
 emails.post("/recipients", async (c) => {
   const orgId = c.req.param("orgId")!;
@@ -275,6 +338,7 @@ emails.post("/:id/test", async (c) => {
   const orgId = c.req.param("orgId")!;
   const campaign = await loadCampaign(c, orgId, c.req.param("id"));
   if (!campaign) return c.json({ error: "Email not found" }, 404);
+  if (campaign.source === "api") return c.json({ error: "An API send keeps no content to test" }, 409);
   const db = c.get("db");
   const [me] = await db.select({ email: users.email }).from(users).where(eq(users.id, c.get("userId")));
   if (!me) return c.json({ error: "Your account has no email address" }, 400);
@@ -517,6 +581,7 @@ emails.get("/:id/sends", async (c) => {
     .select({
       email: emailSends.email,
       name: users.name,
+      subject: emailSends.subject,
       status: emailSends.status,
       error: emailSends.error,
       sentAt: emailSends.sentAt,

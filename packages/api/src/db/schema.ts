@@ -1207,11 +1207,17 @@ export const emailCampaigns = pgTable(
     // Why the campaign failed as a whole (e.g. daily limit), not per-recipient errors.
     error: text("error"),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    // ui = written on the Emails page; api = one POST /emails/messages call (per-person content, not stored).
+    source: varchar("source", { length: 16 }).notNull().default("ui"),
+    apiKeyId: uuid("api_key_id").references((): AnyPgColumn => emailApiKeys.id, { onDelete: "set null" }),
+    // The caller's Idempotency-Key; a repeat returns the first call's results.
+    idempotencyKey: varchar("idempotency_key", { length: 255 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     index("email_campaigns_org_idx").on(table.orgId, table.createdAt),
+    uniqueIndex("email_campaigns_api_idempotency_idx").on(table.apiKeyId, table.idempotencyKey),
     index("email_campaigns_parent_idx").on(table.parentId, table.createdAt),
     // The cron's "what's due" scan.
     index("email_campaigns_due_idx").on(table.status, table.scheduledAt),
@@ -1231,6 +1237,8 @@ export const emailSends = pgTable(
       .references(() => emailCampaigns.id, { onDelete: "cascade" }),
     userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
     email: varchar("email", { length: 255 }).notNull(),
+    // Set for API sends, where each person gets their own subject.
+    subject: varchar("subject", { length: 255 }),
     // skipped = unsubscribed or inactive at send time
     status: varchar("status", { length: 16 }).notNull().default("pending"),
     resendId: varchar("resend_id", { length: 64 }),
@@ -1268,6 +1276,30 @@ export const emailAttachments = pgTable(
   (table) => [
     index("email_attachments_campaign_idx").on(table.campaignId),
     check("email_attachments_status_check", sql`${table.status} in ('pending', 'ready')`),
+  ]
+);
+
+/** Org-scoped keys for scripts sending through POST /orgs/:orgId/emails/messages. Only the hash is kept. */
+export const emailApiKeys = pgTable(
+  "email_api_keys",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 100 }).notNull(),
+    // First characters of the key, shown so admins can tell keys apart.
+    keyPrefix: varchar("key_prefix", { length: 20 }).notNull(),
+    keyHash: varchar("key_hash", { length: 64 }).notNull(),
+    // The key acts for its creator; it stops working when they're no longer an active admin.
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("email_api_keys_hash_idx").on(table.keyHash),
+    index("email_api_keys_org_idx").on(table.orgId, table.createdAt),
   ]
 );
 

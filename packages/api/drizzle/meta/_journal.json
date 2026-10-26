@@ -204,6 +204,13 @@
       "when": 1793017830711,
       "tag": "0028_email_attachments",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1793025291925,
+      "tag": "0029_email_api_keys",
+      "breakpoints": true
     }
   ]
 }

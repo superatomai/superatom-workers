@@ -31,6 +31,7 @@ import graphRoutes from "./routes/graph";
 import releaseRoutes from "./routes/releases";
 import checklistReportsRoutes from "./routes/checklist-reports";
 import emailsRoutes from "./routes/emails";
+import emailMessagesRoutes from "./routes/email-messages";
 import emailUnsubscribeRoutes from "./routes/email-unsubscribe";
 import { processDueCampaigns } from "./lib/email-campaigns";
 
@@ -136,6 +137,7 @@ app.route("/auth", bootstrapRoutes);
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);
 app.route("/orgs/:orgId/projects", projectsRoutes);
+app.route("/orgs/:orgId/emails/messages", emailMessagesRoutes); // email API key, so before emailsRoutes' login middleware
 app.route("/orgs/:orgId/emails", emailsRoutes); // org announcements (org admins)
 app.route("/email", emailUnsubscribeRoutes); // public unsubscribe links
 // More specific prefix first — Hono matches in registration order.
