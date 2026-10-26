@@ -19,6 +19,7 @@ import {
   verifyDownload,
 } from "./lib";
 import { isUniqueViolation } from "../superadmin/lib/validate";
+import { parseChecklistReportBody, storeChecklistReport } from "../lib/checklist-reports";
 import engine from "./engine";
 import { mountRegistry } from "./registry";
 
@@ -379,6 +380,40 @@ install.post("/api/installed", async (c) => {
       set: values,
     });
   return c.text("ok");
+});
+
+/**
+ * POST /api/checklist-reports {projectId, installName, checklistId, scope,
+ * status, ranBy, startedAt, finishedAt, report, ...} + Bearer <project API
+ * key> — a deploy checklist run (e.g. stage-1-engine-install) reported from
+ * the VM. Project-scoped; a checklist with no project to be scoped to (a
+ * future dev->prod merge gate) goes through POST /checklist-reports on the
+ * main app instead, authenticated with the service token.
+ */
+install.post("/api/checklist-reports", async (c) => {
+  if (await limited(c.env, `checklist-reports:${clientIp(c)}`)) {
+    return c.text("Too many attempts. Wait a minute and retry.", 429);
+  }
+  const body = await c.req.json().catch(() => null);
+  const projectId = typeof body?.projectId === "string" ? body.projectId : "";
+  const key = await projectFromKey(c, projectId);
+  if (!key) return c.text("Invalid API key for this project", 401);
+
+  const parsed = parseChecklistReportBody(body);
+  if (!parsed) return c.text("Invalid checklist report body", 400);
+
+  const [project] = await c.var.db
+    .select({ orgId: projects.orgId })
+    .from(projects)
+    .where(eq(projects.id, projectId))
+    .limit(1);
+
+  const { id } = await storeChecklistReport(c.var.db, c.env, {
+    ...parsed,
+    projectId,
+    orgId: project?.orgId ?? null,
+  });
+  return c.json({ success: true, id });
 });
 
 /** GET /api/code/<signed link> — the code tarball at the signed commit, streamed from GitHub. */

@@ -46,6 +46,9 @@ export type Env = {
   FRONTEND_BUILDS: R2Bucket;
   // Docker Engine/compose mirrors and per-release deploy bundles.
   INSTALL_ARTIFACTS: R2Bucket;
+  // Full report JSON for checklist runs (deploy checklists, later a
+  // dev->prod merge-gate checklist). checklist_runs (Postgres) indexes these.
+  CHECKLIST_REPORTS: R2Bucket;
   // Hostname that serves the super-admin console (UI + /api/*) instead of sa-api.
   SUPERADMIN_HOST: string;
   // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).

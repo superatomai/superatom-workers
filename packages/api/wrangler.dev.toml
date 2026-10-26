@@ -37,6 +37,13 @@ id = "9c9a0b9db2e346b98150dc0f2f9a27df"
 binding = "FRONTEND_BUILDS"
 bucket_name = "sa-frontend-builds-dev"
 
+# Checklist run reports — isolated from prod, so dev test runs don't mix into
+# the report history analytics.superatom.ai reads for real clients.
+# Create with: wrangler r2 bucket create sa-checklist-reports-dev --config wrangler.dev.toml
+[[r2_buckets]]
+binding = "CHECKLIST_REPORTS"
+bucket_name = "sa-checklist-reports-dev"
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"

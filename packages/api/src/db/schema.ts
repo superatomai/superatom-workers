@@ -221,6 +221,50 @@ export const projectInstallsRelations = relations(projectInstalls, ({ one }) => 
   project: one(projects, { fields: [projectInstalls.projectId], references: [projects.id] }),
 }));
 
+export const checklistRunStatusEnum = pgEnum("checklist_run_status", ["pass", "fail", "partial"]);
+export const checklistRanByEnum = pgEnum("checklist_ran_by", ["agent", "human"]);
+
+/**
+ * One row per checklist run, indexing a report stored in R2 (full JSON body,
+ * including per-item results — too large/variable-shaped for a query table).
+ * `checklistId` + `scope` cover both today's project-scoped deploy checklists
+ * (scope: {orgSlug, projectId}) and a future repo-scoped one, e.g. a
+ * dev->prod merge gate (scope: {repo, commit}) — no schema change needed to
+ * add that later. orgId/projectId are nullable for exactly that reason.
+ */
+export const checklistRuns = pgTable(
+  "checklist_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    checklistId: varchar("checklist_id", { length: 100 }).notNull(),
+    scope: jsonb("scope").notNull(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "set null" }),
+    projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
+    status: checklistRunStatusEnum("status").notNull(),
+    ranBy: checklistRanByEnum("ran_by").notNull(),
+    summary: text("summary"),
+    findingsCount: integer("findings_count").notNull().default(0),
+    failedCount: integer("failed_count").notNull().default(0),
+    // Git sha/tag or release version this run is against, when known.
+    version: varchar("version", { length: 255 }),
+    // Key of the full report JSON in the CHECKLIST_REPORTS bucket.
+    r2Key: varchar("r2_key", { length: 512 }).notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("checklist_runs_checklist_idx").on(table.checklistId, table.createdAt),
+    index("checklist_runs_project_idx").on(table.projectId, table.createdAt),
+    index("checklist_runs_org_idx").on(table.orgId, table.createdAt),
+  ]
+);
+
+export const checklistRunsRelations = relations(checklistRuns, ({ one }) => ({
+  project: one(projects, { fields: [checklistRuns.projectId], references: [projects.id] }),
+  organization: one(organizations, { fields: [checklistRuns.orgId], references: [organizations.id] }),
+}));
+
 export const projectsRelations = relations(projects, ({ one, many }) => ({
   organization: one(organizations, {
     fields: [projects.orgId],

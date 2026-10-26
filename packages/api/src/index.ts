@@ -29,6 +29,7 @@ import feedbackRoutes from "./routes/product-feedback";
 import sdkAuthRoutes from "./routes/sdk-auth";
 import graphRoutes from "./routes/graph";
 import releaseRoutes from "./routes/releases";
+import checklistReportsRoutes from "./routes/checklist-reports";
 
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -145,6 +146,7 @@ app.route("/", appsRoutes); // handles /projects/:projectId/apps and /apps/:appI
 app.route("/answer-feedback", answerFeedbackRoutes); // feedback 1: server-to-server (service token auth)
 app.route("/feedback", feedbackRoutes); // feedback 2: product feedback (public + superadmin list)
 app.route("/", analyticsRoutes); // handles /analytics/chat
+app.route("/", checklistReportsRoutes); // handles /checklist-reports
 app.route("/speech", speechRoutes);
 
 // ─── 404 fallback ────────────────────────────────────────

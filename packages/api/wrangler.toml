@@ -39,6 +39,14 @@ bucket_name = "sa-frontend-builds"
 binding = "INSTALL_ARTIFACTS"
 bucket_name = "superatom-install"
 
+# Private bucket for checklist run reports (deploy checklists today; future
+# dev->prod merge-gate checklists later). checklist_runs (Postgres) is the
+# queryable index; this bucket holds each run's full report JSON.
+# Create with: wrangler r2 bucket create sa-checklist-reports
+[[r2_buckets]]
+binding = "CHECKLIST_REPORTS"
+bucket_name = "sa-checklist-reports"
+
 [[kv_namespaces]]
 binding = "JWT_SECRETS"
 id = "1669d6442bf34757a223bd7d6548d14c"
