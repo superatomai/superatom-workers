@@ -44,6 +44,10 @@ bucket_name = "sa-frontend-builds-dev"
 binding = "CHECKLIST_REPORTS"
 bucket_name = "sa-checklist-reports-dev"
 
+# Sends scheduled announcement emails and resumes stalled ones (src/lib/email-campaigns.ts).
+[triggers]
+crons = ["*/5 * * * *"]
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
@@ -62,6 +66,8 @@ INSTALL_WS_URL = "wss://sa-websocket-dev.ashish-91e.workers.dev/websocket"
 INSTALL_PLATFORM_UI_URL = "https://dev.platform.superatom.ai"
 INSTALL_USER_UI_URL = "https://dev.live.superatom.ai"
 INSTALL_LLM_PROXY_MODE = "dummy"
+# Sender of org announcement emails; must be on a domain verified in Resend.
+EMAIL_FROM = "alerts@superatom.ai"
 
 # sa-websocket-dev's per-project DO, told about composition graph releases. Deploy sa-websocket-dev first.
 [[durable_objects.bindings]]
@@ -102,6 +108,7 @@ simple = { limit = 20, period = 60 }
 #   pnpm wrangler secret put GITHUB_CODE_TOKEN --config wrangler.dev.toml        # same read-only PAT as prod is fine
 #   pnpm wrangler secret put INSTALL_DOWNLOAD_SECRET --config wrangler.dev.toml  # fresh random value
 #   pnpm wrangler secret put RESEND_API_KEY --config wrangler.dev.toml           # optional on dev
+#   pnpm wrangler secret put EMAIL_UNSUBSCRIBE_SECRET --config wrangler.dev.toml # fresh random value
 #
 # DATABASE_URL: Dev Neon PostgreSQL connection string
 # JWT_SECRET: A fresh random secret (different from prod). Signs only SSO/SAML

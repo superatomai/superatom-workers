@@ -1179,3 +1179,79 @@ export const files = pgTable(
     check("files_status_check", sql`${table.status} in ('pending', 'ready', 'deleted', 'expired')`),
   ]
 );
+
+// ─── Emails (announcements to users) ─────────────────────
+
+export const emailCampaigns = pgTable(
+  "email_campaigns",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    // Null = platform-wide (superadmin, every org).
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "cascade" }),
+    // { type: "all" | "admins" | "members" | "project" | "users", projectId?, userIds? }
+    audience: jsonb("audience").notNull(),
+    // Unsubscribe category, e.g. "announcements" or "usage".
+    category: varchar("category", { length: 32 }).notNull().default("announcements"),
+    subject: varchar("subject", { length: 255 }).notNull(),
+    bodyMarkdown: text("body_markdown").notNull(),
+    status: varchar("status", { length: 16 }).notNull().default("draft"),
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    recipientCount: integer("recipient_count").notNull().default(0),
+    sentCount: integer("sent_count").notNull().default(0),
+    failedCount: integer("failed_count").notNull().default(0),
+    // Why the campaign failed as a whole (e.g. daily limit), not per-recipient errors.
+    error: text("error"),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("email_campaigns_org_idx").on(table.orgId, table.createdAt),
+    // The cron's "what's due" scan.
+    index("email_campaigns_due_idx").on(table.status, table.scheduledAt),
+    check(
+      "email_campaigns_status_check",
+      sql`${table.status} in ('draft', 'scheduled', 'sending', 'sent', 'cancelled', 'failed')`
+    ),
+  ]
+);
+
+export const emailSends = pgTable(
+  "email_sends",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => emailCampaigns.id, { onDelete: "cascade" }),
+    userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
+    email: varchar("email", { length: 255 }).notNull(),
+    // skipped = unsubscribed or inactive at send time
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    resendId: varchar("resend_id", { length: 64 }),
+    error: text("error"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    // A retried send never mails the same address twice for one campaign.
+    uniqueIndex("email_sends_campaign_email_idx").on(table.campaignId, table.email),
+    index("email_sends_campaign_status_idx").on(table.campaignId, table.status),
+    check(
+      "email_sends_status_check",
+      sql`${table.status} in ('pending', 'sent', 'failed', 'skipped')`
+    ),
+  ]
+);
+
+export const emailUnsubscribes = pgTable(
+  "email_unsubscribes",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    category: varchar("category", { length: 32 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.category] })]
+);
