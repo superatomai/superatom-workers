@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { concepts, graphChanges, graphDomainTerms, graphEdges, graphNodes, users } from "../../db/schema";
+import { concepts, graphChangeHeads, graphChanges, graphDomainTerms, graphEdges, graphNodes, users } from "../../db/schema";
 import type { Q } from "../../db/tx";
 import { HttpError, isUniqueViolation } from "./errors";
 import { analyseGraph, MAX_DEPTH } from "./dag";
@@ -100,6 +100,7 @@ export function conceptFieldsOf(c: ConceptRow): ConceptFields {
     description: c.description,
     sourceId: c.sourceId,
     originRef: c.originRef,
+    active: c.active,
   };
 }
 
@@ -201,6 +202,20 @@ export const nodeContent = (p: NodeProposal) => ({
   terms: [...p.terms].sort((a, b) => a.term.localeCompare(b.term)),
 });
 
+/**
+ * Take the next `count` change numbers for the project and return the first.
+ * The head row stays locked until the transaction ends, so a later edit waits
+ * for this one to commit (numbers in commit order) and a rollback gives them back.
+ */
+export async function takeChangeSeqs(q: Q, s: Scope, count: number): Promise<number> {
+  const [head] = await q
+    .insert(graphChangeHeads)
+    .values({ projectId: s.projectId, orgId: s.orgId, seq: count })
+    .onConflictDoUpdate({ target: graphChangeHeads.projectId, set: { seq: sql`${graphChangeHeads.seq} + ${count}` } })
+    .returning({ seq: graphChangeHeads.seq });
+  return Number(head.seq) - count + 1;
+}
+
 /** Append one row to graph_changes. An update that changes nothing is not recorded. */
 export async function logChange(
   q: Q,
@@ -210,6 +225,7 @@ export async function logChange(
 ): Promise<void> {
   if (c.action === "update" && canonicalJson(c.before) === canonicalJson(c.after)) return;
   await q.insert(graphChanges).values({
+    seq: await takeChangeSeqs(q, s, 1),
     orgId: s.orgId,
     projectId: s.projectId,
     entity: c.entity,

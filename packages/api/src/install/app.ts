@@ -1,7 +1,7 @@
 import { Hono } from "hono";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { createDb, type Database } from "../db";
-import { apiKeys, installTokens, organizations, projects } from "../db/schema";
+import { apiKeys, installTokens, organizations, projectInstalls, projectReleases, projects } from "../db/schema";
 import type { Env } from "../types";
 // Same generator/hash the websocket worker validates against — one key format.
 import { generateApiKey, getKeyPrefix, hashApiKey } from "../../../websocket/src/api-keys/service";
@@ -13,10 +13,15 @@ import {
   issueProxyKey,
   latestCommit,
   sha256Hex,
+  signBundle,
   signDownload,
+  verifyBundle,
   verifyDownload,
 } from "./lib";
 import { isUniqueViolation } from "../superadmin/lib/validate";
+import { parseChecklistReportBody, storeChecklistReport } from "../lib/checklist-reports";
+import engine from "./engine";
+import { mountRegistry } from "./registry";
 
 /**
  * install.superatom.ai — what `curl -fsSL https://install.superatom.ai | sh` talks to.
@@ -30,8 +35,15 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 install.use("*", async (c, next) => {
   c.set("db", createDb(c.env.DATABASE_URL));
   await next();
-  c.header("Cache-Control", "no-store");
+  // Engine artifacts are immutable and set their own; everything else is per-install.
+  if (!c.res.headers.get("Cache-Control")) c.header("Cache-Control", "no-store");
 });
+
+// Docker Engine + compose, for VMs that cannot reach download.docker.com.
+install.route("/api/engine", engine);
+
+// OCI pulls, authenticated per project (src/install/registry.ts).
+mountRegistry(install);
 
 async function limited(env: Env, key: string): Promise<boolean> {
   const { success } = await env.INSTALL_RATE_LIMITER.limit({ key });
@@ -79,6 +91,7 @@ async function usableToken(db: Database, rawToken: unknown) {
       redeemedAt: installTokens.redeemedAt,
       revokedAt: installTokens.revokedAt,
       projectId: projects.id,
+      pinnedVersion: projects.pinnedVersion,
       orgId: organizations.id,
       orgSlug: organizations.slug,
     })
@@ -108,6 +121,112 @@ async function usableToken(db: Database, rawToken: unknown) {
 }
 
 /**
+ * The release a project should run: its pinned version, else the newest published.
+ * Throws when nothing is published, so a token is never spent on a project that
+ * has no image to install.
+ */
+/**
+ * The release an install should be running: a super-admin pin wins, then the version
+ * an admin approved for that install, then the newest. A VM never silently follows
+ * "newest" once a target exists, so publishing a release does not deploy it.
+ *
+ * Null means this project has no releases at all — a normal state while a client is
+ * being onboarded. Callers fall back to the source-tarball contract rather than
+ * failing, so deploying this code cannot break an install that predates releases.
+ * A pin or target naming a version that is NOT published is a misconfiguration, and
+ * still 409s: silently serving a different version would be worse.
+ */
+async function currentRelease(
+  db: Database, projectId: string, pinned: string | null, target?: string | null,
+) {
+  const want = pinned ?? target ?? null;
+  const [release] = await db
+    .select()
+    .from(projectReleases)
+    .where(
+      want
+        ? and(eq(projectReleases.projectId, projectId), eq(projectReleases.version, want))
+        : eq(projectReleases.projectId, projectId)
+    )
+    .orderBy(desc(projectReleases.publishedAt))
+    .limit(1);
+  if (!release && want) {
+    throw new InstallError(
+      409,
+      pinned
+        ? `This project is pinned to version "${pinned}", which is not published. Pick another version in the super-admin console.`
+        : `Version "${target}" is no longer published for this project. Choose another version to update to.`
+    );
+  }
+  return release ?? null;
+}
+
+/** The project behind a `Bearer sa_live_…` key, or null. Used by the VM's own endpoints. */
+async function projectFromKey(
+  c: any, projectId: string,
+): Promise<{ pinnedVersion: string | null } | null> {
+  const auth = c.req.header("Authorization") ?? "";
+  const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!apiKey.startsWith("sa_live_") || !UUID.test(projectId)) return null;
+  // api_keys.project_id is varchar, projects.id is uuid — hence the cast.
+  const [key] = await c.var.db
+    .select({ pinnedVersion: projects.pinnedVersion })
+    .from(apiKeys)
+    .innerJoin(projects, and(eq(projects.id, projectId), eq(apiKeys.projectId, sql`${projects.id}::text`)))
+    .where(and(
+      eq(apiKeys.projectId, projectId),
+      eq(apiKeys.keyHash, await hashApiKey(apiKey)),
+      eq(apiKeys.isActive, true),
+    ))
+    .limit(1);
+  return key ?? null;
+}
+
+/** Records that this install is alive, and what it says it is running. */
+async function touchInstall(
+  db: Database, projectId: string, installName: string, current: string | null,
+): Promise<void> {
+  const seen = { lastSeenAt: new Date(), updatedAt: new Date() };
+  const values = current ? { ...seen, releaseVersion: current } : seen;
+  await db
+    .insert(projectInstalls)
+    .values({ projectId, installName, ...values })
+    .onConflictDoUpdate({
+      target: [projectInstalls.projectId, projectInstalls.installName],
+      set: values,
+    });
+}
+
+/** The install row for this VM, if it has reported itself before. */
+async function installRow(db: Database, projectId: string, installName: string) {
+  const [row] = await db
+    .select()
+    .from(projectInstalls)
+    .where(and(eq(projectInstalls.projectId, projectId), eq(projectInstalls.installName, installName)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** What a VM needs to pull and run a release. The registry is this worker's /v2. */
+async function releaseLines(c: any, release: any) {
+  const host = c.env.INSTALL_REGISTRY_HOST ?? new URL(c.req.url).host;
+  // "<repo>:<tag>" — the repo is a project id, or "base" for a shared baseline.
+  const repo = String(release.image).split(":")[0];
+  const bundleKey = `bundles/${repo}/${release.version}/bundle.tar.gz`;
+  return {
+    RELEASE_VERSION: release.version,
+    IMAGE: `${host}/${release.image}`,
+    IMAGE_DIGEST: release.imageDigest,
+    REGISTRY_HOST: host,
+    BUNDLE_URL: `${new URL(c.req.url).origin}/api/bundle/${await signBundle(c.env, bundleKey)}`,
+    BUNDLE_SHA256: release.bundleSha256,
+    ENGINE_VERSION: release.engineVersion ?? undefined,
+    COMPOSE_VERSION: release.composeVersion ?? undefined,
+    CODE_COMMIT: release.commit.slice(0, 12),
+  };
+}
+
+/**
  * POST /api/token-info {token} — checks a token without using it, so the installer can
  * prepare the install folder before spending the one-time token.
  */
@@ -115,6 +234,9 @@ install.post("/api/token-info", async (c) => {
   if (await limited(c.env, `token-info:${clientIp(c)}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
   const body = await c.req.json<{ token?: unknown }>().catch(() => null);
   const row = await usableToken(c.var.db, body?.token);
+  // Checked here as well, so a bad pin costs no token. No release at all is fine:
+  // the install falls back to the source tarball.
+  await currentRelease(c.var.db, row.projectId, row.pinnedVersion);
   return c.text(envLines({ INSTALL_NAME: row.installName }));
 });
 
@@ -139,6 +261,8 @@ install.post("/api/redeem", async (c) => {
     .where(and(eq(installTokens.projectId, row.projectId), eq(installTokens.llmClientId, row.installName)))
     .limit(1);
 
+  // Before any mutation: a project with nothing published must not consume the token.
+  const release = await currentRelease(db, row.projectId, row.pinnedVersion);
   const sha = await latestCommit(c.env);
   const { proxyKey, created } = await issueProxyKey(c.env, row.installName, row.llmBudgetCents, !!ownClient);
   if (created) {
@@ -170,8 +294,9 @@ install.post("/api/redeem", async (c) => {
   return c.text(
     envLines({
       INSTALL_NAME: row.installName,
+      ...(release ? await releaseLines(c, release) : { CODE_COMMIT: sha.slice(0, 12) }),
+      // Transitional: an installer older than releases downloads source and builds.
       CODE_URL: await codeUrl(c, sha, row.projectId),
-      CODE_COMMIT: sha.slice(0, 12),
       SUPERATOM_API_KEY: apiKey,
       SUPERATOM_PROJECT_ID: row.projectId,
       SA_API_URL: c.env.INSTALL_SA_API_URL,
@@ -187,26 +312,108 @@ install.post("/api/redeem", async (c) => {
   );
 });
 
-/** POST /api/update {projectId} + Bearer <project API key> — latest code for an existing install. */
+/**
+ * POST /api/update {projectId, installName?} + Bearer <project API key> — the release
+ * this install should be running. With an installName we answer with its approved
+ * target; without one (an install made before targets existed) we answer as before.
+ */
 install.post("/api/update", async (c) => {
   const ip = clientIp(c);
   if (await limited(c.env, `update:${ip}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
 
-  const auth = c.req.header("Authorization") ?? "";
-  const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  const body = await c.req.json<{ projectId?: unknown }>().catch(() => null);
+  const body = await c.req
+    .json<{ projectId?: unknown; installName?: unknown; currentVersion?: unknown }>()
+    .catch(() => null);
   const projectId = typeof body?.projectId === "string" ? body.projectId : "";
-  if (!apiKey.startsWith("sa_live_") || !UUID.test(projectId)) return c.text("Invalid API key for this project", 401);
-
-  const [key] = await c.var.db
-    .select({ id: apiKeys.id })
-    .from(apiKeys)
-    .where(and(eq(apiKeys.projectId, projectId), eq(apiKeys.keyHash, await hashApiKey(apiKey)), eq(apiKeys.isActive, true)))
-    .limit(1);
+  const installName = typeof body?.installName === "string" ? body.installName.trim().slice(0, 255) : "";
+  const current = typeof body?.currentVersion === "string" ? body.currentVersion.slice(0, 255) : "";
+  const key = await projectFromKey(c, projectId);
   if (!key) return c.text("Invalid API key for this project", 401);
 
+  const row = installName ? await installRow(c.var.db, projectId, installName) : null;
+  // The updater's poll doubles as the heartbeat, so a quiet install still needs
+  // only one request per tick to stay visibly alive.
+  if (installName) await touchInstall(c.var.db, projectId, installName, current || null);
+  const release = await currentRelease(c.var.db, projectId, key.pinnedVersion, row?.targetVersion);
   const sha = await latestCommit(c.env);
-  return c.text(envLines({ CODE_URL: await codeUrl(c, sha, projectId), CODE_COMMIT: sha.slice(0, 12) }));
+  return c.text(
+    envLines({
+      ...(release ? await releaseLines(c, release) : { CODE_COMMIT: sha.slice(0, 12) }),
+      // Transitional, as in redeem.
+      CODE_URL: await codeUrl(c, sha, projectId),
+    })
+  );
+});
+
+/**
+ * POST /api/installed {projectId, installName, releaseVersion, imageDigest?, error?}
+ * + Bearer <project API key> — what this VM is now running. Also the heartbeat, so
+ * the UI can tell "behind" from "we have not heard from it".
+ */
+install.post("/api/installed", async (c) => {
+  if (await limited(c.env, `installed:${clientIp(c)}`)) {
+    return c.text("Too many attempts. Wait a minute and retry.", 429);
+  }
+  const body = await c.req
+    .json<{ projectId?: unknown; installName?: unknown; releaseVersion?: unknown; imageDigest?: unknown; error?: unknown }>()
+    .catch(() => null);
+  const projectId = typeof body?.projectId === "string" ? body.projectId : "";
+  const installName = typeof body?.installName === "string" ? body.installName.trim().slice(0, 255) : "";
+  if (!installName) return c.text("installName is required", 400);
+  if (!(await projectFromKey(c, projectId))) return c.text("Invalid API key for this project", 401);
+
+  const str = (v: unknown, max: number) => (typeof v === "string" && v ? v.slice(0, max) : null);
+  const values = {
+    releaseVersion: str(body?.releaseVersion, 255),
+    imageDigest: str(body?.imageDigest, 71),
+    // Cleared whenever the updater reports without one, so a fixed install stops
+    // showing yesterday's failure.
+    lastError: str(body?.error, 2000),
+    lastSeenAt: new Date(),
+    updatedAt: new Date(),
+  };
+  await c.var.db
+    .insert(projectInstalls)
+    .values({ projectId, installName, ...values })
+    .onConflictDoUpdate({
+      target: [projectInstalls.projectId, projectInstalls.installName],
+      set: values,
+    });
+  return c.text("ok");
+});
+
+/**
+ * POST /api/checklist-reports {projectId, installName, checklistId, scope,
+ * status, ranBy, startedAt, finishedAt, report, ...} + Bearer <project API
+ * key> — a deploy checklist run (e.g. stage-1-engine-install) reported from
+ * the VM. Project-scoped; a checklist with no project to be scoped to (a
+ * future dev->prod merge gate) goes through POST /checklist-reports on the
+ * main app instead, authenticated with the service token.
+ */
+install.post("/api/checklist-reports", async (c) => {
+  if (await limited(c.env, `checklist-reports:${clientIp(c)}`)) {
+    return c.text("Too many attempts. Wait a minute and retry.", 429);
+  }
+  const body = await c.req.json().catch(() => null);
+  const projectId = typeof body?.projectId === "string" ? body.projectId : "";
+  const key = await projectFromKey(c, projectId);
+  if (!key) return c.text("Invalid API key for this project", 401);
+
+  const parsed = parseChecklistReportBody(body);
+  if (!parsed) return c.text("Invalid checklist report body", 400);
+
+  const [project] = await c.var.db
+    .select({ orgId: projects.orgId })
+    .from(projects)
+    .where(eq(projects.id, projectId))
+    .limit(1);
+
+  const { id } = await storeChecklistReport(c.var.db, c.env, {
+    ...parsed,
+    projectId,
+    orgId: project?.orgId ?? null,
+  });
+  return c.json({ success: true, id });
 });
 
 /** GET /api/code/<signed link> — the code tarball at the signed commit, streamed from GitHub. */
@@ -220,6 +427,22 @@ install.get("/api/code/:link", async (c) => {
       "Content-Type": "application/gzip",
       "Content-Disposition": `attachment; filename="superatom-${sha.slice(0, 12)}.tar.gz"`,
       "Cache-Control": "no-store",
+    },
+  });
+});
+
+/** GET /api/bundle/<signed link> — the release's compose file and setup.sh. */
+install.get("/api/bundle/:link", async (c) => {
+  if (await limited(c.env, `bundle:${clientIp(c)}`)) return c.text("Too many attempts. Wait a minute and retry.", 429);
+  const key = await verifyBundle(c.env, c.req.param("link"));
+  if (!key) return c.text("This download link is invalid or has expired. Re-run the installer.", 403);
+  const obj = await c.env.INSTALL_ARTIFACTS?.get(key);
+  if (!obj) return c.text("The deploy bundle for this release is missing. Re-publish it.", 404);
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": "application/gzip",
+      "Content-Length": String(obj.size),
+      "Content-Disposition": 'attachment; filename="bundle.tar.gz"',
     },
   });
 });

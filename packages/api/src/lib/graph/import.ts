@@ -14,6 +14,7 @@ import {
   nodeContent,
   nodeHash,
   proposalOf,
+  takeChangeSeqs,
   type ConceptRow,
   type NodeRow,
   type Scope,
@@ -39,6 +40,8 @@ interface FileConcept {
   requires?: string[];
   returns?: Record<string, unknown>;
   sourceId?: string | null;
+  /** Exported only when off. */
+  active?: boolean;
 }
 interface FileDomain {
   name: string;
@@ -101,7 +104,8 @@ async function inChunks<T, R>(rows: T[], write: (chunk: T[]) => Promise<R[]>): P
   return out;
 }
 
-type ChangeRow = typeof graphChanges.$inferInsert;
+/** A history row before its change number (numbered all at once when written). */
+type ChangeRow = Omit<typeof graphChanges.$inferInsert, "seq">;
 type RequestInsert = typeof graphChangeRequests.$inferInsert;
 
 /** A node to create or update, with its final links and terms. */
@@ -124,6 +128,7 @@ const conceptSet = {
   description: sql`excluded.description`,
   sourceId: sql`excluded.source_id`,
   originRef: sql`excluded.origin_ref`,
+  active: sql`excluded.active`,
   editVersion: sql`${concepts.editVersion} + 1`,
   updatedBy: sql`excluded.updated_by`,
   updatedAt: sql`now()`,
@@ -312,6 +317,8 @@ export async function importGraph(q: Q, s: Scope, raw: unknown, mode: ImportMode
       description: fc.description ?? null,
       sourceId: fc.sourceId ?? null,
       originRef: existing?.originRef ?? null,
+      // Files leave it out when on; a file without it turns the concept on.
+      active: fc.active ?? true,
     });
     if (!existing) {
       conceptCreates.push(fields);
@@ -456,7 +463,9 @@ export async function importGraph(q: Q, s: Scope, raw: unknown, mode: ImportMode
 
   // ── Requests and history, one insert each.
   await inChunks(requests, (chunk) => q.insert(graphChangeRequests).values(chunk).returning({ id: graphChangeRequests.id }));
-  await inChunks(changes, (chunk) => q.insert(graphChanges).values(chunk).returning({ id: graphChanges.id }));
+  const firstSeq = changes.length ? await takeChangeSeqs(q, s, changes.length) : 0;
+  const numbered = changes.map((c, i) => ({ ...c, seq: firstSeq + i }));
+  await inChunks(numbered, (chunk) => q.insert(graphChanges).values(chunk).returning({ id: graphChanges.id }));
 
   return { mode, counts };
 }

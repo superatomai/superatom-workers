@@ -53,8 +53,8 @@ export default {
 			return apiKeyResponse;
 		}
 
-		// Internal only: sa-api calls the DO's /graph-release via its binding; never forward it from outside.
-		if (url.pathname === '/graph-release') {
+		// Internal only: sa-api calls the DO's /graph-release and /graph-changes via its binding; never forward them from outside.
+		if (url.pathname === '/graph-release' || url.pathname === '/graph-changes') {
 			return new Response('Not found', { status: 404 });
 		}
 

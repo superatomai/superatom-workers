@@ -44,6 +44,11 @@ export type Env = {
   SPEECH_CORRECT_TERMS?: string;
   // Built front-end apps, served by hostname: <app>/releases/<buildId>/… + <app>/current.json.
   FRONTEND_BUILDS: R2Bucket;
+  // Docker Engine/compose mirrors and per-release deploy bundles.
+  INSTALL_ARTIFACTS: R2Bucket;
+  // Full report JSON for checklist runs (deploy checklists, later a
+  // dev->prod merge-gate checklist). checklist_runs (Postgres) indexes these.
+  CHECKLIST_REPORTS: R2Bucket;
   // Hostname that serves the super-admin console (UI + /api/*) instead of sa-api.
   SUPERADMIN_HOST: string;
   // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).
@@ -61,6 +66,10 @@ export type Env = {
   INSTALL_DOWNLOAD_SECRET?: string;
   // Values handed to new installs.
   INSTALL_SA_API_URL: string;
+  // Host a VM runs `docker login`/`docker pull` against (this worker serves /v2).
+  INSTALL_REGISTRY_HOST?: string;
+  /** "dev" | "prod" — picks the baseline pointer; dev and prod share the bucket. */
+  INSTALL_ENV?: string;
   // Client UI links for the install summary; "{slug}" is replaced with the org slug.
   INSTALL_PLATFORM_UI_URL: string;
   INSTALL_USER_UI_URL: string;

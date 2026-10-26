@@ -132,6 +132,14 @@ export const projects = pgTable(
     icon: text("icon"),
     designSystem: jsonb("design_system"),
     config: jsonb("config"),
+    // Which superatom-setup-code branch the publish script builds for this project.
+    // A build input, not a delivery one: the VM pulls an image, never a git ref.
+    codeBranch: varchar("code_branch", { length: 255 }).notNull().default("main"),
+    // Set to roll back; null means the newest row in project_releases.
+    pinnedVersion: varchar("pinned_version", { length: 255 }),
+    // Per program name, the version to run instead of the newest published one —
+    // e.g. { "home": "0.1.0" } rolls home back. A name not listed runs its newest.
+    programPins: jsonb("program_pins").$type<Record<string, string>>().notNull().default({}),
     createdBy: uuid("created_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -140,6 +148,171 @@ export const projects = pgTable(
   },
   (table) => [uniqueIndex("projects_org_slug_idx").on(table.orgId, table.slug)]
 );
+
+/**
+ * One row per published release: the image, the engine it expects and the bundle
+ * that goes with it, pinned together so a rollback cannot mix versions. Written
+ * by the publish script; read by redeem/update to tell a VM what to run.
+ */
+export const projectReleases = pgTable(
+  "project_releases",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    version: varchar("version", { length: 255 }).notNull(),
+    branch: varchar("branch", { length: 255 }).notNull(),
+    commit: varchar("commit", { length: 40 }).notNull(),
+    // Repository and tag; the registry host comes from config, so an image stays
+    // valid if the host ever changes.
+    image: varchar("image", { length: 512 }).notNull(),
+    imageDigest: varchar("image_digest", { length: 71 }).notNull(),
+    bundleSha256: varchar("bundle_sha256", { length: 64 }).notNull(),
+    // Null means "whatever engine/current.json publishes".
+    engineVersion: varchar("engine_version", { length: 32 }),
+    composeVersion: varchar("compose_version", { length: 32 }),
+    // Migration count in this release, so a rollback across a schema change can warn.
+    migrations: integer("migrations"),
+    publishedBy: varchar("published_by", { length: 255 }),
+    // The commit log since the project's previous release, as RELEASE.md shows it.
+    // Stored so the UI can say what changed without fetching the bundle from R2.
+    notes: text("notes"),
+    publishedAt: timestamp("published_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_releases_version_idx").on(table.projectId, table.version),
+    index("project_releases_latest_idx").on(table.projectId, table.publishedAt),
+  ]
+);
+
+export const projectReleasesRelations = relations(projectReleases, ({ one }) => ({
+  project: one(projects, { fields: [projectReleases.projectId], references: [projects.id] }),
+}));
+
+/**
+ * One row per uploaded program build — the catalogue (architecture doc §11).
+ *
+ * A project has many programs, each one job's server side and/or UI, versioned
+ * apart from the engine and from each other. A build is its archive,
+ * programs/<projectId>/<hash>.tar.gz in the install bucket; the hash is the
+ * archive's sha256, so every hop can check what it got.
+ *
+ * An uploaded build is a draft until it is published (published_at set). What a
+ * project runs, per program name: its pin in projects.program_pins, else its
+ * newest published build.
+ */
+export const projectPrograms = pgTable(
+  "project_programs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // The program's name and version, from its program.json.
+    name: varchar("name", { length: 255 }).notNull(),
+    version: varchar("version", { length: 255 }).notNull(),
+    hash: varchar("hash", { length: 64 }).notNull(),
+    // The archive's size, checked with the hash.
+    bytes: integer("bytes").notNull(),
+    // The program repository's commit it was built from.
+    commit: varchar("commit", { length: 40 }).notNull(),
+    builtBy: varchar("built_by", { length: 255 }),
+    uploadedAt: timestamp("uploaded_at", { withTimezone: true }).defaultNow().notNull(),
+    // Null while a draft.
+    publishedBy: varchar("published_by", { length: 255 }),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    notes: text("notes"),
+  },
+  (table) => [
+    uniqueIndex("project_programs_version_idx").on(table.projectId, table.name, table.version),
+    // One row per build: the same archive cannot be registered twice.
+    uniqueIndex("project_programs_hash_idx").on(table.projectId, table.hash),
+    index("project_programs_latest_idx").on(table.projectId, table.name, table.publishedAt),
+  ]
+);
+
+export const projectProgramsRelations = relations(projectPrograms, ({ one }) => ({
+  project: one(projects, { fields: [projectPrograms.projectId], references: [projects.id] }),
+}));
+
+/**
+ * One row per installed copy of a project — a client VM. The VM reports what it is
+ * running and reads targetVersion to know where to converge. Nothing derivable is
+ * stored (behind / in sync / updating), so the row cannot go stale.
+ */
+export const projectInstalls = pgTable(
+  "project_installs",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Matches install_tokens.install_name: one project can run on several VMs.
+    installName: varchar("install_name", { length: 255 }).notNull(),
+    // What the VM last reported running; null until it reports for the first time.
+    releaseVersion: varchar("release_version", { length: 255 }),
+    imageDigest: varchar("image_digest", { length: 71 }),
+    // What an admin approved. The updater only ever moves towards this, so
+    // publishing a release does not deploy it.
+    targetVersion: varchar("target_version", { length: 255 }),
+    targetSetBy: varchar("target_set_by", { length: 255 }),
+    targetSetAt: timestamp("target_set_at", { withTimezone: true }),
+    // The updater's last failure, cleared on its next successful report.
+    lastError: text("last_error"),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.projectId, table.installName] })]
+);
+
+export const projectInstallsRelations = relations(projectInstalls, ({ one }) => ({
+  project: one(projects, { fields: [projectInstalls.projectId], references: [projects.id] }),
+}));
+
+export const checklistRunStatusEnum = pgEnum("checklist_run_status", ["pass", "fail", "partial"]);
+export const checklistRanByEnum = pgEnum("checklist_ran_by", ["agent", "human"]);
+
+/**
+ * One row per checklist run, indexing a report stored in R2 (full JSON body,
+ * including per-item results — too large/variable-shaped for a query table).
+ * `checklistId` + `scope` cover both today's project-scoped deploy checklists
+ * (scope: {orgSlug, projectId}) and a future repo-scoped one, e.g. a
+ * dev->prod merge gate (scope: {repo, commit}) — no schema change needed to
+ * add that later. orgId/projectId are nullable for exactly that reason.
+ */
+export const checklistRuns = pgTable(
+  "checklist_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    checklistId: varchar("checklist_id", { length: 100 }).notNull(),
+    scope: jsonb("scope").notNull(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "set null" }),
+    projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
+    status: checklistRunStatusEnum("status").notNull(),
+    ranBy: checklistRanByEnum("ran_by").notNull(),
+    summary: text("summary"),
+    findingsCount: integer("findings_count").notNull().default(0),
+    failedCount: integer("failed_count").notNull().default(0),
+    // Git sha/tag or release version this run is against, when known.
+    version: varchar("version", { length: 255 }),
+    // Key of the full report JSON in the CHECKLIST_REPORTS bucket.
+    r2Key: varchar("r2_key", { length: 512 }).notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("checklist_runs_checklist_idx").on(table.checklistId, table.createdAt),
+    index("checklist_runs_project_idx").on(table.projectId, table.createdAt),
+    index("checklist_runs_org_idx").on(table.orgId, table.createdAt),
+  ]
+);
+
+export const checklistRunsRelations = relations(checklistRuns, ({ one }) => ({
+  project: one(projects, { fields: [checklistRuns.projectId], references: [projects.id] }),
+  organization: one(organizations, { fields: [checklistRuns.orgId], references: [organizations.id] }),
+}));
 
 export const projectsRelations = relations(projects, ({ one, many }) => ({
   organization: one(organizations, {
@@ -653,6 +826,9 @@ export const concepts = pgTable(
     supersedes: integer("supersedes"),
     // Parity with the engine: rows here are always verified.
     verified: boolean("verified").default(true).notNull(),
+    // Off: answers leave it out (its domain links stay, so turning it back on puts it back).
+    // Versioned like any field. Not the engine's review status, which is a separate thing.
+    active: boolean("active").default(true).notNull(),
     editVersion: integer("edit_version").default(1).notNull(),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
     updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
@@ -788,6 +964,8 @@ export const graphChanges = pgTable(
     projectId: uuid("project_id")
       .notNull()
       .references(() => projects.id, { onDelete: "cascade" }),
+    // 1, 2, 3 … per project with no gaps, in commit order (from graph_change_heads); engines follow it.
+    seq: bigint("seq", { mode: "number" }).notNull(),
     // node | concept
     entity: varchar("entity", { length: 8 }).notNull(),
     // graph_nodes.id or concepts.id per `entity` (not an FK: history outlives the row).
@@ -807,8 +985,23 @@ export const graphChanges = pgTable(
   (table) => [
     index("graph_changes_item_idx").on(table.entity, table.entityId, table.changedAt),
     index("graph_changes_project_idx").on(table.projectId, table.changedAt),
+    uniqueIndex("graph_changes_project_seq_idx").on(table.projectId, table.seq),
   ]
 );
+
+// ─── Graph Change Heads ──────────────────────────────────
+// The last graph_changes.seq per project. Taking the next number locks this row
+// until the edit commits, so numbers are handed out in commit order with no gaps.
+
+export const graphChangeHeads = pgTable("graph_change_heads", {
+  projectId: uuid("project_id")
+    .primaryKey()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  orgId: uuid("org_id")
+    .notNull()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  seq: bigint("seq", { mode: "number" }).notNull(),
+});
 
 // ─── Graph Revisions ─────────────────────────────────────
 // Append-only: an immutable copy of an item each time a release includes a change to it.
@@ -921,6 +1114,8 @@ export const graphEngineState = pgTable(
       onDelete: "set null",
     }),
     appliedRootHash: varchar("applied_root_hash", { length: 64 }),
+    // Last working-copy change (graph_changes.seq) it applied to its draft.
+    appliedChangeSeq: bigint("applied_change_seq", { mode: "number" }),
     // in_sync | behind | error
     status: varchar("status", { length: 12 }).notNull(),
     // Error from the last GRAPH_NACK.
@@ -929,4 +1124,58 @@ export const graphEngineState = pgTable(
     lastAckAt: timestamp("last_ack_at", { withTimezone: true }),
   },
   (table) => [primaryKey({ columns: [table.projectId, table.engineId] })]
+);
+
+// ─── Files ───────────────────────────────────────────────
+// One row per file kept in R2, whatever put it there. The row is the record of
+// the file; the object in R2 is its content. A changed file is a new row that
+// points at the one it replaces, never an overwrite.
+
+export const files = pgTable(
+  "files",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // The chat agent the file belongs to, when it belongs to one.
+    appId: uuid("app_id").references(() => apps.id, { onDelete: "set null" }),
+    // Who put it there; null once that user is removed.
+    userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
+    // chat_attachment now; agent_output and source_file later.
+    kind: varchar("kind", { length: 32 }).notNull(),
+    // What the file belongs to: ownerType "thread" with the thread id, "source" with
+    // the data source's id, and so on. These ids live in the project's own database
+    // (thread ids are nanoids, source ids look like "excel-168814462398"), so they
+    // are plain strings with no foreign key. Both set, or both empty.
+    ownerType: varchar("owner_type", { length: 32 }),
+    ownerId: varchar("owner_id", { length: 255 }),
+    fileName: text("file_name").notNull(),
+    contentType: varchar("content_type", { length: 255 }),
+    sizeBytes: bigint("size_bytes", { mode: "number" }),
+    r2Key: text("r2_key").notNull(),
+    etag: varchar("etag", { length: 128 }),
+    // pending: reserved, not yet confirmed in R2 | ready | deleted | expired: never completed
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    version: integer("version").notNull().default(1),
+    // The row this one replaces, when it is a changed copy.
+    previousVersionId: uuid("previous_version_id").references((): AnyPgColumn => files.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("files_r2_key_unique").on(table.r2Key),
+    index("files_org_idx").on(table.orgId),
+    index("files_project_kind_idx").on(table.projectId, table.kind),
+    index("files_owner_idx").on(table.ownerType, table.ownerId),
+    check("files_owner_check", sql`(${table.ownerType} is null) = (${table.ownerId} is null)`),
+    // The sweep that expires uploads that never completed.
+    index("files_status_created_idx").on(table.status, table.createdAt),
+    check("files_status_check", sql`${table.status} in ('pending', 'ready', 'deleted', 'expired')`),
+  ]
 );

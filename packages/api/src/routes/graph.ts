@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
-import { concepts, graphChangeRequests, graphChanges, graphEdges, graphEngineState, graphNodes, graphReleaseEvents, graphReleases, users } from "../db/schema";
+import { concepts, graphChangeHeads, graphChangeRequests, graphChanges, graphEdges, graphEngineState, graphNodes, graphReleaseEvents, graphReleases, users } from "../db/schema";
 import { withTransaction, type Tx } from "../db/tx";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly } from "../middleware/auth";
@@ -33,10 +33,10 @@ import {
   rejectRequest,
   updateOwnRequest,
 } from "../lib/graph/requests";
-import { currentRelease, diffItems, discardDraft, getRelease, notifyRelease, pendingChanges, publish, releaseContent, rollback, type ReleaseItem } from "../lib/graph/release";
+import { currentRelease, diffItems, discardDraft, getRelease, notifyChanges, notifyRelease, pendingChanges, publish, releaseContent, rollback, type ReleaseItem } from "../lib/graph/release";
 import { importGraph, type ImportMode } from "../lib/graph/import";
 
-/** Composition graph routes (/projects/:projectId/graph), org admins only; engines see edits only after a publish. */
+/** Composition graph routes (/projects/:projectId/graph), org admins only; engines get every edit as their draft and answer from the published release. */
 
 const graphRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 graphRouter.use("*", authMiddleware, adminOnly);
@@ -48,7 +48,10 @@ function handler(fn: (c: AppContext, s: Scope) => Promise<Response>) {
       const projectId = c.req.param("projectId") ?? "";
       const access = await assertProjectAccess(c, projectId);
       if (!access.ok) return c.json({ error: access.error }, access.status);
-      return await fn(c, { projectId, orgId: access.orgId, userId: c.get("userId"), role: c.get("userRole") });
+      const res = await fn(c, { projectId, orgId: access.orgId, userId: c.get("userId"), role: c.get("userRole") });
+      // Any write may have changed the working copy; engines pull what's new (nothing, if it didn't).
+      if (c.req.method !== "GET" && res.ok) runLater(c, notifyChanges(c.env, projectId));
+      return res;
     } catch (err) {
       if (err instanceof HttpError) return c.json({ error: err.message, ...(err.details ?? {}) }, err.status);
       throw err;
@@ -68,7 +71,10 @@ function tx<T>(c: AppContext, fn: (q: Tx) => Promise<T>, isolationLevel?: "repea
 
 /** Runs after the response; engines catch up on their own if it fails. */
 function notifyLater(c: AppContext, projectId: string, notice: Parameters<typeof notifyRelease>[2]) {
-  const task = notifyRelease(c.env, projectId, notice);
+  runLater(c, notifyRelease(c.env, projectId, notice));
+}
+
+function runLater(c: AppContext, task: Promise<void>) {
   try {
     c.executionCtx.waitUntil(task);
   } catch {
@@ -672,11 +678,13 @@ graphRouter.get(
   "/engines",
   handler(async (c, s) => {
     const db = c.get("db");
-    const [rows, current] = await Promise.all([
+    const [rows, current, [head]] = await Promise.all([
       db.select().from(graphEngineState).where(eq(graphEngineState.projectId, s.projectId)),
       currentRelease(db, s.projectId),
+      db.select({ seq: graphChangeHeads.seq }).from(graphChangeHeads).where(eq(graphChangeHeads.projectId, s.projectId)),
     ]);
-    return c.json({ currentReleaseId: current?.release.id ?? null, engines: rows });
+    // An engine's draft is in sync when its appliedChangeSeq equals currentChangeSeq.
+    return c.json({ currentReleaseId: current?.release.id ?? null, currentChangeSeq: head?.seq ?? null, engines: rows });
   }),
 );
 

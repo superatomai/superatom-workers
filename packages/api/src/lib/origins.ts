@@ -1,10 +1,15 @@
 /**
  * First-party origin allowlist.
  *
- * Single source of truth for "is this one of our own front-ends", shared by the
- * CORS policy and SSO redirect validation. Those two had drifted apart — CORS
- * allowed everything and SSO validated nothing — so keeping one definition means
- * tightening it once tightens it everywhere.
+ * Single source of truth for "is this one of our own front-ends". SSO redirect
+ * validation (isAllowedRedirect, below) is now its only caller: the CORS policy
+ * in index.ts answers ANY origin, because the SDK runs on customer domains we
+ * do not know in advance. So do not read a request reaching a route as having
+ * come from one of these — see the comment on that middleware.
+ *
+ * Nothing here has loosened. A redirect destination still has to be ours: the
+ * SSO callback appends `?token=<jwt>` to the URL it is given, so this allowlist
+ * is the entire protection against handing a live session to another site.
  *
  * Subdomains are matched at ANY depth, because the product uses several levels:
  *   runtime   — live.superatom.ai, <client>.superatom.ai, dev.live.superatom.ai

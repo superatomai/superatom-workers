@@ -28,10 +28,12 @@
  */
 
 import { Hono } from "hono";
-import { AwsClient } from "aws4fetch";
+import { and, eq, ne, sql } from "drizzle-orm";
+import { files } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, authenticateRequest } from "../middleware/auth";
 import { assertProjectAccess, type AppContext } from "../lib/project-access";
+import { r2S3Client, objectUrl, deleteObject } from "../lib/r2-objects";
 
 const KEY_PREFIX = "chat-attachments/";
 
@@ -50,25 +52,13 @@ const ALLOWED_EXTENSIONS = [
 
 const chatAttachmentRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
-function r2S3Client(env: Env): AwsClient {
-	return new AwsClient({
-		accessKeyId: env.R2_ACCESS_KEY_ID,
-		secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-		service: "s3",
-		region: "auto",
-	});
-}
-
-function objectUrl(env: Env, key: string): string {
-	return `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_SOURCE_FILES_BUCKET_NAME}/${encodeURI(key)}`;
-}
-
-/** Deletes one object. A key that is already gone counts as deleted. */
-async function deleteObject(env: Env, key: string): Promise<void> {
-	const res = await r2S3Client(env).fetch(objectUrl(env, key), { method: "DELETE" });
-	if (!res.ok && res.status !== 404) {
-		throw new Error(`R2 DELETE failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
-	}
+/** Marks the file's row deleted. No row (an upload from before files were recorded) is fine. */
+async function markFileDeleted(c: AppContext, key: string): Promise<void> {
+	await c
+		.get("db")
+		.update(files)
+		.set({ status: "deleted", deletedAt: new Date() })
+		.where(and(eq(files.r2Key, key), ne(files.status, "deleted")));
 }
 
 function sanitizeFileName(name: string): string {
@@ -129,12 +119,22 @@ async function authorizeKeyAccess(
 
 /**
  * POST /upload/chat-attachment/initiate
- * Body: { projectId, appId, fileName, contentType?, fileSize }
- * Returns: { key, uploadUrl, expiresIn }
+ * Body: { projectId, appId, fileName, contentType?, fileSize, threadId? }
+ * Returns: { key, fileId, uploadUrl, expiresIn }
+ *
+ * The file is recorded (status "pending") before the upload URL is handed out, so
+ * an upload never exists in R2 without a row; /complete confirms it.
  */
 chatAttachmentRouter.post("/initiate", authMiddleware, async (c) => {
 	const body = await c.req
-		.json<{ projectId: string; appId: string; fileName: string; contentType?: string; fileSize: number }>()
+		.json<{
+			projectId: string;
+			appId: string;
+			fileName: string;
+			contentType?: string;
+			fileSize: number;
+			threadId?: string;
+		}>()
 		.catch(() => null);
 	if (!body) return c.json({ error: "Invalid JSON body" }, 400);
 
@@ -159,12 +159,31 @@ chatAttachmentRouter.post("/initiate", authMiddleware, async (c) => {
 	if (!access.ok) return c.json({ error: access.error }, access.status);
 
 	const key = buildObjectKey(projectId, appId, c.get("userId"), fileName);
+	const [row] = await c
+		.get("db")
+		.insert(files)
+		.values({
+			orgId: access.orgId,
+			projectId,
+			appId,
+			userId: c.get("userId"),
+			kind: "chat_attachment",
+			...(typeof body.threadId === "string" && body.threadId
+				? { ownerType: "thread", ownerId: body.threadId.slice(0, 255) }
+				: {}),
+			fileName: sanitizeFileName(fileName),
+			contentType: body.contentType ?? null,
+			sizeBytes: fileSize,
+			r2Key: key,
+		})
+		.returning({ id: files.id });
+
 	const signed = await r2S3Client(c.env).sign(`${objectUrl(c.env, key)}?X-Amz-Expires=${UPLOAD_URL_TTL_SECONDS}`, {
 		method: "PUT",
 		aws: { signQuery: true },
 	});
 
-	return c.json({ key, uploadUrl: signed.url, expiresIn: UPLOAD_URL_TTL_SECONDS });
+	return c.json({ key, fileId: row.id, uploadUrl: signed.url, expiresIn: UPLOAD_URL_TTL_SECONDS });
 });
 
 /**
@@ -194,6 +213,7 @@ chatAttachmentRouter.post("/complete", authMiddleware, async (c) => {
 	if (probe.status === 404) return c.json({ error: "Upload not found" }, 404);
 	if (probe.status === 416) {
 		await deleteObject(c.env, body.key).catch(() => {});
+		await markFileDeleted(c, body.key).catch(() => {});
 		return c.json({ error: "The file is empty" }, 400);
 	}
 	if (!probe.ok) {
@@ -207,14 +227,45 @@ chatAttachmentRouter.post("/complete", authMiddleware, async (c) => {
 	}
 	if (size > MAX_FILE_SIZE) {
 		await deleteObject(c.env, body.key).catch(() => {});
+		await markFileDeleted(c, body.key).catch(() => {});
 		return c.json({ error: `File too large. Max ${MAX_FILE_SIZE / 1024 / 1024} MB.` }, 400);
 	}
 
+	const parsed = parseKey(body.key)!;
+	const contentType = probe.headers.get("content-type");
+	const etag = probe.headers.get("etag")?.replace(/"/g, "") || null;
+
+	// Confirm the row /initiate wrote. An upload started before files were recorded
+	// has none, so it is written here, already confirmed. A file deleted since is left alone.
+	const [row] = await c
+		.get("db")
+		.insert(files)
+		.values({
+			orgId: owner.orgId,
+			projectId: parsed.projectId,
+			appId: parsed.appId,
+			userId: parsed.userId,
+			kind: "chat_attachment",
+			fileName: parsed.fileName,
+			contentType,
+			sizeBytes: size,
+			r2Key: body.key,
+			etag,
+			status: "ready",
+		})
+		.onConflictDoUpdate({
+			target: files.r2Key,
+			set: { status: "ready", sizeBytes: size, contentType, etag },
+			setWhere: sql`${files.status} in ('pending', 'ready')`,
+		})
+		.returning({ id: files.id });
+
 	return c.json({
 		key: body.key,
-		fileName: parseKey(body.key)!.fileName,
+		fileId: row?.id ?? null,
+		fileName: parsed.fileName,
 		size,
-		contentType: probe.headers.get("content-type"),
+		contentType,
 	}, 201);
 });
 
@@ -253,6 +304,7 @@ chatAttachmentRouter.post("/delete", async (c) => {
 
 	try {
 		await deleteObject(c.env, body.key);
+		await markFileDeleted(c, body.key);
 		return c.json({ deleted: true });
 	} catch (err: any) {
 		console.error("[chat-attachment] delete failed", err?.message || err, body.key);
