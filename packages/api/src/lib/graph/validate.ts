@@ -48,6 +48,8 @@ export interface ConceptFields {
   description: string | null;
   sourceId: string | null;
   originRef: string | null;
+  /** Off: answers leave it out. */
+  active: boolean;
 }
 
 const KIND = /^[a-z][a-z0-9_]{0,15}$/;
@@ -206,6 +208,7 @@ export function parseConceptInput(body: unknown, base?: ConceptFields): ConceptF
     description: pick("description", () => str(body.description, "description", 240), null),
     sourceId: pick("sourceId", () => str(body.sourceId, "sourceId", 100), null),
     originRef: pick("originRef", () => str(body.originRef, "originRef", 100), null),
+    active: pick("active", () => (typeof body.active === "boolean" ? body.active : bad("active must be true or false")), true),
   };
   if (!fields.name) bad("name is required");
   if (!fields.body) bad("body is required");
