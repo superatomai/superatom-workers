@@ -35,10 +35,10 @@ export function isEmailConfigured(env: Env): boolean {
   return Boolean(env.RESEND_API_KEY);
 }
 
-/** The From header: "<name> via Superatom <EMAIL_FROM>". */
+/** The From header: "<name> via Superatom AI <EMAIL_FROM>". */
 export function fromAddress(env: Env, displayName?: string): string {
   const address = env.EMAIL_FROM || "updates@superatom.ai";
-  const name = (displayName ? `${displayName} via Superatom` : "Superatom").replace(/["<>]/g, "");
+  const name = (displayName ? `${displayName} via Superatom AI` : "Superatom AI").replace(/["<>]/g, "");
   return `"${name}" <${address}>`;
 }
 

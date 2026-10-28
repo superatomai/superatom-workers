@@ -242,7 +242,6 @@ export function buildEmailHtml(p: { orgName: string; bodyMarkdown?: string; body
 <html><body style="margin: 0; padding: 0; background-color: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #f3f4f6; padding: 24px 0;"><tr><td align="center">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px;">
-<tr><td style="padding: 20px 28px; border-bottom: 1px solid #e5e7eb; font-size: 15px; font-weight: 700; color: #111827;">${org}</td></tr>
 <tr><td style="padding: 20px 28px;">${p.bodyHtml !== undefined ? htmlFragment(p.bodyHtml) : renderMarkdown(p.bodyMarkdown ?? "")}</td></tr>
 <tr><td style="padding: 16px 28px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #6b7280; line-height: 1.5;">${footer}</td></tr>
 </table></td></tr></table></body></html>`;
