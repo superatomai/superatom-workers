@@ -15,8 +15,8 @@ minimumReleaseAgeExclude:
 # local dev toolchain (miniflare/unenv/drizzle-kit/tsx) past known CVEs.
 overrides:
   esbuild: ^0.28.1
-  # >=6.29.1 fixes GHSA-xjj6-f33q-929c and GHSA-4qv8-2p9j-2685 on the 6.x line miniflare 3 uses
-  undici: ^6.29.1
+  # >=7.30.1 fixes the Oct 2026 undici advisories on the 7.x line miniflare 4 uses
+  undici: ^7.30.1
   ws: ^8.21.0
   defu: ^6.1.5
   sharp: ^0.35.5
