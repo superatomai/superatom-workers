@@ -1179,3 +1179,158 @@ export const files = pgTable(
     check("files_status_check", sql`${table.status} in ('pending', 'ready', 'deleted', 'expired')`),
   ]
 );
+
+// ─── Emails (announcements to users) ─────────────────────
+
+export const emailCampaigns = pgTable(
+  "email_campaigns",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    // Null = platform-wide (superadmin, every org).
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "cascade" }),
+    // { type: "all" | "admins" | "members" | "project" | "users", projectId?, userIds? }
+    audience: jsonb("audience").notNull(),
+    // Unsubscribe category, e.g. "announcements" or "usage".
+    category: varchar("category", { length: 32 }).notNull().default("announcements"),
+    subject: varchar("subject", { length: 255 }).notNull(),
+    bodyMarkdown: text("body_markdown").notNull(),
+    status: varchar("status", { length: 16 }).notNull().default("draft"),
+    // EmailSchedule (lib/email-schedule.ts); null = send now. Recurring ones stay "scheduled",
+    // scheduledAt is the next run, and each run is a child row (parentId) holding its own sends.
+    schedule: jsonb("schedule"),
+    parentId: uuid("parent_id").references((): AnyPgColumn => emailCampaigns.id, { onDelete: "cascade" }),
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    recipientCount: integer("recipient_count").notNull().default(0),
+    sentCount: integer("sent_count").notNull().default(0),
+    failedCount: integer("failed_count").notNull().default(0),
+    // Why the campaign failed as a whole (e.g. daily limit), not per-recipient errors.
+    error: text("error"),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    // ui = written on the Emails page; api = one POST /emails/messages call (per-person content, not stored).
+    source: varchar("source", { length: 16 }).notNull().default("ui"),
+    apiKeyId: uuid("api_key_id").references((): AnyPgColumn => emailApiKeys.id, { onDelete: "set null" }),
+    // The caller's Idempotency-Key; a repeat returns the first call's results.
+    idempotencyKey: varchar("idempotency_key", { length: 255 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("email_campaigns_org_idx").on(table.orgId, table.createdAt),
+    uniqueIndex("email_campaigns_api_idempotency_idx").on(table.apiKeyId, table.idempotencyKey),
+    index("email_campaigns_parent_idx").on(table.parentId, table.createdAt),
+    // The cron's "what's due" scan.
+    index("email_campaigns_due_idx").on(table.status, table.scheduledAt),
+    check(
+      "email_campaigns_status_check",
+      sql`${table.status} in ('draft', 'scheduled', 'sending', 'sent', 'cancelled', 'failed')`
+    ),
+  ]
+);
+
+export const emailSends = pgTable(
+  "email_sends",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => emailCampaigns.id, { onDelete: "cascade" }),
+    userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
+    email: varchar("email", { length: 255 }).notNull(),
+    // Set for API sends, where each person gets their own subject.
+    subject: varchar("subject", { length: 255 }),
+    // skipped = unsubscribed or inactive at send time
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    resendId: varchar("resend_id", { length: 64 }),
+    error: text("error"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    // A retried send never mails the same address twice for one campaign.
+    uniqueIndex("email_sends_campaign_email_idx").on(table.campaignId, table.email),
+    index("email_sends_campaign_status_idx").on(table.campaignId, table.status),
+    check(
+      "email_sends_status_check",
+      sql`${table.status} in ('pending', 'sent', 'failed', 'skipped')`
+    ),
+  ]
+);
+
+/** Files sent with an announcement; a recurring email's runs reuse the parent's. Kept in R2. */
+export const emailAttachments = pgTable(
+  "email_attachments",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => emailCampaigns.id, { onDelete: "cascade" }),
+    fileName: varchar("file_name", { length: 255 }).notNull(),
+    contentType: varchar("content_type", { length: 255 }),
+    sizeBytes: integer("size_bytes").notNull(),
+    r2Key: text("r2_key").notNull(),
+    // pending: upload URL handed out | ready: the object is confirmed in R2
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("email_attachments_campaign_idx").on(table.campaignId),
+    check("email_attachments_status_check", sql`${table.status} in ('pending', 'ready')`),
+  ]
+);
+
+/** Org-scoped keys for scripts sending through POST /orgs/:orgId/emails/messages. Only the hash is kept. */
+export const emailApiKeys = pgTable(
+  "email_api_keys",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 100 }).notNull(),
+    // First characters of the key, shown so admins can tell keys apart.
+    keyPrefix: varchar("key_prefix", { length: 20 }).notNull(),
+    keyHash: varchar("key_hash", { length: 64 }).notNull(),
+    // The key acts for its creator; it stops working when they're no longer an active admin.
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("email_api_keys_hash_idx").on(table.keyHash),
+    index("email_api_keys_org_idx").on(table.orgId, table.createdAt),
+  ]
+);
+
+export const emailUnsubscribes = pgTable(
+  "email_unsubscribes",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    category: varchar("category", { length: 32 }).notNull(),
+    // self = the person's own unsubscribe link; admin = an org admin turned it off.
+    source: varchar("source", { length: 16 }).notNull().default("self"),
+    changedBy: uuid("changed_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.category] })]
+);
+
+/** Every subscribe/unsubscribe, kept after the current state changes back. */
+export const emailSubscriptionEvents = pgTable(
+  "email_subscription_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    category: varchar("category", { length: 32 }).notNull(),
+    subscribed: boolean("subscribed").notNull(),
+    source: varchar("source", { length: 16 }).notNull(),
+    changedBy: uuid("changed_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index("email_subscription_events_user_idx").on(table.userId, table.createdAt)]
+);

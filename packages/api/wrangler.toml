@@ -51,9 +51,15 @@ bucket_name = "sa-checklist-reports"
 binding = "JWT_SECRETS"
 id = "1669d6442bf34757a223bd7d6548d14c"
 
+# Sends scheduled announcement emails and resumes stalled ones (src/lib/email-campaigns.ts).
+[triggers]
+crons = ["*/5 * * * *"]
+
 [vars]
 R2_PUBLIC_URL = "https://sa-assets.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files"
+# Announcement emails: From address (Resend-verified domain). Attachments stay off until prod has R2 S3 keys + EMAIL_ATTACHMENTS_BUCKET_NAME.
+EMAIL_FROM = "alerts@superatom.ai"
 SUPERADMIN_HOST = "superadmin.superatom.ai"
 # Installer host: curl -fsSL https://install.superatom.ai | sh (src/install)
 INSTALL_HOST = "install.superatom.ai"
@@ -112,7 +118,8 @@ script_name = "sa-websocket"
 #   wrangler secret put GITHUB_CODE_TOKEN        # installer: fine-grained PAT, superatom-setup-code only, Contents read-only
 #   wrangler secret put INSTALL_DOWNLOAD_SECRET  # installer: signs code download links; ≥32 random chars
 #   wrangler secret put LLM_PROXY_ADMIN_SECRET   # installer: the llm-proxy worker's ADMIN_SECRET
-#   wrangler secret put RESEND_API_KEY           # installer: handed to new installs (report/alert emails)
+#   wrangler secret put RESEND_API_KEY           # installer: handed to new installs (report/alert emails); also sends announcements
+#   wrangler secret put EMAIL_UNSUBSCRIBE_SECRET # signs announcement unsubscribe links; ≥32 random chars
 #
 # DATABASE_URL: Prod Neon PostgreSQL connection string
 # JWT_SECRET: Secret key for signing/verifying JWTs

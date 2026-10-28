@@ -29,14 +29,14 @@
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.21.0",
     "typescript": "^5.3.0",
-    "wrangler": "^3.22.0"
+    "wrangler": "~4.150.0"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.0",
     "@xmldom/xmldom": "^0.8.15",
     "aws4fetch": "^1.0.20",
     "drizzle-orm": "^0.45.2",
-    "hono": "^4.13.5",
+    "hono": "^4.13.11",
     "jose": "^5.9.0",
     "xml-crypto": "^6.1.2"
   },

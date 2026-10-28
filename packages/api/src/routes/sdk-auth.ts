@@ -219,7 +219,8 @@ sdkAuth.post("/exchange", async (c) => {
       return reject(
         c,
         401,
-        'access must be a list of filters, e.g. [{ "table": "orders", "column": "customer_id", "op": "in", "values": [12] }]',
+        'access must be a list of filters, e.g. [{ "table": "orders", "column": "customer_id", "op": "in", "values": [12] }], ' +
+          'or an object, e.g. { "allowedSources": ["postgres-1a2b"], "policies": [ ... ] }',
         "bad_access",
         `org=${orgId}`
       );

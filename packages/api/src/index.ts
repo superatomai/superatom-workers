@@ -30,6 +30,10 @@ import sdkAuthRoutes from "./routes/sdk-auth";
 import graphRoutes from "./routes/graph";
 import releaseRoutes from "./routes/releases";
 import checklistReportsRoutes from "./routes/checklist-reports";
+import emailsRoutes from "./routes/emails";
+import emailMessagesRoutes from "./routes/email-messages";
+import emailUnsubscribeRoutes from "./routes/email-unsubscribe";
+import { processDueCampaigns } from "./lib/email-campaigns";
 
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -133,6 +137,9 @@ app.route("/auth", bootstrapRoutes);
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);
 app.route("/orgs/:orgId/projects", projectsRoutes);
+app.route("/orgs/:orgId/emails/messages", emailMessagesRoutes); // email API key, so before emailsRoutes' login middleware
+app.route("/orgs/:orgId/emails", emailsRoutes); // org announcements (org admins)
+app.route("/email", emailUnsubscribeRoutes); // public unsubscribe links
 // More specific prefix first — Hono matches in registration order.
 app.route("/upload/source-file", sourceUploadRoutes);
 app.route("/upload/chat-attachment", chatAttachmentUploadRoutes);
@@ -176,5 +183,9 @@ export default {
       return installApp.fetch(request, env, ctx);
     }
     return app.fetch(request, env, ctx);
+  },
+  // Cron (wrangler.toml [triggers]): scheduled announcements, and resuming stalled sends.
+  scheduled(_event, env, ctx) {
+    ctx.waitUntil(processDueCampaigns(env, createDb(env.DATABASE_URL)));
   },
 } satisfies ExportedHandler<Env>;
