@@ -31,6 +31,14 @@ export async function handleReleaseNotice(ctx: GraphContext, request: Request): 
 	return json({ ok: true, sent });
 }
 
+/** sa-api says the program catalogue changed (upload, publish, unpublish, pin); each engine re-syncs. */
+export async function handleProgramsNotice(ctx: GraphContext, request: Request): Promise<Response> {
+	if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+	const sent = notifyEngines(ctx, 'PROGRAMS_CHANGED', {});
+	console.log(`Broadcaster ${ctx.projectId()}: PROGRAMS_CHANGED → ${sent} engine socket(s)`);
+	return json({ ok: true, sent });
+}
+
 /** GRAPH_HELLO — an engine reports its release; answered with GRAPH_NONE, GRAPH_IN_SYNC, GRAPH_SWITCH or GRAPH_SNAPSHOT parts. */
 export async function handleHello(ctx: GraphContext, ws: WebSocket, clientInfo: ClientInfo, msg: BroadcastMessage): Promise<void> {
 	if (!isEngine(clientInfo)) {
