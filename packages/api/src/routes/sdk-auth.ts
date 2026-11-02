@@ -247,54 +247,96 @@ sdkAuth.post("/exchange", async (c) => {
     }
   }
 
-  // Find the user: by their id in the customer's system first, then — once — by
-  // email, to link an account that already exists (e.g. created by our admins).
-  // Linking never takes over an account already tied to a different identity.
-  let [user] = await db
-    .select()
-    .from(users)
-    .where(and(eq(users.orgId, orgId), eq(users.ssoSubject, sub)))
-    .limit(1);
-
-  if (!user) {
-    const [byEmail] = await db
+  /**
+   * Find the user by email within the org: one email, one account, one org.
+   *
+   * Email is the key here, NOT `sub`. That is a deliberate trade and the cost is
+   * known: an address change in the customer's system reads as a different
+   * person, so they get a new account and the old one is left behind. In return,
+   * what the customer sends is always what they get — the address in the token
+   * is the account they are signed in to, with nothing stored from an earlier
+   * sign-in able to override it.
+   *
+   * `sub` used to be the key, and the failure it produced was the quieter one. A
+   * customer tagging the address per environment (`a+dev@acme.com`, to keep DEV,
+   * QA and UAT apart) had the tag silently ignored for anyone already known:
+   * matched on the id, we returned the old address and never read the email at
+   * all. The visible half was worse — the untagged address stayed in this org's
+   * unique (org, email) slot, so the same person arriving from their next
+   * environment with a new id was refused outright.
+   *
+   * A departed person's address being reassigned is the case this does not
+   * distinguish, since the new holder matches the old row. Deactivation covers
+   * it: an inactive account is refused below rather than handed over.
+   */
+  const lookupByEmail = () =>
+    db
       .select()
       .from(users)
       .where(and(eq(users.orgId, orgId), sql`lower(${users.email}) = ${email}`))
       .limit(1);
 
-    if (byEmail) {
-      if (byEmail.ssoSubject && byEmail.ssoSubject !== sub) {
-        return reject(c, 401, "This email is already linked to another identity", "email_linked_elsewhere", `org=${orgId}`);
-      }
-      // Linking an account that already exists here: stamp the identity so we
-      // recognise them next time, and nothing else. The account predates this
-      // sign-in, so its roles and access are the platform's to say, not the
-      // token's.
-      await db
-        .update(users)
-        .set({ ssoSubject: sub, updatedAt: new Date() })
-        .where(eq(users.id, byEmail.id));
-      user = { ...byEmail, ssoSubject: sub };
-    } else {
+  let [user] = await lookupByEmail();
+
+  if (user) {
+    /**
+     * Their id in the customer's system, kept opportunistically.
+     *
+     * Informational, not a key: nothing in this route reads it. SSO and SAML
+     * still look it up first (sso.ts, saml.ts) and fall back to email, so a
+     * value here helps them and its absence costs them one query.
+     *
+     * Written only when it is free. `users_org_sso_subject_idx` is unique on
+     * (org, sso_subject), and one id legitimately arrives under two addresses —
+     * that same per-environment tagging, where DEV and PROD share an internal
+     * user id and differ only by the tag. Taking the id from the other row would
+     * mean two sign-ins fighting over a column neither of them needs, so the
+     * second one simply leaves it alone.
+     */
+    if (sub && user.ssoSubject !== sub) {
       try {
-        [user] = await db
-          .insert(users)
-          // No `config`: what the customer sends rides in the token and is never
-          // written down. `users.config` belongs to the platform alone, so an
-          // admin's edit there is the only thing that can end up in this column.
-          .values({ orgId, email, name, ssoSubject: sub, externalRoles: roles, role: "member", isActive: true })
-          .returning();
+        await db
+          .update(users)
+          .set({ ssoSubject: sub, updatedAt: new Date() })
+          .where(eq(users.id, user.id));
+        user = { ...user, ssoSubject: sub };
       } catch {
-        // Two first sign-ins racing: the other request created the row. Use it.
-        [user] = await db
-          .select()
-          .from(users)
-          .where(and(eq(users.orgId, orgId), eq(users.ssoSubject, sub)))
-          .limit(1);
-        if (!user) {
-          return reject(c, 401, "Could not create the user", "create_failed", `org=${orgId}`);
+        console.warn(`[sdk-auth] sub already held in this org, left as is: org=${orgId} user=${user.id}`);
+      }
+    }
+  } else {
+    try {
+      [user] = await db
+        .insert(users)
+        // No `config`: what the customer sends rides in the token and is never
+        // written down. `users.config` belongs to the platform alone, so an
+        // admin's edit there is the only thing that can end up in this column.
+        .values({ orgId, email, name, ssoSubject: sub, externalRoles: roles, role: "member", isActive: true })
+        .returning();
+    } catch {
+      /**
+       * Either the address was created by a request racing this one, or `sub` is
+       * already held by another row in this org. Re-read before deciding which:
+       * a row under this address means the race, and the winner is the account.
+       */
+      [user] = await lookupByEmail();
+
+      if (!user) {
+        // No row under the address, so it was the id that collided. The same
+        // insert without it — the account matters, the id does not.
+        try {
+          [user] = await db
+            .insert(users)
+            .values({ orgId, email, name, ssoSubject: null, externalRoles: roles, role: "member", isActive: true })
+            .returning();
+          console.warn(`[sdk-auth] sub already held in this org, user created without it: org=${orgId}`);
+        } catch {
+          [user] = await lookupByEmail();
         }
+      }
+
+      if (!user) {
+        return reject(c, 401, "Could not create the user", "create_failed", `org=${orgId}`);
       }
     }
   }
