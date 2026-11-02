@@ -39,15 +39,18 @@ const KEY_PREFIX = "chat-attachments/";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
+// A chat's files share 100 MB (checked by the engine and the runtime); one file may use all of it.
+const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 
 const UPLOAD_URL_TTL_SECONDS = 15 * 60; // 15 minutes — one small file
 const DOWNLOAD_URL_TTL_SECONDS = 60 * 60; // 1 hour
 
-const ALLOWED_EXTENSIONS = [
-	"pdf", "docx", "txt", "md", "json",
-	"csv", "xlsx", "xls",
-	"png", "jpg", "jpeg", "webp", "gif",
+// Files that run rather than hold data. Any other kind of file can be attached
+// (a zip is unpacked by the engine, which keeps these out of it too); these stay
+// out of the agent's workspace, which can run commands.
+const BLOCKED_EXTENSIONS = [
+	"exe", "dll", "msi", "com", "scr", "app", "dmg", "pkg",
+	"bat", "cmd", "ps1", "vbs", "vbe", "wsf", "hta", "sh", "jar", "apk", "lnk", "reg",
 ];
 
 const chatAttachmentRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -94,15 +97,36 @@ async function assertKeyOwner(c: AppContext, key: string) {
 /**
  * Accept the backend's service token, or a signed-in user (who must then own
  * the key). Mirrors source-upload's signed-get/delete dual auth.
+ *
+ * The service token is one secret shared by every engine, so on its own it says
+ * nothing about whose file is wanted. The engine names the project and user it
+ * is asking for, and a key that is not theirs is refused. An engine that
+ * predates this names neither and is let through, logged, until every engine
+ * sends them.
  */
 async function authorizeKeyAccess(
 	c: AppContext,
 	key: string,
+	claim: { projectId?: unknown; userId?: unknown },
 ): Promise<{ ok: true } | { ok: false; status: 400 | 401 | 403 | 404 | 503; error: string }> {
-	if (!parseKey(key)) return { ok: false, status: 400, error: "Invalid key" };
+	const parsed = parseKey(key);
+	if (!parsed) return { ok: false, status: 400, error: "Invalid key" };
 
 	const serviceToken = c.req.header("X-SA-Service-Token");
-	if (serviceToken && serviceToken === c.env.SA_INTERNAL_SERVICE_TOKEN) return { ok: true };
+	if (serviceToken && serviceToken === c.env.SA_INTERNAL_SERVICE_TOKEN) {
+		if (claim.projectId === undefined && claim.userId === undefined) {
+			console.warn(`[chat-attachment] service-token call names no project/user (engine predates the owner check): ${key}`);
+			return { ok: true };
+		}
+		if (parsed.projectId !== claim.projectId || parsed.userId !== claim.userId) {
+			console.warn(
+				`[chat-attachment] service-token call refused: asked for project ${String(claim.projectId)} ` +
+				`user ${String(claim.userId)}, key belongs to project ${parsed.projectId} user ${parsed.userId}`,
+			);
+			return { ok: false, status: 403, error: "Not permitted for this file" };
+		}
+		return { ok: true };
+	}
 
 	// authMiddleware can't run after the service-token branch above, so run the
 	// same check and populate the same context it would.
@@ -150,9 +174,9 @@ chatAttachmentRouter.post("/initiate", authMiddleware, async (c) => {
 		return c.json({ error: `File too large. Max ${MAX_FILE_SIZE / 1024 / 1024} MB.` }, 400);
 	}
 
-	const ext = fileName.split(".").pop()?.toLowerCase();
-	if (!ext || !ALLOWED_EXTENSIONS.includes(ext)) {
-		return c.json({ error: `Unsupported file type. Allowed: ${ALLOWED_EXTENSIONS.join(", ")}` }, 400);
+	const ext = fileName.includes(".") ? fileName.split(".").pop()!.toLowerCase() : "";
+	if (BLOCKED_EXTENSIONS.includes(ext)) {
+		return c.json({ error: `.${ext} files can't be attached: files that run programs or scripts are not allowed.` }, 400);
 	}
 
 	const access = await assertProjectAccess(c, projectId);
@@ -272,14 +296,14 @@ chatAttachmentRouter.post("/complete", authMiddleware, async (c) => {
 /**
  * POST /upload/chat-attachment/signed-get
  * Auth: X-SA-Service-Token (backend → worker), or the uploader's Bearer JWT.
- * Body: { key }
+ * Body: { key, projectId?, userId? } — the backend names whose file it is asking for
  * Returns: { url, expiresIn }
  */
 chatAttachmentRouter.post("/signed-get", async (c) => {
-	const body = await c.req.json<{ key: string }>().catch(() => null);
+	const body = await c.req.json<{ key: string; projectId?: string; userId?: string }>().catch(() => null);
 	if (!body?.key) return c.json({ error: "key is required" }, 400);
 
-	const auth = await authorizeKeyAccess(c, body.key);
+	const auth = await authorizeKeyAccess(c, body.key, body);
 	if (!auth.ok) return c.json({ error: auth.error }, auth.status);
 
 	const signed = await r2S3Client(c.env).sign(`${objectUrl(c.env, body.key)}?X-Amz-Expires=${DOWNLOAD_URL_TTL_SECONDS}`, {
@@ -292,14 +316,14 @@ chatAttachmentRouter.post("/signed-get", async (c) => {
 /**
  * POST /upload/chat-attachment/delete
  * Auth: X-SA-Service-Token (backend → worker), or the uploader's Bearer JWT.
- * Body: { key }
+ * Body: { key, projectId?, userId? } — the backend names whose file it is deleting
  * Returns: { deleted: true }   (idempotent — succeeds even if the key is gone)
  */
 chatAttachmentRouter.post("/delete", async (c) => {
-	const body = await c.req.json<{ key: string }>().catch(() => null);
+	const body = await c.req.json<{ key: string; projectId?: string; userId?: string }>().catch(() => null);
 	if (!body?.key) return c.json({ error: "key is required" }, 400);
 
-	const auth = await authorizeKeyAccess(c, body.key);
+	const auth = await authorizeKeyAccess(c, body.key, body);
 	if (!auth.ok) return c.json({ error: auth.error }, auth.status);
 
 	try {
