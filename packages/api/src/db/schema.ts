@@ -223,6 +223,17 @@ export const projectPrograms = pgTable(
     publishedBy: varchar("published_by", { length: 255 }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
     notes: text("notes"),
+    // Who registered the build; drafts are served only to this user's dev engine.
+    creatorId: uuid("creator_id").references(() => users.id, { onDelete: "set null" }),
+    // program.json, so lists and the engine prompt need not open the archive.
+    manifest: jsonb("manifest").$type<Record<string, unknown>>(),
+    // pending until the archive is in R2 and its size checked; then ready. unpublished = retracted after a publish.
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    // R2 keys in the programs bucket: the built archive and the source archive.
+    key: varchar("key", { length: 512 }),
+    sourceKey: varchar("source_key", { length: 512 }),
+    sourceHash: varchar("source_hash", { length: 64 }),
+    sourceBytes: integer("source_bytes"),
   },
   (table) => [
     uniqueIndex("project_programs_version_idx").on(table.projectId, table.name, table.version),

@@ -44,6 +44,11 @@ bucket_name = "sa-frontend-builds-dev"
 binding = "CHECKLIST_REPORTS"
 bucket_name = "sa-checklist-reports-dev"
 
+# Program archives (built + source). Keys <projectId>/<name>/<version>/<hash>.tar.gz
+[[r2_buckets]]
+binding = "PROGRAMS"
+bucket_name = "sa-programs-dev"
+
 # Sends scheduled announcement emails and resumes stalled ones (src/lib/email-campaigns.ts).
 [triggers]
 crons = ["*/5 * * * *"]
@@ -51,6 +56,7 @@ crons = ["*/5 * * * *"]
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
+PROGRAMS_BUCKET_NAME = "sa-programs-dev"
 SUPERADMIN_HOST = "dev.superadmin.superatom.ai"
 # Installer host. Dev installs the dev branch, a dummy LLM key and the dev websocket.
 INSTALL_HOST = "dev.install.superatom.ai"

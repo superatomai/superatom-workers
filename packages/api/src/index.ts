@@ -29,6 +29,7 @@ import feedbackRoutes from "./routes/product-feedback";
 import sdkAuthRoutes from "./routes/sdk-auth";
 import graphRoutes from "./routes/graph";
 import releaseRoutes from "./routes/releases";
+import programsRoutes from "./routes/programs";
 import checklistReportsRoutes from "./routes/checklist-reports";
 import emailsRoutes from "./routes/emails";
 import emailMessagesRoutes from "./routes/email-messages";
@@ -149,6 +150,7 @@ app.route("/my/apps", myAppsRoutes); // must be before appsRoutes (mounted at /)
 app.route("/apps", permissionsRoutes); // handles /apps/:appId/permissions
 app.route("/projects/:projectId/graph", graphRoutes); // composition graph (org admins only)
 app.route("/projects/:projectId/release", releaseRoutes); // release status + the Update button (org admins)
+app.route("/projects/:projectId/programs", programsRoutes); // program catalogue: engines (service token) and admins
 app.route("/", appsRoutes); // handles /projects/:projectId/apps and /apps/:appId
 app.route("/answer-feedback", answerFeedbackRoutes); // feedback 1: server-to-server (service token auth)
 app.route("/feedback", feedbackRoutes); // feedback 2: product feedback (public + superadmin list)

@@ -47,6 +47,11 @@ bucket_name = "superatom-install"
 binding = "CHECKLIST_REPORTS"
 bucket_name = "sa-checklist-reports"
 
+# Program archives (built + source). Keys <projectId>/<name>/<version>/<hash>.tar.gz
+[[r2_buckets]]
+binding = "PROGRAMS"
+bucket_name = "sa-programs"
+
 [[kv_namespaces]]
 binding = "JWT_SECRETS"
 id = "1669d6442bf34757a223bd7d6548d14c"
@@ -58,6 +63,7 @@ crons = ["*/5 * * * *"]
 [vars]
 R2_PUBLIC_URL = "https://sa-assets.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files"
+PROGRAMS_BUCKET_NAME = "sa-programs"
 # Announcement emails: From address (Resend-verified domain). Attachments stay off until prod has R2 S3 keys + EMAIL_ATTACHMENTS_BUCKET_NAME.
 EMAIL_FROM = "alerts@superatom.ai"
 SUPERADMIN_HOST = "superadmin.superatom.ai"
