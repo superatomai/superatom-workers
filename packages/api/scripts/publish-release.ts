@@ -472,12 +472,17 @@ async function main() {
     const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
 
     console.log("\nUploading blobs…");
+    let newBytes = 0, reusedBytes = 0;
     for (const d of [manifest.config, ...manifest.layers]) {
       const key = `registry/${repoName}/blobs/${d.digest}`;
-      if (await exists(key)) { console.log(`  = ${d.digest.slice(0, 19)}… already present`); continue; }
+      if (await exists(key)) { reusedBytes += d.size ?? 0; console.log(`  = ${d.digest.slice(0, 19)}… already present`); continue; }
+      newBytes += d.size ?? 0;
       const what = await upload(key, join(layout, "blobs", "sha256", d.digest.split(":")[1]), "application/octet-stream");
       console.log(`  ✓ ${d.digest.slice(0, 19)}… ${what}`);
     }
+    // What a VM downloads and stores for this release; a code-only change should be tens of MB.
+    const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
+    console.log(`  layers: new ${mb(newBytes)}, reused ${mb(reusedBytes)}`);
 
     // By tag AND by digest: the client resolves the tag, then re-fetches by digest.
     const manifestBody = await readFile(manifestFile);
