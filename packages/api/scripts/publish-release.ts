@@ -28,13 +28,16 @@
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, createReadStream, createWriteStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { AwsClient } from "aws4fetch";
 import { neon, neonConfig } from "@neondatabase/serverless";
+import { depsKey, depsPointerKey, hasDepsStage } from "../src/install/deps-image";
 
 const run = promisify(execFile);
 const BUCKET = "superatom-install";
@@ -170,6 +173,76 @@ async function upload(key: string, file: string, contentType: string): Promise<s
   }
   await putSmall(key, await readFile(file), contentType);
   return `${mb} MB`;
+}
+
+async function getToFile(key: string, file: string): Promise<void> {
+  const { client, base } = s3();
+  const res = await fetchRetry(`GET ${key}`, () => client.fetch(`${base}/${key}`));
+  if (!res.ok || !res.body) fail(`GET ${key} -> ${res.status}`);
+  await pipeline(Readable.fromWeb(res.body as any), createWriteStream(file));
+}
+
+async function sha256File(file: string): Promise<string> {
+  const h = createHash("sha256");
+  await pipeline(createReadStream(file), h);
+  return `sha256:${h.digest("hex")}`;
+}
+
+const DEPS_CACHE = join(process.env.HOME || tmpdir(), ".cache", "superatom-publish", "deps");
+const blobPath = (layout: string, digest: string) => join(layout, "blobs", "sha256", digest.split(":")[1]);
+
+/**
+ * The dependency image as a local OCI layout the release build uses for its `deps` stage: from this
+ * machine's cache, else downloaded once from the registry, else built and uploaded once (new lockfiles).
+ * Same layers every release, so a VM pulls and keeps only the code layers.
+ */
+async function ensureDeps(repoName: string, tree: string, work: string): Promise<{ layout: string; digest: string }> {
+  const key = depsKey(tree);
+  const layout = join(DEPS_CACHE, repoName, key);
+  const done = join(layout, "digest");
+  if (existsSync(done)) {
+    console.log(`deps    ${key.slice(0, 12)} (cached on this machine)`);
+    return { layout, digest: readFileSync(done, "utf8").trim() };
+  }
+  rmSync(layout, { recursive: true, force: true });
+  mkdirSync(join(layout, "blobs", "sha256"), { recursive: true });
+  const pointer = depsPointerKey(repoName, key);
+  let digest: string;
+  if (await exists(pointer)) {
+    console.log(`deps    ${key.slice(0, 12)} published before: downloading it once to this machine`);
+    const ptr = join(work, "deps-pointer.json");
+    await getToFile(pointer, ptr);
+    digest = JSON.parse(readFileSync(ptr, "utf8")).manifestDigest;
+    const mFile = blobPath(layout, digest);
+    await getToFile(`registry/${repoName}/manifests/${digest}`, mFile);
+    const manifest = JSON.parse(readFileSync(mFile, "utf8"));
+    for (const d of [{ digest }, manifest.config, ...manifest.layers]) {
+      if (d.digest !== digest) await getToFile(`registry/${repoName}/blobs/${d.digest}`, blobPath(layout, d.digest));
+      if (await sha256File(blobPath(layout, d.digest)) !== d.digest) fail(`deps blob ${d.digest} did not match its digest`);
+    }
+    writeFileSync(join(layout, "oci-layout"), JSON.stringify({ imageLayoutVersion: "1.0.0" }));
+    writeFileSync(join(layout, "index.json"), JSON.stringify({ schemaVersion: 2, manifests: [{
+      mediaType: manifest.mediaType ?? "application/vnd.oci.image.manifest.v1+json", digest, size: statSync(mFile).size }] }));
+  } else {
+    console.log(`deps    ${key.slice(0, 12)} is a new dependency set: building and publishing it once`);
+    const tar = join(work, "deps.tar");
+    await sh("docker", ["buildx", "build", "--builder", "ocibuilder", "--target", "deps",
+      "--output", `type=oci,dest=${tar}`, tree]);
+    await sh("tar", ["-xf", tar, "-C", layout]);
+    const mDesc = JSON.parse(readFileSync(join(layout, "index.json"), "utf8")).manifests[0];
+    digest = mDesc.digest;
+    const manifest = JSON.parse(readFileSync(blobPath(layout, digest), "utf8"));
+    for (const d of [manifest.config, ...manifest.layers]) {
+      const k = `registry/${repoName}/blobs/${d.digest}`;
+      if (await exists(k)) continue;
+      console.log(`  ✓ ${d.digest.slice(0, 19)}… ${await upload(k, blobPath(layout, d.digest), "application/octet-stream")}`);
+    }
+    await putSmall(`registry/${repoName}/manifests/${digest}`, readFileSync(blobPath(layout, digest)), mDesc.mediaType);
+    // Last, so the pointer never names a manifest whose blobs are not all there.
+    await putSmall(pointer, Buffer.from(JSON.stringify({ manifestDigest: digest, key, createdAt: new Date().toISOString() }) + "\n"), "application/json");
+  }
+  writeFileSync(done, digest);
+  return { layout, digest };
 }
 
 /** The control-plane database for one environment, from the same files the migrations use. */
@@ -382,7 +455,12 @@ async function main() {
     // The repository name IS the project id: that is what the registry routes
     // authorise against (src/install/registry.ts), so it must match exactly.
     const repoTag = `${repoName}:${version}`;
-    await sh("docker", ["buildx", "build", "--builder", "ocibuilder",
+    const depsArgs: string[] = [];
+    if (hasDepsStage(readFileSync(join(tree, "Dockerfile"), "utf8"))) {
+      const deps = await ensureDeps(repoName, tree, work);
+      depsArgs.push("--build-context", `deps=oci-layout://${deps.layout}@${deps.digest}`);
+    }
+    await sh("docker", ["buildx", "build", "--builder", "ocibuilder", ...depsArgs,
       "--output", `type=oci,dest=${join(work, "image.tar")}`, "-t", repoTag, tree]);
 
     const layout = join(work, "oci");
