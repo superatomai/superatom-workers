@@ -12,7 +12,8 @@ import {
   unsubscribeHeaders,
   type EmailMessage,
 } from "../lib/email";
-import { ANNOUNCEMENTS, DAILY_ORG_LIMIT, buildEmailHtml, dailyUsage, unsubscribeUrl } from "../lib/email-campaigns";
+import { ANNOUNCEMENTS, DAILY_ORG_LIMIT, dailyUsage, loadBranding, unsubscribeUrl } from "../lib/email-campaigns";
+import { buildEmailHtml, renderBody } from "../lib/email-layout";
 
 /**
  * Script/agent sending: each message has its own recipient and content. Authenticated by an
@@ -173,7 +174,16 @@ emailMessages.post("/", async (c) => {
   if (outgoing.length) {
     const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
     const orgName = org?.name ?? "Your organization";
-    const from = fromAddress(c.env, orgName);
+    const branding = await loadBranding(db, orgId);
+    const from = fromAddress(c.env, orgName, branding);
+    const html = (m: Message, url: string) =>
+      buildEmailHtml(c.env, {
+        orgName,
+        title: m.subject,
+        bodyHtml: m.html !== undefined ? renderBody(m.html, "html") : renderBody(m.markdown!, "markdown", branding?.headerColor ?? undefined),
+        branding,
+        unsubscribeUrl: url,
+      });
     const batch: EmailMessage[] = await Promise.all(
       outgoing.map(async ({ message: m, userId }) => {
         const url = unsubscribeUrl(c.env, await signUnsubscribeToken(c.env, userId, ANNOUNCEMENTS));
@@ -181,9 +191,9 @@ emailMessages.post("/", async (c) => {
           from,
           to: [m.to],
           subject: m.subject,
-          html: buildEmailHtml(m.html !== undefined ? { orgName, bodyHtml: m.html, unsubscribeUrl: url } : { orgName, bodyMarkdown: m.markdown, unsubscribeUrl: url }),
+          html: html(m, url),
           ...(m.text ? { text: m.text } : {}),
-          replyTo: m.replyTo ?? auth.creatorEmail,
+          replyTo: m.replyTo ?? (branding?.senderEmail ? undefined : auth.creatorEmail),
           headers: unsubscribeHeaders(url),
           tags: [{ name: "campaign", value: campaign.id }],
         };

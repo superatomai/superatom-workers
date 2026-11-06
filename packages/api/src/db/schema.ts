@@ -1204,7 +1204,11 @@ export const emailCampaigns = pgTable(
     // Unsubscribe category, e.g. "announcements" or "usage".
     category: varchar("category", { length: 32 }).notNull().default("announcements"),
     subject: varchar("subject", { length: 255 }).notNull(),
+    // The body as written: markdown, or HTML when bodyFormat is "html".
     bodyMarkdown: text("body_markdown").notNull(),
+    bodyFormat: varchar("body_format", { length: 8 }).notNull().default("markdown"),
+    // Heading in the email's header band; null = the subject.
+    title: varchar("title", { length: 200 }),
     status: varchar("status", { length: 16 }).notNull().default("draft"),
     // EmailSchedule (lib/email-schedule.ts); null = send now. Recurring ones stay "scheduled",
     // scheduledAt is the next run, and each run is a child row (parentId) holding its own sends.
@@ -1236,8 +1240,26 @@ export const emailCampaigns = pgTable(
       "email_campaigns_status_check",
       sql`${table.status} in ('draft', 'scheduled', 'sending', 'sent', 'cancelled', 'failed')`
     ),
+    check("email_campaigns_body_format_check", sql`${table.bodyFormat} in ('markdown', 'html')`),
   ]
 );
+
+// An org's look and sender for its emails (lib/email-layout.ts); no row = the defaults.
+export const emailBranding = pgTable("email_branding", {
+  orgId: uuid("org_id")
+    .primaryKey()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  headerColor: varchar("header_color", { length: 7 }),
+  logoUrl: text("logo_url"),
+  showSuperatomLogo: boolean("show_superatom_logo").notNull().default(true),
+  // Sender: the address must be in the worker's allowed list (EMAIL_FROM + EMAIL_SENDERS).
+  senderName: varchar("sender_name", { length: 100 }),
+  senderEmail: varchar("sender_email", { length: 255 }),
+  whyText: varchar("why_text", { length: 500 }),
+  footerNote: varchar("footer_note", { length: 300 }),
+  updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
 
 export const emailSends = pgTable(
   "email_sends",

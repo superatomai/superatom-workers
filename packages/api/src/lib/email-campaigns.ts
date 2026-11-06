@@ -8,6 +8,7 @@ import {
   appPermissions,
   apps,
   emailAttachments,
+  emailBranding,
   emailCampaigns,
   emailSends,
   emailSubscriptionEvents,
@@ -27,6 +28,7 @@ import {
 } from "./email";
 import { signObjectUrl } from "./r2-objects";
 import { isRecurring, nextRun, parseSchedule } from "./email-schedule";
+import { buildEmailHtml, personalize, renderBody, type BodyFormat, type Branding } from "./email-layout";
 
 export const DAILY_ORG_LIMIT = 2000;
 export const ANNOUNCEMENTS = "announcements";
@@ -170,81 +172,32 @@ export async function dailyUsage(db: Database, orgId: string, excludeCampaignId?
 
 // ─── Rendering ───────────────────────────────────────────
 
-function escapeHtml(str: string): string {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+/** The org's branding row, or null for the defaults. */
+export async function loadBranding(db: Database, orgId: string): Promise<typeof emailBranding.$inferSelect | null> {
+  const [row] = await db.select().from(emailBranding).where(eq(emailBranding.orgId, orgId));
+  return row ?? null;
 }
 
-function inline(html: string): string {
-  return html
-    .replace(
-      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-      '<a href="$2" style="color: #2563eb; text-decoration: underline;">$1</a>'
-    )
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/__(.+?)__/g, "<strong>$1</strong>")
-    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<em>$1</em>")
-    .replace(/`(.+?)`/g, '<code style="background: #f3f4f6; padding: 1px 4px; border-radius: 3px; font-size: 13px;">$1</code>');
-}
-
-/** Same subset as sa-platform-ui's emailMarkdown.ts (plus links), so the preview matches. */
-export function renderMarkdown(md: string): string {
-  const out: string[] = [];
-  let list: "ul" | "ol" | null = null;
-  const closeList = () => {
-    if (list) out.push(`</${list}>`);
-    list = null;
-  };
-  const li = (text: string) =>
-    `<li style="margin: 4px 0; font-size: 14px; color: #374151; line-height: 1.6;">${inline(escapeHtml(text))}</li>`;
-
-  for (const line of md.split("\n")) {
-    const heading = line.match(/^(#{1,3})\s+(.*)/);
-    const bullet = line.match(/^\s*[-*]\s+(.*)/);
-    const numbered = line.match(/^\s*\d+\.\s+(.*)/);
-    if (heading) {
-      closeList();
-      const size = { 1: "18px", 2: "16px", 3: "14px" }[heading[1].length as 1 | 2 | 3];
-      out.push(`<p style="margin: 16px 0 8px 0; font-size: ${size}; font-weight: 700; color: #111827;">${inline(escapeHtml(heading[2]))}</p>`);
-    } else if (bullet || numbered) {
-      const tag = bullet ? "ul" : "ol";
-      if (list !== tag) {
-        closeList();
-        out.push(`<${tag} style="margin: 8px 0; padding-left: 20px;">`);
-        list = tag;
-      }
-      out.push(li((bullet ?? numbered)![1]));
-    } else {
-      closeList();
-      if (line.trim()) {
-        out.push(`<p style="margin: 6px 0; font-size: 14px; color: #374151; line-height: 1.6;">${inline(escapeHtml(line))}</p>`);
-      }
-    }
+/** One recipient's copy of a stored email: placeholders filled, body rendered, wrapped in the org layout. */
+export function renderCampaign(
+  env: Env,
+  p: {
+    orgName: string;
+    branding: Branding | null;
+    campaign: { subject: string; title: string | null; bodyMarkdown: string; bodyFormat: string };
+    recipientName?: string | null;
+    unsubscribeUrl?: string;
   }
-  closeList();
-  return out.join("\n");
-}
-
-/** The part of caller-supplied HTML that goes inside our layout: the <body> contents, keeping <style> blocks. */
-export function htmlFragment(html: string): string {
-  const body = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-  if (!body) return html.replace(/<!doctype[^>]*>|<\/?html[^>]*>|<head[^>]*>[\s\S]*?<\/head>/gi, "");
-  const styles = html.slice(0, body.index).match(/<style[^>]*>[\s\S]*?<\/style>/gi) ?? [];
-  return styles.join("\n") + body[1];
-}
-
-/** Solid colours only: Gmail strips gradient backgrounds. `bodyHtml` (API sends) is used as given. */
-export function buildEmailHtml(p: { orgName: string; bodyMarkdown?: string; bodyHtml?: string; unsubscribeUrl?: string }): string {
-  const org = escapeHtml(p.orgName);
-  const footer = p.unsubscribeUrl
-    ? `You're receiving this because you're a member of ${org} on Superatom.<br><a href="${escapeHtml(p.unsubscribeUrl)}" style="color: #6b7280;">Unsubscribe from announcements</a>`
-    : `You're receiving this because you're a member of ${org} on Superatom.`;
-  return `<!doctype html>
-<html><body style="margin: 0; padding: 0; background-color: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #f3f4f6; padding: 24px 0;"><tr><td align="center">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px;">
-<tr><td style="padding: 20px 28px;">${p.bodyHtml !== undefined ? htmlFragment(p.bodyHtml) : renderMarkdown(p.bodyMarkdown ?? "")}</td></tr>
-<tr><td style="padding: 16px 28px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #6b7280; line-height: 1.5;">${footer}</td></tr>
-</table></td></tr></table></body></html>`;
+): string {
+  const format: BodyFormat = p.campaign.bodyFormat === "html" ? "html" : "markdown";
+  const body = personalize(p.campaign.bodyMarkdown, p.recipientName, format);
+  return buildEmailHtml(env, {
+    orgName: p.orgName,
+    title: p.campaign.title?.trim() || p.campaign.subject,
+    bodyHtml: renderBody(body, format, p.branding?.headerColor ?? undefined),
+    branding: p.branding,
+    unsubscribeUrl: p.unsubscribeUrl,
+  });
 }
 
 /** Public base for unsubscribe links: this worker's own URL. */
@@ -387,17 +340,20 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
     ? await db.select({ email: users.email }).from(users).where(eq(users.id, campaign.createdBy))
     : [];
   const orgName = org?.name ?? "Your organization";
-  const from = fromAddress(env, orgName);
+  const branding = await loadBranding(db, orgId);
+  const from = fromAddress(env, orgName, branding);
+  // An org sender is a no-reply address of its own; otherwise replies reach the author.
+  const replyTo = branding?.senderEmail ? undefined : author?.email;
 
   const files = await attachmentLinks(env, await readyAttachments(db, campaign.parentId ?? campaignId));
-  const buildMessage = async (r: { email: string; userId: string | null }): Promise<EmailMessage> => {
+  const buildMessage = async (r: { email: string; userId: string | null; name: string | null }): Promise<EmailMessage> => {
     const url = r.userId ? unsubscribeUrl(env, await signUnsubscribeToken(env, r.userId, campaign.category)) : undefined;
     return {
       from,
       to: [r.email],
       subject: campaign.subject,
-      html: buildEmailHtml({ orgName, bodyMarkdown: campaign.bodyMarkdown, unsubscribeUrl: url }),
-      replyTo: author?.email,
+      html: renderCampaign(env, { orgName, branding, campaign, recipientName: r.name, unsubscribeUrl: url }),
+      replyTo,
       headers: url ? unsubscribeHeaders(url) : undefined,
       tags: [{ name: "campaign", value: campaignId }],
       ...(files.length ? { attachments: files } : {}),
@@ -415,8 +371,9 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
       return;
     }
     const batch = await db
-      .select({ id: emailSends.id, email: emailSends.email, userId: emailSends.userId })
+      .select({ id: emailSends.id, email: emailSends.email, userId: emailSends.userId, name: users.name })
       .from(emailSends)
+      .leftJoin(users, eq(users.id, emailSends.userId))
       .where(and(eq(emailSends.campaignId, campaignId), eq(emailSends.status, "pending")))
       .orderBy(emailSends.id)
       .limit(files.length ? 25 : RESEND_BATCH_LIMIT);
@@ -505,6 +462,8 @@ async function runRecurring(env: Env, db: Database, campaignId: string, budgetMs
       category: parent.category,
       subject: parent.subject,
       bodyMarkdown: parent.bodyMarkdown,
+      bodyFormat: parent.bodyFormat,
+      title: parent.title,
       status: "scheduled",
       scheduledAt: now,
       createdBy: parent.createdBy,

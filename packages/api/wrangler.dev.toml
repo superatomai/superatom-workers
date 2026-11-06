@@ -74,6 +74,8 @@ INSTALL_USER_UI_URL = "https://dev.live.superatom.ai"
 INSTALL_LLM_PROXY_MODE = "dummy"
 # Sender of org announcement emails; must be on a domain verified in Resend.
 EMAIL_FROM = "alerts@superatom.ai"
+# More From addresses org admins may choose in email branding (same Resend-verified domain).
+EMAIL_SENDERS = "agents@superatom.ai"
 # Private bucket for email attachments (S3 API, like source files). CORS: any origin, PUT/GET.
 EMAIL_ATTACHMENTS_BUCKET_NAME = "sa-email-attachments-dev"
 

@@ -34,7 +34,7 @@ uploadRouter.use("*", authMiddleware, adminOnly);
  * image/png would otherwise be stored and served under a type a browser could
  * sniff its way back out of.
  */
-function matchesMagicBytes(mime: string, bytes: Uint8Array): boolean {
+export function matchesMagicBytes(mime: string, bytes: Uint8Array): boolean {
   const startsWith = (...sig: number[]) =>
     sig.length <= bytes.length && sig.every((b, i) => bytes[i] === b);
 

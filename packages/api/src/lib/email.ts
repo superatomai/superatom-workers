@@ -3,6 +3,7 @@
  * Also signs the one-click unsubscribe links every announcement carries.
  */
 import type { Env } from "../types";
+import { allowedSenders } from "./email-layout";
 
 const RESEND_URL = "https://api.resend.com/emails";
 const RESEND_BATCH_URL = "https://api.resend.com/emails/batch";
@@ -35,10 +36,21 @@ export function isEmailConfigured(env: Env): boolean {
   return Boolean(env.RESEND_API_KEY);
 }
 
-/** The From header: "<name> via Superatom AI <EMAIL_FROM>". */
-export function fromAddress(env: Env, displayName?: string): string {
-  const address = env.EMAIL_FROM || "updates@superatom.ai";
-  const name = (displayName ? `${displayName} via Superatom AI` : "Superatom AI").replace(/["<>]/g, "");
+/**
+ * The From header. Default: "<org> via Superatom AI <EMAIL_FROM>". An org's own sender name and
+ * address are used as given, the address only while it's still in the allowed list.
+ */
+export function fromAddress(
+  env: Env,
+  displayName?: string,
+  sender?: { senderName: string | null; senderEmail: string | null } | null
+): string {
+  const fallback = env.EMAIL_FROM || "updates@superatom.ai";
+  const own = sender?.senderEmail?.trim().toLowerCase();
+  const address = own && allowedSenders(env).includes(own) ? own : fallback;
+  const name = (
+    sender?.senderName?.trim() || (displayName ? `${displayName} via Superatom AI` : "Superatom AI")
+  ).replace(/["<>\r\n]/g, "");
   return `"${name}" <${address}>`;
 }
 

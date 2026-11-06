@@ -80,6 +80,8 @@ export type Env = {
   RESEND_API_KEY?: string;
   // Announcement emails: sending address (a var) and the unsubscribe-link signing key (a secret).
   EMAIL_FROM?: string;
+  /** More From addresses org admins may pick (comma-separated, same verified domain). */
+  EMAIL_SENDERS?: string;
   EMAIL_UNSUBSCRIBE_SECRET?: string;
   /** Private R2 bucket for email attachments, reached through the S3 API like source files. */
   EMAIL_ATTACHMENTS_BUCKET_NAME?: string;
