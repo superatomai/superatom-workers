@@ -3,7 +3,7 @@
  * Also signs the one-click unsubscribe links every announcement carries.
  */
 import type { Env } from "../types";
-import { allowedSenders } from "./email-layout";
+import { senderAllowed } from "./email-layout";
 
 const RESEND_URL = "https://api.resend.com/emails";
 const RESEND_BATCH_URL = "https://api.resend.com/emails/batch";
@@ -43,24 +43,25 @@ export function isEmailConfigured(env: Env): boolean {
 export function fromAddress(
   env: Env,
   displayName?: string,
-  sender?: { senderName: string | null; senderEmail: string | null } | null
+  sender?: { senderName: string | null; senderEmail: string | null; resendKeyEnc?: string | null; senderDomains?: unknown } | null
 ): string {
   const fallback = env.EMAIL_FROM || "updates@superatom.ai";
   const own = sender?.senderEmail?.trim().toLowerCase();
-  const address = own && allowedSenders(env).includes(own) ? own : fallback;
+  const address = own && senderAllowed(env, own, sender) ? own : fallback;
   const name = (
     sender?.senderName?.trim() || (displayName ? `${displayName} via Superatom AI` : "Superatom AI")
   ).replace(/["<>\r\n]/g, "");
   return `"${name}" <${address}>`;
 }
 
-export async function sendEmail(env: Env, message: EmailMessage, idempotencyKey?: string): Promise<SendResult> {
+/** `apiKey` = an org's own Resend key; default the platform's. */
+export async function sendEmail(env: Env, message: EmailMessage, idempotencyKey?: string, apiKey?: string): Promise<SendResult> {
   if (!message.to.length) return { success: false, error: "No recipients specified" };
-  return post(env, RESEND_URL, toResend(message), idempotencyKey);
+  return post(env, RESEND_URL, toResend(message), idempotencyKey, apiKey);
 }
 
 /** One Resend call for up to 100 messages; all-or-nothing on Resend's side. */
-export async function sendEmailBatch(env: Env, messages: EmailMessage[], idempotencyKey?: string): Promise<SendResult> {
+export async function sendEmailBatch(env: Env, messages: EmailMessage[], idempotencyKey?: string, apiKey?: string): Promise<SendResult> {
   if (!messages.length) return { success: true, ids: [] };
   if (messages.some((m) => m.attachments?.length)) {
     return { success: false, error: "Resend batch sends don't support attachments" };
@@ -68,7 +69,7 @@ export async function sendEmailBatch(env: Env, messages: EmailMessage[], idempot
   if (messages.length > RESEND_BATCH_LIMIT) {
     return { success: false, error: `Batch exceeds ${RESEND_BATCH_LIMIT} messages` };
   }
-  return post(env, RESEND_BATCH_URL, messages.map(toResend), idempotencyKey);
+  return post(env, RESEND_BATCH_URL, messages.map(toResend), idempotencyKey, apiKey);
 }
 
 function toResend(m: EmailMessage) {
@@ -86,12 +87,13 @@ function toResend(m: EmailMessage) {
 }
 
 /** POST to Resend, retrying 429 and 5xx with backoff. Idempotency-Key makes the retries safe. */
-async function post(env: Env, url: string, payload: unknown, idempotencyKey?: string): Promise<SendResult> {
-  if (!env.RESEND_API_KEY) {
+async function post(env: Env, url: string, payload: unknown, idempotencyKey?: string, apiKey?: string): Promise<SendResult> {
+  const key = apiKey ?? env.RESEND_API_KEY;
+  if (!key) {
     return { success: false, notConfigured: true, error: "RESEND_API_KEY not configured" };
   }
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${env.RESEND_API_KEY}`,
+    Authorization: `Bearer ${key}`,
     "Content-Type": "application/json",
   };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;

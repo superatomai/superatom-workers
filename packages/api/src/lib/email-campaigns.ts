@@ -29,6 +29,7 @@ import {
 import { signObjectUrl } from "./r2-objects";
 import { isRecurring, nextRun, parseSchedule } from "./email-schedule";
 import { buildEmailHtml, personalize, renderBody, type BodyFormat, type Branding } from "./email-layout";
+import { orgResendKey } from "./email-keys";
 
 export const DAILY_ORG_LIMIT = 2000;
 export const ANNOUNCEMENTS = "announcements";
@@ -296,7 +297,10 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
 
   const fail = (error: string) =>
     db.update(emailCampaigns).set({ status: "failed", error, updatedAt: new Date() }).where(eq(emailCampaigns.id, campaignId));
-  if (!env.RESEND_API_KEY || !env.EMAIL_UNSUBSCRIBE_SECRET) {
+  const branding = await loadBranding(db, orgId);
+  const key = await orgResendKey(env, branding);
+  if (!key.ok) return void (await fail(key.error));
+  if (!key.apiKey || !env.EMAIL_UNSUBSCRIBE_SECRET) {
     return void (await fail("Email sending is not configured (RESEND_API_KEY / EMAIL_UNSUBSCRIBE_SECRET)"));
   }
 
@@ -340,7 +344,6 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
     ? await db.select({ email: users.email }).from(users).where(eq(users.id, campaign.createdBy))
     : [];
   const orgName = org?.name ?? "Your organization";
-  const branding = await loadBranding(db, orgId);
   const from = fromAddress(env, orgName, branding);
   // An org sender is a no-reply address of its own; otherwise replies reach the author.
   const replyTo = branding?.senderEmail ? undefined : author?.email;
@@ -382,13 +385,13 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
     const results: Array<{ id: string; resendId?: string; error?: string }> = [];
     if (!files.length) {
       const messages = await Promise.all(batch.map(buildMessage));
-      const result = await sendEmailBatch(env, messages, `campaign-${campaignId}-${await digest(batch.map((r) => r.id).join(","))}`);
+      const result = await sendEmailBatch(env, messages, `campaign-${campaignId}-${await digest(batch.map((r) => r.id).join(","))}`, key.apiKey);
       batch.forEach((r, i) =>
         results.push(result.success ? { id: r.id, resendId: result.ids?.[i] } : { id: r.id, error: result.error ?? "Send failed" })
       );
     } else {
       for (const r of batch) {
-        const result = await sendEmail(env, await buildMessage(r), `campaign-${campaignId}-${r.id}`);
+        const result = await sendEmail(env, await buildMessage(r), `campaign-${campaignId}-${r.id}`, key.apiKey);
         results.push(result.success ? { id: r.id, resendId: result.ids?.[0] } : { id: r.id, error: result.error ?? "Send failed" });
         await sleep(SINGLE_SEND_INTERVAL_MS);
       }

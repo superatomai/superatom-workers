@@ -6,7 +6,8 @@ import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
 import { checkObject, deleteObject, signObjectUrl } from "../lib/r2-objects";
-import { fromAddress, isEmailConfigured, sendEmail } from "../lib/email";
+import { fromAddress, sendEmail } from "../lib/email";
+import { RESEND_KEY_FORMAT, checkResendKey, encryptKey, orgResendKey } from "../lib/email-keys";
 import {
   ANNOUNCEMENTS,
   DAILY_ORG_LIMIT,
@@ -24,7 +25,7 @@ import {
 } from "../lib/email-campaigns";
 import { isRecurring, nextRun, parseSchedule, type EmailSchedule } from "../lib/email-schedule";
 import { generateEmailApiKey, hashEmailApiKey } from "../lib/email-api-keys";
-import { DEFAULT_BRANDING, HEX_COLOR, allowedSenders, superatomLogoUrl, type BodyFormat, type Branding } from "../lib/email-layout";
+import { DEFAULT_BRANDING, HEX_COLOR, allowedSenders, senderAllowed, superatomLogoUrl, type BodyFormat, type Branding } from "../lib/email-layout";
 import { matchesMagicBytes } from "./upload";
 
 /**
@@ -127,6 +128,12 @@ async function checkLimit(
   return { ok: true as const, count };
 }
 
+/** A key to send with: the org's own (that decrypts) or the platform's. */
+async function orgCanSend(c: AppContext, orgId: string): Promise<boolean> {
+  const key = await orgResendKey(c.env, await loadBranding(c.get("db"), orgId));
+  return key.ok && Boolean(key.apiKey);
+}
+
 /** GET /orgs/:orgId/emails — campaigns, newest first; a recurring email's runs are nested under it. */
 emails.get("/", async (c) => {
   const orgId = c.req.param("orgId")!;
@@ -161,7 +168,7 @@ emails.get("/usage", async (c) => {
   return c.json({
     used: await dailyUsage(c.get("db"), orgId),
     limit: DAILY_ORG_LIMIT,
-    configured: isEmailConfigured(c.env),
+    configured: await orgCanSend(c, orgId),
   });
 });
 
@@ -220,23 +227,49 @@ emails.put("/subscribers/:userId", async (c) => {
 
 const EMAIL = /^[^\s@<>",]+@[^\s@<>",]+\.[^\s@<>",]+$/;
 
-/** GET /orgs/:orgId/emails/branding — the org's look and sender, plus the addresses it may pick. */
+type BrandingRow = typeof emailBranding.$inferSelect;
+type KeyFields = Pick<BrandingRow, "resendKeyEnc" | "senderDomains">;
+
+/** What the UI sees: never the key itself, only its last 4 characters and the account's domains. */
+function brandingView(env: Env, orgId: string, row: BrandingRow | null) {
+  const r = row ?? { ...DEFAULT_BRANDING, orgId, resendKeyEnc: null, resendKeyLast4: null, senderDomains: null, updatedBy: null, updatedAt: null };
+  const { orgId: _o, updatedBy: _u, resendKeyEnc, resendKeyLast4, senderDomains, ...branding } = r;
+  return {
+    ...branding,
+    resendKey: resendKeyEnc ? { last4: resendKeyLast4, domains: Array.isArray(senderDomains) ? (senderDomains as string[]) : null } : null,
+    allowedSenders: resendKeyEnc ? [] : allowedSenders(env),
+    superatomLogo: { onDark: superatomLogoUrl(env, true), onLight: superatomLogoUrl(env, false) },
+  };
+}
+
+/** GET /orgs/:orgId/emails/branding — the org's look, sender and Resend account; refreshes that account's domains. */
 emails.get("/branding", async (c) => {
   const orgId = c.req.param("orgId")!;
-  const row = await loadBranding(c.get("db"), orgId);
-  const { orgId: _o, updatedBy: _u, updatedAt, ...branding } = row ?? { ...DEFAULT_BRANDING, orgId, updatedBy: null, updatedAt: null };
-  return c.json({
-    ...branding,
-    updatedAt,
-    allowedSenders: allowedSenders(c.env),
-    superatomLogo: { onDark: superatomLogoUrl(c.env, true), onLight: superatomLogoUrl(c.env, false) },
-  });
+  const db = c.get("db");
+  let row = await loadBranding(db, orgId);
+  if (row?.resendKeyEnc) {
+    // Domains verified since the key was saved show up here; a failed check keeps the stored list.
+    const key = await orgResendKey(c.env, row);
+    const check = key.ok && key.apiKey ? await checkResendKey(key.apiKey) : null;
+    if (check?.ok && JSON.stringify(check.domains) !== JSON.stringify(row.senderDomains)) {
+      [row] = await db.update(emailBranding).set({ senderDomains: check.domains }).where(eq(emailBranding.orgId, orgId)).returning();
+    }
+  }
+  return c.json(brandingView(c.env, orgId, row));
 });
 
 type BrandingBody = Partial<Record<"headerColor" | "logoUrl" | "senderName" | "senderEmail" | "whyText" | "footerNote" | "showSuperatomLogo", unknown>>;
 
-/** Validates a whole branding setting; empty strings clear a field. */
-export function readBranding(env: Env, b: BrandingBody): { ok: true; value: Branding } | { ok: false; error: string } {
+/** Which addresses a sender may be, for the error message. */
+function senderRule(env: Env, key?: KeyFields | null): string {
+  if (!key?.resendKeyEnc) return `one of: ${allowedSenders(env).join(", ")}`;
+  const domains = Array.isArray(key.senderDomains) ? (key.senderDomains as string[]) : null;
+  if (!domains) return "an address on a domain verified in your Resend account";
+  return domains.length ? `an address @${domains.join(", @")}` : "an address on a verified domain (your Resend account has none yet)";
+}
+
+/** Validates a whole branding setting; empty strings clear a field. `key` = the org's own Resend account, if any. */
+export function readBranding(env: Env, b: BrandingBody, key?: KeyFields | null): { ok: true; value: Branding } | { ok: false; error: string } {
   const fields: Record<string, string | null> = {};
   const limits = { headerColor: 7, logoUrl: 2000, senderName: 100, senderEmail: 255, whyText: 500, footerNote: 300 } as const;
   for (const [field, max] of Object.entries(limits)) {
@@ -252,8 +285,8 @@ export function readBranding(env: Env, b: BrandingBody): { ok: true; value: Bran
   if (f.senderName && /["<>\r\n]/.test(f.senderName)) return { ok: false, error: "senderName can't contain quotes, < or >" };
   if (f.senderEmail) {
     f.senderEmail = f.senderEmail.toLowerCase();
-    if (!EMAIL.test(f.senderEmail) || !allowedSenders(env).includes(f.senderEmail)) {
-      return { ok: false, error: `senderEmail must be one of: ${allowedSenders(env).join(", ")}` };
+    if (!EMAIL.test(f.senderEmail) || !senderAllowed(env, f.senderEmail, key)) {
+      return { ok: false, error: `senderEmail must be ${senderRule(env, key)}` };
     }
   }
   if (b.showSuperatomLogo !== undefined && typeof b.showSuperatomLogo !== "boolean") {
@@ -262,19 +295,69 @@ export function readBranding(env: Env, b: BrandingBody): { ok: true; value: Bran
   return { ok: true, value: { ...f, headerColor: f.headerColor?.toLowerCase() ?? null, showSuperatomLogo: b.showSuperatomLogo !== false } };
 }
 
-/** PUT /orgs/:orgId/emails/branding — replace the whole setting. */
+/** PUT /orgs/:orgId/emails/branding — replace the whole setting (the Resend key has its own route). */
 emails.put("/branding", async (c) => {
   const orgId = c.req.param("orgId")!;
-  const parsed = readBranding(c.env, await c.req.json<BrandingBody>().catch(() => ({}) as BrandingBody));
+  const db = c.get("db");
+  const current = await loadBranding(db, orgId);
+  const parsed = readBranding(c.env, await c.req.json<BrandingBody>().catch(() => ({}) as BrandingBody), current);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const values = { ...parsed.value, updatedBy: c.get("userId"), updatedAt: new Date() };
-  const [row] = await c
-    .get("db")
+  const [row] = await db
     .insert(emailBranding)
     .values({ orgId, ...values })
     .onConflictDoUpdate({ target: emailBranding.orgId, set: values })
     .returning();
-  return c.json(row);
+  return c.json(brandingView(c.env, orgId, row));
+});
+
+/**
+ * PUT /orgs/:orgId/emails/branding/resend-key { apiKey } — send this org's emails through its own Resend
+ * account. Checked with Resend first; a sender address that account can't use is cleared.
+ */
+emails.put("/branding/resend-key", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const { apiKey } = await c.req.json<{ apiKey?: unknown }>().catch(() => ({}) as { apiKey?: unknown });
+  if (typeof apiKey !== "string" || !RESEND_KEY_FORMAT.test(apiKey.trim())) {
+    return c.json({ error: "That doesn't look like a Resend API key (they start with re_)" }, 400);
+  }
+  if (!c.env.EMAIL_KEYS_SECRET) return c.json({ error: "Storing organization keys is not configured on this server" }, 503);
+  const check = await checkResendKey(apiKey.trim());
+  if (!check.ok) return c.json({ error: check.error }, 400);
+  const db = c.get("db");
+  const current = await loadBranding(db, orgId);
+  const keyFields = { resendKeyEnc: await encryptKey(c.env, apiKey.trim()), resendKeyLast4: apiKey.trim().slice(-4), senderDomains: check.domains };
+  const sender = current?.senderEmail;
+  const senderCleared = Boolean(sender && !senderAllowed(c.env, sender, keyFields));
+  const values = { ...keyFields, ...(senderCleared ? { senderEmail: null } : {}), updatedBy: c.get("userId"), updatedAt: new Date() };
+  const [row] = await db
+    .insert(emailBranding)
+    .values({ orgId, ...values })
+    .onConflictDoUpdate({ target: emailBranding.orgId, set: values })
+    .returning();
+  return c.json({ ...brandingView(c.env, orgId, row), senderCleared });
+});
+
+/** DELETE /orgs/:orgId/emails/branding/resend-key — back to the platform account; an own-domain sender is cleared. */
+emails.delete("/branding/resend-key", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const db = c.get("db");
+  const current = await loadBranding(db, orgId);
+  if (!current?.resendKeyEnc) return c.json(brandingView(c.env, orgId, current));
+  const senderCleared = Boolean(current.senderEmail && !senderAllowed(c.env, current.senderEmail, null));
+  const [row] = await db
+    .update(emailBranding)
+    .set({
+      resendKeyEnc: null,
+      resendKeyLast4: null,
+      senderDomains: null,
+      ...(senderCleared ? { senderEmail: null } : {}),
+      updatedBy: c.get("userId"),
+      updatedAt: new Date(),
+    })
+    .where(eq(emailBranding.orgId, orgId))
+    .returning();
+  return c.json({ ...brandingView(c.env, orgId, row), senderCleared });
 });
 
 /** POST /orgs/:orgId/emails/branding/logo (body = the image, Content-Type its type) — public assets bucket; returns its URL. */
@@ -302,19 +385,20 @@ emails.post("/branding/logo", async (c) => {
 emails.post("/preview", async (c) => {
   const orgId = c.req.param("orgId")!;
   const body = await c.req.json<Body & { branding?: BrandingBody }>().catch(() => ({}) as Body & { branding?: BrandingBody });
+  const db = c.get("db");
+  const saved = await loadBranding(db, orgId);
   let override: Branding | undefined;
   if (body.branding !== undefined) {
-    const parsed = readBranding(c.env, body.branding ?? {});
+    const parsed = readBranding(c.env, body.branding ?? {}, saved);
     if (!parsed.ok) return c.json({ error: parsed.error }, 400);
     override = parsed.value;
   }
   if (typeof body.bodyMarkdown !== "string" || body.bodyMarkdown.length > MAX_BODY) return c.json({ error: "bodyMarkdown is required" }, 400);
-  const db = c.get("db");
   const [me] = await db.select({ name: users.name }).from(users).where(eq(users.id, c.get("userId")));
   const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
   const html = renderCampaign(c.env, {
     orgName: org?.name ?? "Your organization",
-    branding: override ?? (await loadBranding(db, orgId)),
+    branding: override ?? saved,
     campaign: {
       subject: typeof body.subject === "string" ? body.subject : "",
       title: typeof body.title === "string" ? body.title : null,
@@ -476,13 +560,20 @@ emails.post("/:id/test", async (c) => {
   const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
   const orgName = org?.name ?? "Your organization";
   const branding = await loadBranding(db, orgId);
-  const result = await sendEmail(c.env, {
-    from: fromAddress(c.env, orgName, branding),
-    to: [me.email],
-    subject: `[Test] ${campaign.subject}`,
-    html: renderCampaign(c.env, { orgName, branding, campaign, recipientName: me.name }),
-    attachments: await attachmentLinks(c.env, await readyAttachments(db, campaign.parentId ?? campaign.id)),
-  });
+  const key = await orgResendKey(c.env, branding);
+  if (!key.ok) return c.json({ error: key.error }, 503);
+  const result = await sendEmail(
+    c.env,
+    {
+      from: fromAddress(c.env, orgName, branding),
+      to: [me.email],
+      subject: `[Test] ${campaign.subject}`,
+      html: renderCampaign(c.env, { orgName, branding, campaign, recipientName: me.name }),
+      attachments: await attachmentLinks(c.env, await readyAttachments(db, campaign.parentId ?? campaign.id)),
+    },
+    undefined,
+    key.apiKey
+  );
   if (!result.success) return c.json({ error: result.error }, result.notConfigured ? 503 : 502);
   return c.json({ message: `Test sent to ${me.email}` });
 });
@@ -495,7 +586,7 @@ emails.post("/:id/send", async (c) => {
   if (campaign.status !== "draft" && campaign.status !== "scheduled") {
     return c.json({ error: `A ${campaign.status} email can't be sent` }, 409);
   }
-  if (!isEmailConfigured(c.env)) return c.json({ error: "Email sending is not configured" }, 503);
+  if (!(await orgCanSend(c, orgId))) return c.json({ error: "Email sending is not configured" }, 503);
   const limit = await checkLimit(c, orgId, campaign);
   if (!limit.ok) return c.json({ error: limit.error }, 400);
 

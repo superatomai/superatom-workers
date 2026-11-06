@@ -6,7 +6,6 @@ import { authenticateEmailKey } from "../lib/email-api-keys";
 import {
   RESEND_BATCH_LIMIT,
   fromAddress,
-  isEmailConfigured,
   sendEmailBatch,
   signUnsubscribeToken,
   unsubscribeHeaders,
@@ -14,6 +13,7 @@ import {
 } from "../lib/email";
 import { ANNOUNCEMENTS, DAILY_ORG_LIMIT, dailyUsage, loadBranding, unsubscribeUrl } from "../lib/email-campaigns";
 import { buildEmailHtml, renderBody } from "../lib/email-layout";
+import { orgResendKey } from "../lib/email-keys";
 
 /**
  * Script/agent sending: each message has its own recipient and content. Authenticated by an
@@ -91,7 +91,10 @@ emailMessages.post("/", async (c) => {
     messages.push(m);
   });
   if (errors.length) return c.json({ error: "Some messages are invalid; nothing was sent", errors }, 400);
-  if (!isEmailConfigured(c.env) || !c.env.EMAIL_UNSUBSCRIBE_SECRET) {
+  const branding = await loadBranding(db, orgId);
+  const key = await orgResendKey(c.env, branding);
+  if (!key.ok) return c.json({ error: key.error }, 503);
+  if (!key.apiKey || !c.env.EMAIL_UNSUBSCRIBE_SECRET) {
     return c.json({ error: "Email sending is not configured" }, 503);
   }
 
@@ -174,7 +177,6 @@ emailMessages.post("/", async (c) => {
   if (outgoing.length) {
     const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
     const orgName = org?.name ?? "Your organization";
-    const branding = await loadBranding(db, orgId);
     const from = fromAddress(c.env, orgName, branding);
     const html = (m: Message, url: string) =>
       buildEmailHtml(c.env, {
@@ -199,7 +201,7 @@ emailMessages.post("/", async (c) => {
         };
       })
     );
-    const sent = await sendEmailBatch(c.env, batch, `api-${campaign.id}`);
+    const sent = await sendEmailBatch(c.env, batch, `api-${campaign.id}`, key.apiKey);
     outgoing.forEach((o, i) =>
       results.push(
         sent.success

@@ -197,6 +197,23 @@ ${note}
 </table></body></html>`;
 }
 
+/**
+ * Whether an org may send from `email`. With its own Resend key: any address on a domain verified
+ * in that account (any address while the domains are unknown). Otherwise the platform list.
+ */
+export function senderAllowed(
+  env: Pick<Env, "EMAIL_FROM" | "EMAIL_SENDERS">,
+  email: string,
+  key?: { resendKeyEnc?: string | null; senderDomains?: unknown } | null
+): boolean {
+  const address = email.trim().toLowerCase();
+  if (key?.resendKeyEnc) {
+    const domains = Array.isArray(key.senderDomains) ? (key.senderDomains as string[]) : null;
+    return domains === null || domains.includes(address.split("@")[1] ?? "");
+  }
+  return allowedSenders(env).includes(address);
+}
+
 /** Addresses this worker may send from: EMAIL_FROM plus the comma-separated EMAIL_SENDERS. */
 export function allowedSenders(env: Pick<Env, "EMAIL_FROM" | "EMAIL_SENDERS">): string[] {
   const list = [env.EMAIL_FROM || "updates@superatom.ai", ...(env.EMAIL_SENDERS ?? "").split(",")];

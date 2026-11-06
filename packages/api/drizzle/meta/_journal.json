@@ -225,6 +225,13 @@
       "when": 1793974595651,
       "tag": "0031_email_branding",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1793976709354,
+      "tag": "0032_email_org_resend_key",
+      "breakpoints": true
     }
   ]
 }

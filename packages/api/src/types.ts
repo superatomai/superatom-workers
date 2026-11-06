@@ -82,6 +82,8 @@ export type Env = {
   EMAIL_FROM?: string;
   /** More From addresses org admins may pick (comma-separated, same verified domain). */
   EMAIL_SENDERS?: string;
+  /** Encrypts orgs' own Resend keys at rest (lib/email-keys.ts). */
+  EMAIL_KEYS_SECRET?: string;
   EMAIL_UNSUBSCRIBE_SECRET?: string;
   /** Private R2 bucket for email attachments, reached through the S3 API like source files. */
   EMAIL_ATTACHMENTS_BUCKET_NAME?: string;

@@ -1257,6 +1257,11 @@ export const emailBranding = pgTable("email_branding", {
   senderEmail: varchar("sender_email", { length: 255 }),
   whyText: varchar("why_text", { length: 500 }),
   footerNote: varchar("footer_note", { length: 300 }),
+  // The org's own Resend key (encrypted, lib/email-keys.ts): its emails are sent and billed there.
+  resendKeyEnc: text("resend_key_enc"),
+  resendKeyLast4: varchar("resend_key_last4", { length: 4 }),
+  // Domains verified in that account; null = unknown (a sending-only key can't list them).
+  senderDomains: jsonb("sender_domains"),
   updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
