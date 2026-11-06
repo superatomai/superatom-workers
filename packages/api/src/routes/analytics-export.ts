@@ -3,7 +3,7 @@ import { eq, and, sql, desc, gt, gte, lte, count } from "drizzle-orm";
 import { chatAnalytics, organizations, projects, users } from "../db/schema";
 import { typeCondition, statusCondition, attachmentNamesSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
 
 const analyticsExportRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -22,7 +22,7 @@ const analyticsExportRouter = new Hono<{ Bindings: Env; Variables: AppVariables 
  */
 analyticsExportRouter.get("/", authMiddleware, adminOnly, async (c) => {
   const db = c.get("db");
-  const orgId = c.req.query("orgId") || c.get("orgId");
+  const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
   const userId = c.req.query("userId");
   const status = c.req.query("status");

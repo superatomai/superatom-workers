@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { and, desc, eq, gte, lte } from "drizzle-orm";
 import { checklistRuns } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
 import { parseChecklistReportBody, storeChecklistReport } from "../lib/checklist-reports";
 
 const checklistReportsRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -42,7 +42,7 @@ checklistReportsRouter.post("/checklist-reports", async (c) => {
 checklistReportsRouter.get("/checklist-reports", authMiddleware, adminOnly, async (c) => {
   const db = c.get("db");
   const checklistId = c.req.query("checklistId");
-  const orgId = c.req.query("orgId") || c.get("orgId");
+  const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
   const status = c.req.query("status");
   const from = c.req.query("from");

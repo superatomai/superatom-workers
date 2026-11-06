@@ -3,7 +3,7 @@ import { eq, and, sql, desc, gt, gte, lte, count, sum, avg, getTableColumns } fr
 import { chatAnalytics } from "../db/schema";
 import { typeCondition, statusCondition, attachmentCountSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
 
 const analyticsRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -119,7 +119,7 @@ analyticsRouter.patch("/analytics/chat/:id/feedback", async (c) => {
  */
 analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
   const db = c.get("db");
-  const orgId = c.req.query("orgId") || c.get("orgId");
+  const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
   const userId = c.req.query("userId");
   const status = c.req.query("status");
@@ -165,7 +165,7 @@ analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
 // so both routes filter identically without duplicating the condition-building.
 function parseScopeParams(c: any) {
   const type = c.req.query("type") || "chat_agent";
-  const orgId = c.req.query("orgId") || c.get("orgId");
+  const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
   const from = c.req.query("from");
   const to = c.req.query("to");
@@ -320,14 +320,13 @@ analyticsRouter.get("/analytics/chat/trends", authMiddleware, adminOnly, async (
  * chat debug detail view (admin only). Registered after the more specific
  * /summary and /trends paths above so those literal segments are never
  * shadowed by this parametric route. Scoped by org the same way GET
- * /analytics/chat is — `orgId` query param if provided (super admins), else
- * the caller's own org — so a non-super-admin can't fetch another org's
- * event by guessing its id.
+ * /analytics/chat is (scopedOrgId: only super admins may pass `orgId`), so a
+ * non-super-admin can't fetch another org's event by guessing its id.
  */
 analyticsRouter.get("/analytics/chat/:id", authMiddleware, adminOnly, async (c) => {
   const db = c.get("db");
   const id = c.req.param("id");
-  const orgId = c.req.query("orgId") || c.get("orgId");
+  const orgId = scopedOrgId(c);
 
   const conditions = [eq(chatAnalytics.id, id)];
   if (orgId) conditions.push(eq(chatAnalytics.orgId, orgId));

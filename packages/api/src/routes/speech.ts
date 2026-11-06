@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { eq, and, sql, desc, gte, lte, count, sum, avg } from "drizzle-orm";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
 import { speechUsage } from "../db/schema";
 
 const speechRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -102,7 +102,7 @@ speechRouter.post("/transcribe", async (c) => {
 
 // Shared by /usage, /usage/summary, /usage/trends — same org/project/user/date scoping.
 function parseUsageScopeParams(c: any) {
-  const orgId = c.req.query("orgId") || c.get("orgId");
+  const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
   const userId = c.req.query("userId");
   const from = c.req.query("from");
