@@ -1,6 +1,7 @@
 import { Hono } from "hono";
-import { eq, and, sql, desc, gte, lte, count, sum, avg } from "drizzle-orm";
+import { eq, and, sql, desc, gt, gte, lte, count, sum, avg, getTableColumns } from "drizzle-orm";
 import { chatAnalytics } from "../db/schema";
+import { typeCondition, statusCondition, attachmentCountSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly } from "../middleware/auth";
 
@@ -118,7 +119,6 @@ analyticsRouter.patch("/analytics/chat/:id/feedback", async (c) => {
  */
 analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
   const db = c.get("db");
-  const type = c.req.query("type") || "chat_agent";
   const orgId = c.req.query("orgId") || c.get("orgId");
   const projectId = c.req.query("projectId");
   const userId = c.req.query("userId");
@@ -127,20 +127,31 @@ analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
   const to = c.req.query("to");
   const limit = Math.min(Number(c.req.query("limit") || 50), 200);
   const offset = Number(c.req.query("offset") || 0);
+  // Only runs slower than this (milliseconds). Unset / invalid / 0 = no filter.
+  const minLatencyMs = Number(c.req.query("minLatencyMs"));
 
   const conditions = [];
-  if (type !== "all") conditions.push(eq(chatAnalytics.type, type as "chat_agent" | "dashboard" | "report"));
+  if (Number.isFinite(minLatencyMs) && minLatencyMs > 0) conditions.push(gt(chatAnalytics.latencyMs, minLatencyMs));
+  const typeCond = typeCondition(c.req.query("type"));
+  if (typeCond) conditions.push(typeCond);
   if (orgId) conditions.push(eq(chatAnalytics.orgId, orgId));
   if (projectId) conditions.push(eq(chatAnalytics.projectId, projectId));
   if (userId) conditions.push(eq(chatAnalytics.userId, userId));
-  if (status && status !== "all") conditions.push(eq(chatAnalytics.status, status as "success" | "error" | "aborted"));
+  const statusCond = statusCondition(status);
+  if (statusCond) conditions.push(statusCond);
   if (from) conditions.push(gte(chatAnalytics.createdAt, new Date(from)));
   if (to) conditions.push(lte(chatAnalytics.createdAt, new Date(to)));
 
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
   const events = await db
-    .select()
+    .select({
+      ...getTableColumns(chatAnalytics),
+      // Ready chat attachments uploaded for THIS question: on its thread, after the previous
+      // question on that thread and up to this one (0 when none, or no thread). A thread can hold
+      // several uploads — e.g. the same question re-asked after deleting the earlier one.
+      attachmentCount: attachmentCountSql,
+    })
     .from(chatAnalytics)
     .where(where)
     .orderBy(desc(chatAnalytics.createdAt))

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
-import { answerFeedback } from "../db/schema";
+import { eq, and, sql } from "drizzle-orm";
+import { answerFeedback, chatAnalytics } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 
 const answerFeedbackRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -86,6 +87,27 @@ answerFeedbackRouter.post("/", async (c) => {
       } as any,
     })
     .returning();
+
+  // Mirror the verdict onto the event row so the analytics list/export can show
+  // it without joining answer_feedback on every read. The event is found the same
+  // way the feedback is keyed: same user, and the event's saved response id is the
+  // feedback's uiBlockId. Best-effort — must never fail the feedback write itself.
+  if (payload.userId) {
+    try {
+      await db
+        .update(chatAnalytics)
+        .set({ feedback: status ?? (payload.feedbackText ? "comment" : null) })
+        .where(
+          and(
+            sql`${chatAnalytics.userId}::text = ${payload.userId}`,
+            sql`${chatAnalytics.response}->>'id' = ${payload.uiBlockId}`,
+            eq(chatAnalytics.type, "chat_agent"),
+          ),
+        );
+    } catch (err) {
+      console.error("[answer-feedback] failed to mirror feedback onto chat_analytics:", err);
+    }
+  }
 
   // Format timestamp to ISO string to preserve timezone info
   const formattedInserted = {

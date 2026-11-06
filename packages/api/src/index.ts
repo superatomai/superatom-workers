@@ -23,6 +23,7 @@ import sourceUploadRoutes from "./routes/source-upload";
 import chatAttachmentUploadRoutes from "./routes/chat-attachment-upload";
 import filesRoutes from "./routes/files";
 import analyticsRoutes from "./routes/analytics";
+import analyticsExportRoutes from "./routes/analytics-export";
 import speechRoutes from "./routes/speech";
 import answerFeedbackRoutes from "./routes/answer-feedback";
 import feedbackRoutes from "./routes/product-feedback";
@@ -154,6 +155,7 @@ app.route("/projects/:projectId/programs", programsRoutes); // program catalogue
 app.route("/", appsRoutes); // handles /projects/:projectId/apps and /apps/:appId
 app.route("/answer-feedback", answerFeedbackRoutes); // feedback 1: server-to-server (service token auth)
 app.route("/feedback", feedbackRoutes); // feedback 2: product feedback (public + superadmin list)
+app.route("/analytics/export", analyticsExportRoutes); // lean rows for the Excel export (admins only)
 app.route("/", analyticsRoutes); // handles /analytics/chat
 app.route("/", checklistReportsRoutes); // handles /checklist-reports
 app.route("/speech", speechRoutes);
