@@ -28,7 +28,7 @@ import {
 } from "./email";
 import { signObjectUrl } from "./r2-objects";
 import { isRecurring, nextRun, parseSchedule } from "./email-schedule";
-import { buildEmailHtml, personalize, renderBody, type BodyFormat, type Branding } from "./email-layout";
+import { buildEmailHtml, type Branding } from "./email-layout";
 import { orgResendKey } from "./email-keys";
 
 export const DAILY_ORG_LIMIT = 2000;
@@ -180,23 +180,19 @@ export async function loadBranding(db: Database, orgId: string): Promise<typeof 
 }
 
 /** One recipient's copy of a stored email: placeholders filled, body rendered, wrapped in the org layout. */
-export function renderCampaign(
-  env: Env,
-  p: {
-    orgName: string;
-    branding: Branding | null;
-    campaign: { subject: string; title: string | null; bodyMarkdown: string; bodyFormat: string };
-    recipientName?: string | null;
-    unsubscribeUrl?: string;
-  }
-): string {
-  const format: BodyFormat = p.campaign.bodyFormat === "html" ? "html" : "markdown";
-  const body = personalize(p.campaign.bodyMarkdown, p.recipientName, format);
-  return buildEmailHtml(env, {
+export function renderCampaign(p: {
+  orgName: string;
+  branding: Branding | null;
+  campaign: { bodyMarkdown: string; bodyFormat: string };
+  recipientName?: string | null;
+  unsubscribeUrl?: string;
+}): string {
+  return buildEmailHtml({
     orgName: p.orgName,
-    title: p.campaign.title?.trim() || p.campaign.subject,
-    bodyHtml: renderBody(body, format, p.branding?.headerColor ?? undefined),
+    body: p.campaign.bodyMarkdown,
+    format: p.campaign.bodyFormat === "html" ? "html" : "markdown",
     branding: p.branding,
+    recipientName: p.recipientName,
     unsubscribeUrl: p.unsubscribeUrl,
   });
 }
@@ -355,7 +351,7 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
       from,
       to: [r.email],
       subject: campaign.subject,
-      html: renderCampaign(env, { orgName, branding, campaign, recipientName: r.name, unsubscribeUrl: url }),
+      html: renderCampaign({ orgName, branding, campaign, recipientName: r.name, unsubscribeUrl: url }),
       replyTo,
       headers: url ? unsubscribeHeaders(url) : undefined,
       tags: [{ name: "campaign", value: campaignId }],

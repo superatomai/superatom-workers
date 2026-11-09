@@ -1249,6 +1249,7 @@ export const emailBranding = pgTable("email_branding", {
   orgId: uuid("org_id")
     .primaryKey()
     .references(() => organizations.id, { onDelete: "cascade" }),
+  // Unused since headers moved into the HTML body; kept until a cleanup migration drops them.
   headerColor: varchar("header_color", { length: 7 }),
   logoUrl: text("logo_url"),
   showSuperatomLogo: boolean("show_superatom_logo").notNull().default(true),
@@ -1257,6 +1258,10 @@ export const emailBranding = pgTable("email_branding", {
   senderEmail: varchar("sender_email", { length: 255 }),
   whyText: varchar("why_text", { length: 500 }),
   footerNote: varchar("footer_note", { length: 300 }),
+  // "default" = why-you-got-this + unsubscribe; "custom" = footerHtml, which must hold {{unsubscribeUrl}}.
+  footerMode: varchar("footer_mode", { length: 8 }).notNull().default("default"),
+  footerHtml: text("footer_html"),
+  buttonColor: varchar("button_color", { length: 7 }),
   // The org's own Resend key (encrypted, lib/email-keys.ts): its emails are sent and billed there.
   resendKeyEnc: text("resend_key_enc"),
   resendKeyLast4: varchar("resend_key_last4", { length: 4 }),

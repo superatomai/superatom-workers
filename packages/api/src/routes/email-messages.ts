@@ -12,7 +12,7 @@ import {
   type EmailMessage,
 } from "../lib/email";
 import { ANNOUNCEMENTS, DAILY_ORG_LIMIT, dailyUsage, loadBranding, unsubscribeUrl } from "../lib/email-campaigns";
-import { buildEmailHtml, renderBody } from "../lib/email-layout";
+import { buildEmailHtml } from "../lib/email-layout";
 import { orgResendKey } from "../lib/email-keys";
 
 /**
@@ -103,6 +103,7 @@ emailMessages.post("/", async (c) => {
     .select({
       userId: users.id,
       email: users.email,
+      name: users.name,
       unsubscribed: sql<boolean>`${emailUnsubscribes.userId} is not null`,
     })
     .from(users)
@@ -153,12 +154,12 @@ emailMessages.post("/", async (c) => {
   }
 
   const results: Result[] = [];
-  const outgoing: Array<{ index: number; message: Message; userId: string }> = [];
+  const outgoing: Array<{ index: number; message: Message; userId: string; name: string | null }> = [];
   messages.forEach((m, index) => {
     const person = byEmail.get(m.to.toLowerCase());
     if (!person) results.push({ index, to: m.to, status: "rejected", error: "Not an active user of this organization" });
     else if (person.unsubscribed) results.push({ index, to: m.to, status: "skipped", error: "Unsubscribed" });
-    else outgoing.push({ index, message: m, userId: person.userId });
+    else outgoing.push({ index, message: m, userId: person.userId, name: person.name });
   });
   const skipped = results.filter((r) => r.status === "skipped");
   const rows = [
@@ -178,22 +179,23 @@ emailMessages.post("/", async (c) => {
     const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
     const orgName = org?.name ?? "Your organization";
     const from = fromAddress(c.env, orgName, branding);
-    const html = (m: Message, url: string) =>
-      buildEmailHtml(c.env, {
+    const html = (m: Message, url: string, recipientName: string | null) =>
+      buildEmailHtml({
         orgName,
-        title: m.subject,
-        bodyHtml: m.html !== undefined ? renderBody(m.html, "html") : renderBody(m.markdown!, "markdown", branding?.headerColor ?? undefined),
+        body: m.html ?? m.markdown!,
+        format: m.html !== undefined ? "html" : "markdown",
         branding,
+        recipientName,
         unsubscribeUrl: url,
       });
     const batch: EmailMessage[] = await Promise.all(
-      outgoing.map(async ({ message: m, userId }) => {
+      outgoing.map(async ({ message: m, userId, name }) => {
         const url = unsubscribeUrl(c.env, await signUnsubscribeToken(c.env, userId, ANNOUNCEMENTS));
         return {
           from,
           to: [m.to],
           subject: m.subject,
-          html: html(m, url),
+          html: html(m, url, name),
           ...(m.text ? { text: m.text } : {}),
           replyTo: m.replyTo ?? (branding?.senderEmail ? undefined : auth.creatorEmail),
           headers: unsubscribeHeaders(url),

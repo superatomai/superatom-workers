@@ -232,6 +232,13 @@
       "when": 1793976709354,
       "tag": "0032_email_org_resend_key",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1794220964331,
+      "tag": "0033_email_footer",
+      "breakpoints": true
     }
   ]
 }

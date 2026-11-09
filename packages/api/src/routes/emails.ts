@@ -25,7 +25,7 @@ import {
 } from "../lib/email-campaigns";
 import { isRecurring, nextRun, parseSchedule, type EmailSchedule } from "../lib/email-schedule";
 import { generateEmailApiKey, hashEmailApiKey } from "../lib/email-api-keys";
-import { DEFAULT_BRANDING, HEX_COLOR, allowedSenders, senderAllowed, superatomLogoUrl, type BodyFormat, type Branding } from "../lib/email-layout";
+import { DEFAULT_BRANDING, HEX_COLOR, UNSUBSCRIBE_PLACEHOLDER, allowedSenders, senderAllowed, type BodyFormat, type Branding } from "../lib/email-layout";
 import { matchesMagicBytes } from "./upload";
 
 /**
@@ -47,6 +47,7 @@ const MAX_API_KEYS = 20;
 const MAX_BODY = 200_000;
 const LOGO_TYPES: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif" };
 const MAX_LOGO_BYTES = 1024 * 1024;
+const MAX_FOOTER = 20_000;
 // Documents, spreadsheets, slides, images and archives; never executables or scripts.
 const ATTACHMENT_EXTENSIONS = [
   "pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp",
@@ -232,17 +233,24 @@ type KeyFields = Pick<BrandingRow, "resendKeyEnc" | "senderDomains">;
 
 /** What the UI sees: never the key itself, only its last 4 characters and the account's domains. */
 function brandingView(env: Env, orgId: string, row: BrandingRow | null) {
-  const r = row ?? { ...DEFAULT_BRANDING, orgId, resendKeyEnc: null, resendKeyLast4: null, senderDomains: null, updatedBy: null, updatedAt: null };
-  const { orgId: _o, updatedBy: _u, resendKeyEnc, resendKeyLast4, senderDomains, ...branding } = r;
+  const b: Branding = row ?? DEFAULT_BRANDING;
   return {
-    ...branding,
-    resendKey: resendKeyEnc ? { last4: resendKeyLast4, domains: Array.isArray(senderDomains) ? (senderDomains as string[]) : null } : null,
-    allowedSenders: resendKeyEnc ? [] : allowedSenders(env),
-    superatomLogo: { onDark: superatomLogoUrl(env, true), onLight: superatomLogoUrl(env, false) },
+    senderName: b.senderName,
+    senderEmail: b.senderEmail,
+    buttonColor: b.buttonColor,
+    footerMode: b.footerMode,
+    footerHtml: b.footerHtml,
+    whyText: b.whyText,
+    footerNote: b.footerNote,
+    updatedAt: row?.updatedAt ?? null,
+    resendKey: row?.resendKeyEnc
+      ? { last4: row.resendKeyLast4, domains: Array.isArray(row.senderDomains) ? (row.senderDomains as string[]) : null }
+      : null,
+    allowedSenders: row?.resendKeyEnc ? [] : allowedSenders(env),
   };
 }
 
-/** GET /orgs/:orgId/emails/branding — the org's look, sender and Resend account; refreshes that account's domains. */
+/** GET /orgs/:orgId/emails/branding — sender, footer, button colour and Resend account; refreshes that account's domains. */
 emails.get("/branding", async (c) => {
   const orgId = c.req.param("orgId")!;
   const db = c.get("db");
@@ -258,7 +266,7 @@ emails.get("/branding", async (c) => {
   return c.json(brandingView(c.env, orgId, row));
 });
 
-type BrandingBody = Partial<Record<"headerColor" | "logoUrl" | "senderName" | "senderEmail" | "whyText" | "footerNote" | "showSuperatomLogo", unknown>>;
+type BrandingBody = Partial<Record<"senderName" | "senderEmail" | "buttonColor" | "footerMode" | "footerHtml" | "whyText" | "footerNote", unknown>>;
 
 /** Which addresses a sender may be, for the error message. */
 function senderRule(env: Env, key?: KeyFields | null): string {
@@ -271,7 +279,7 @@ function senderRule(env: Env, key?: KeyFields | null): string {
 /** Validates a whole branding setting; empty strings clear a field. `key` = the org's own Resend account, if any. */
 export function readBranding(env: Env, b: BrandingBody, key?: KeyFields | null): { ok: true; value: Branding } | { ok: false; error: string } {
   const fields: Record<string, string | null> = {};
-  const limits = { headerColor: 7, logoUrl: 2000, senderName: 100, senderEmail: 255, whyText: 500, footerNote: 300 } as const;
+  const limits = { senderName: 100, senderEmail: 255, buttonColor: 7, footerHtml: MAX_FOOTER, whyText: 500, footerNote: 300 } as const;
   for (const [field, max] of Object.entries(limits)) {
     const v = b[field as keyof typeof limits];
     if (v === undefined || v === null || v === "") fields[field] = null;
@@ -280,8 +288,7 @@ export function readBranding(env: Env, b: BrandingBody, key?: KeyFields | null):
     else fields[field] = v.trim() || null;
   }
   const f = fields as Record<keyof typeof limits, string | null>;
-  if (f.headerColor && !HEX_COLOR.test(f.headerColor)) return { ok: false, error: "headerColor must be a hex colour like #152435" };
-  if (f.logoUrl && !/^https:\/\/[^\s"'<>]+$/.test(f.logoUrl)) return { ok: false, error: "logoUrl must be an https link" };
+  if (f.buttonColor && !HEX_COLOR.test(f.buttonColor)) return { ok: false, error: "buttonColor must be a hex colour like #152435" };
   if (f.senderName && /["<>\r\n]/.test(f.senderName)) return { ok: false, error: "senderName can't contain quotes, < or >" };
   if (f.senderEmail) {
     f.senderEmail = f.senderEmail.toLowerCase();
@@ -289,10 +296,16 @@ export function readBranding(env: Env, b: BrandingBody, key?: KeyFields | null):
       return { ok: false, error: `senderEmail must be ${senderRule(env, key)}` };
     }
   }
-  if (b.showSuperatomLogo !== undefined && typeof b.showSuperatomLogo !== "boolean") {
-    return { ok: false, error: "showSuperatomLogo must be true or false" };
+  const footerMode = b.footerMode === undefined || b.footerMode === null || b.footerMode === "" ? "default" : b.footerMode;
+  if (footerMode !== "default" && footerMode !== "custom") return { ok: false, error: "footerMode must be default or custom" };
+  if (footerMode === "custom") {
+    if (!f.footerHtml) return { ok: false, error: "A custom footer needs its HTML" };
+    // People must always be able to opt out; the link goes wherever the footer puts it.
+    if (!UNSUBSCRIBE_PLACEHOLDER.test(f.footerHtml)) {
+      return { ok: false, error: "A custom footer must include the unsubscribe link: {{unsubscribeUrl}}" };
+    }
   }
-  return { ok: true, value: { ...f, headerColor: f.headerColor?.toLowerCase() ?? null, showSuperatomLogo: b.showSuperatomLogo !== false } };
+  return { ok: true, value: { ...f, buttonColor: f.buttonColor?.toLowerCase() ?? null, footerMode } };
 }
 
 /** PUT /orgs/:orgId/emails/branding — replace the whole setting (the Resend key has its own route). */
@@ -360,27 +373,30 @@ emails.delete("/branding/resend-key", async (c) => {
   return c.json({ ...brandingView(c.env, orgId, row), senderCleared });
 });
 
-/** POST /orgs/:orgId/emails/branding/logo (body = the image, Content-Type its type) — public assets bucket; returns its URL. */
-emails.post("/branding/logo", async (c) => {
+/**
+ * POST /orgs/:orgId/emails/images (body = the image, Content-Type its type) — stored in the public assets
+ * bucket, since email apps only load images from a public link; returns that URL for the email's HTML.
+ */
+emails.post("/images", async (c) => {
   const orgId = c.req.param("orgId")!;
   const type = (c.req.header("Content-Type") ?? "").split(";")[0].trim().toLowerCase();
   const ext = LOGO_TYPES[type];
-  if (!ext) return c.json({ error: "Logo must be PNG, JPEG or GIF (email apps don't show SVG or WebP)" }, 400);
-  if (Number(c.req.header("Content-Length") ?? 0) > MAX_LOGO_BYTES) return c.json({ error: "Logo is too large (max 1 MB)" }, 400);
+  if (!ext) return c.json({ error: "Images must be PNG, JPEG or GIF (email apps don't show SVG or WebP)" }, 400);
+  if (Number(c.req.header("Content-Length") ?? 0) > MAX_LOGO_BYTES) return c.json({ error: "Image is too large (max 1 MB)" }, 400);
   const bytes = new Uint8Array(await c.req.arrayBuffer());
   if (!bytes.length) return c.json({ error: "The image is empty" }, 400);
-  if (bytes.length > MAX_LOGO_BYTES) return c.json({ error: "Logo is too large (max 1 MB)" }, 400);
+  if (bytes.length > MAX_LOGO_BYTES) return c.json({ error: "Image is too large (max 1 MB)" }, 400);
   if (!matchesMagicBytes(type, bytes)) return c.json({ error: "File content does not match its image type" }, 400);
-  // A content-hashed key: sent emails keep showing the logo they went out with.
+  // A content-hashed key: sent emails keep showing the image they went out with.
   const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)).slice(0, 8), (x) => x.toString(16).padStart(2, "0")).join("");
-  const key = `email-branding/${orgId}/logo-${hash}.${ext}`;
+  const key = `email-images/${orgId}/${hash}.${ext}`;
   await c.env.R2_BUCKET.put(key, bytes, { httpMetadata: { contentType: type, cacheControl: "public, max-age=31536000, immutable" } });
   return c.json({ url: `${(c.env.R2_PUBLIC_URL || "https://sa-assets.superatom.ai").replace(/\/+$/, "")}/${key}` }, 201);
 });
 
 /**
- * POST /orgs/:orgId/emails/preview { subject, title?, bodyMarkdown, bodyFormat?, branding? } — the email as the
- * caller would get it; `branding` previews unsaved settings.
+ * POST /orgs/:orgId/emails/preview { bodyMarkdown, bodyFormat?, branding? } — the email as the caller would get
+ * it; `branding` previews unsaved settings.
  */
 emails.post("/preview", async (c) => {
   const orgId = c.req.param("orgId")!;
@@ -396,17 +412,11 @@ emails.post("/preview", async (c) => {
   if (typeof body.bodyMarkdown !== "string" || body.bodyMarkdown.length > MAX_BODY) return c.json({ error: "bodyMarkdown is required" }, 400);
   const [me] = await db.select({ name: users.name }).from(users).where(eq(users.id, c.get("userId")));
   const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
-  const html = renderCampaign(c.env, {
+  const html = renderCampaign({
     orgName: org?.name ?? "Your organization",
     branding: override ?? saved,
-    campaign: {
-      subject: typeof body.subject === "string" ? body.subject : "",
-      title: typeof body.title === "string" ? body.title : null,
-      bodyMarkdown: body.bodyMarkdown,
-      bodyFormat: body.bodyFormat === "html" ? "html" : "markdown",
-    },
+    campaign: { bodyMarkdown: body.bodyMarkdown, bodyFormat: body.bodyFormat === "html" ? "html" : "markdown" },
     recipientName: me?.name,
-    unsubscribeUrl: "#",
   });
   return c.json({ html });
 });
@@ -568,7 +578,7 @@ emails.post("/:id/test", async (c) => {
       from: fromAddress(c.env, orgName, branding),
       to: [me.email],
       subject: `[Test] ${campaign.subject}`,
-      html: renderCampaign(c.env, { orgName, branding, campaign, recipientName: me.name }),
+      html: renderCampaign({ orgName, branding, campaign, recipientName: me.name }),
       attachments: await attachmentLinks(c.env, await readyAttachments(db, campaign.parentId ?? campaign.id)),
     },
     undefined,
