@@ -30,6 +30,8 @@ export interface SendResult {
   error?: string;
   /** No RESEND_API_KEY on this worker; nothing was sent. */
   notConfigured?: boolean;
+  /** Resend refused the request as invalid (400/422), e.g. a bad address. */
+  validation?: boolean;
 }
 
 export function isEmailConfigured(env: Env): boolean {
@@ -72,6 +74,50 @@ export async function sendEmailBatch(env: Env, messages: EmailMessage[], idempot
   return post(env, RESEND_BATCH_URL, messages.map(toResend), idempotencyKey, apiKey);
 }
 
+/** One outcome per message: a Resend id, or why it failed. */
+export type MessageResult = { id?: string; error?: string };
+
+// Reserved for docs/tests (RFC 2606/6761); Resend rejects them, and with them the whole batch.
+const PLACEHOLDER_DOMAIN = /@(example\.(com|net|org)|[^@]*\.(test|example|invalid|localhost))$/i;
+
+export function isPlaceholderAddress(email: string): boolean {
+  return PLACEHOLDER_DOMAIN.test(email.trim());
+}
+
+/**
+ * Batch send with per-message results. Placeholder addresses fail without a call. If Resend
+ * rejects the batch as invalid (one bad address fails all), each message is sent on its own.
+ */
+export async function sendEmailsEach(
+  env: Env,
+  messages: EmailMessage[],
+  idempotencyKey: string,
+  apiKey?: string,
+  intervalMs = 250
+): Promise<MessageResult[]> {
+  const results: MessageResult[] = messages.map((m) =>
+    m.to.some(isPlaceholderAddress) ? { error: "Placeholder address (e.g. example.com): not deliverable" } : {}
+  );
+  const live = messages.flatMap((_, i) => (results[i].error ? [] : [i]));
+  if (!live.length) return results;
+
+  const batch = await sendEmailBatch(env, live.map((i) => messages[i]), idempotencyKey, apiKey);
+  if (batch.success) {
+    live.forEach((i, k) => (results[i] = { id: batch.ids?.[k] }));
+    return results;
+  }
+  if (live.length === 1 || !batch.validation) {
+    for (const i of live) results[i] = { error: batch.error ?? "Send failed" };
+    return results;
+  }
+  for (const [k, i] of live.entries()) {
+    if (k) await sleep(intervalMs);
+    const one = await sendEmail(env, messages[i], `${idempotencyKey}-${i}`, apiKey);
+    results[i] = one.success ? { id: one.ids?.[0] } : { error: one.error ?? "Send failed" };
+  }
+  return results;
+}
+
 function toResend(m: EmailMessage) {
   return {
     from: m.from,
@@ -100,6 +146,7 @@ async function post(env: Env, url: string, payload: unknown, idempotencyKey?: st
   const body = JSON.stringify(payload);
 
   let lastError = "";
+  let validation = false;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const res = await fetch(url, { method: "POST", headers, body });
@@ -110,6 +157,7 @@ async function post(env: Env, url: string, payload: unknown, idempotencyKey?: st
       }
       const text = await res.text().catch(() => "");
       lastError = `Resend API error: ${res.status}${text ? ` - ${text.slice(0, 300)}` : ""}`;
+      validation = res.status === 400 || res.status === 422;
       if (!(res.status === 429 || res.status >= 500) || attempt === MAX_ATTEMPTS) break;
       const retryAfter = Number(res.headers.get("retry-after"));
       await sleep(retryAfter > 0 ? retryAfter * 1000 : 500 * 2 ** (attempt - 1));
@@ -120,7 +168,7 @@ async function post(env: Env, url: string, payload: unknown, idempotencyKey?: st
     }
   }
   console.error("[email] send failed:", lastError);
-  return { success: false, error: lastError };
+  return { success: false, error: lastError, ...(validation ? { validation } : {}) };
 }
 
 function sleep(ms: number): Promise<void> {

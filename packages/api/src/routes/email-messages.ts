@@ -6,7 +6,7 @@ import { authenticateEmailKey } from "../lib/email-api-keys";
 import {
   RESEND_BATCH_LIMIT,
   fromAddress,
-  sendEmailBatch,
+  sendEmailsEach,
   signUnsubscribeToken,
   unsubscribeHeaders,
   type EmailMessage,
@@ -203,27 +203,23 @@ emailMessages.post("/", async (c) => {
         };
       })
     );
-    const sent = await sendEmailBatch(c.env, batch, `api-${campaign.id}`, key.apiKey);
+    const each = await sendEmailsEach(c.env, batch, `api-${campaign.id}`, key.apiKey);
     outgoing.forEach((o, i) =>
       results.push(
-        sent.success
-          ? { index: o.index, to: o.message.to, status: "sent", id: sent.ids?.[i] }
-          : { index: o.index, to: o.message.to, status: "failed", error: sent.error ?? "Send failed" }
+        each[i].error
+          ? { index: o.index, to: o.message.to, status: "failed", error: each[i].error }
+          : { index: o.index, to: o.message.to, status: "sent", id: each[i].id }
       )
     );
-    await db
-      .update(emailSends)
-      .set(sent.success ? { status: "sent", sentAt: new Date() } : { status: "failed", error: sent.error ?? "Send failed" })
-      .where(and(eq(emailSends.campaignId, campaign.id), eq(emailSends.status, "pending")));
-    if (sent.success && sent.ids?.length) {
-      const values = sql.join(
-        outgoing.map((o, i) => sql`(${o.message.to}, ${sent.ids![i] ?? null})`),
-        sql`, `
-      );
-      await db.execute(sql`
-        update ${emailSends} set resend_id = v.rid from (values ${values}) as v(email, rid)
-        where ${emailSends.campaignId} = ${campaign.id} and ${emailSends.email} = v.email`);
-    }
+    const values = sql.join(
+      outgoing.map((o, i) => sql`(${o.message.to}, ${each[i].error ? "failed" : "sent"}, ${each[i].id ?? null}, ${each[i].error ?? null})`),
+      sql`, `
+    );
+    await db.execute(sql`
+      update ${emailSends} set status = v.status, resend_id = v.rid, error = v.err,
+        sent_at = case when v.status = 'sent' then now() else null end
+      from (values ${values}) as v(email, status, rid, err)
+      where ${emailSends.campaignId} = ${campaign.id} and ${emailSends.email} = v.email and ${emailSends.status} = 'pending'`);
   }
 
   const sentCount = results.filter((r) => r.status === "sent").length;

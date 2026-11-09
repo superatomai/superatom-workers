@@ -21,7 +21,7 @@ import {
   RESEND_BATCH_LIMIT,
   fromAddress,
   sendEmail,
-  sendEmailBatch,
+  sendEmailsEach,
   signUnsubscribeToken,
   unsubscribeHeaders,
   type EmailMessage,
@@ -381,10 +381,8 @@ export async function processCampaign(env: Env, db: Database, campaignId: string
     const results: Array<{ id: string; resendId?: string; error?: string }> = [];
     if (!files.length) {
       const messages = await Promise.all(batch.map(buildMessage));
-      const result = await sendEmailBatch(env, messages, `campaign-${campaignId}-${await digest(batch.map((r) => r.id).join(","))}`, key.apiKey);
-      batch.forEach((r, i) =>
-        results.push(result.success ? { id: r.id, resendId: result.ids?.[i] } : { id: r.id, error: result.error ?? "Send failed" })
-      );
+      const each = await sendEmailsEach(env, messages, `campaign-${campaignId}-${await digest(batch.map((r) => r.id).join(","))}`, key.apiKey);
+      batch.forEach((r, i) => results.push({ id: r.id, resendId: each[i].id, error: each[i].error }));
     } else {
       for (const r of batch) {
         const result = await sendEmail(env, await buildMessage(r), `campaign-${campaignId}-${r.id}`, key.apiKey);
