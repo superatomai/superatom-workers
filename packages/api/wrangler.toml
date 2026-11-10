@@ -23,6 +23,12 @@ bucket_name = "sa-source-files"
 # bucket. Remove before pushing.
 # preview_bucket_name = "sa-source-files"
 
+# Parcels — large websocket payloads, kept briefly (src/lib/parcels.ts). Private,
+# reached only through this worker. Lifecycle rule on the bucket: delete 1 day after upload.
+[[r2_buckets]]
+binding = "R2_PARCELS"
+bucket_name = "sa-parcels"
+
 # Private bucket for built front-end apps (super-admin console now; platform/runtime later).
 # Create with: wrangler r2 bucket create sa-frontend-builds
 [[r2_buckets]]

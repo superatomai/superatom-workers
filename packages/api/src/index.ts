@@ -36,6 +36,7 @@ import emailsRoutes from "./routes/emails";
 import emailMessagesRoutes from "./routes/email-messages";
 import emailUnsubscribeRoutes from "./routes/email-unsubscribe";
 import { processDueCampaigns } from "./lib/email-campaigns";
+import parcelsRoutes from "./routes/parcels";
 
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -147,6 +148,7 @@ app.route("/upload/source-file", sourceUploadRoutes);
 app.route("/upload/chat-attachment", chatAttachmentUploadRoutes);
 app.route("/upload", uploadRoutes);
 app.route("/files", filesRoutes); // agent output files (service token) and downloads (user)
+app.route("/parcels", parcelsRoutes); // large websocket payloads: engine project key or user token
 app.route("/my/apps", myAppsRoutes); // must be before appsRoutes (mounted at /) to avoid adminOnly middleware
 app.route("/apps", permissionsRoutes); // handles /apps/:appId/permissions
 app.route("/projects/:projectId/graph", graphRoutes); // composition graph (org admins only)

@@ -15,6 +15,12 @@ bucket_name = "sa-assets-dev"
 binding = "R2_SOURCE_FILES"
 bucket_name = "sa-source-files-dev"
 
+# Parcels — large websocket payloads, kept briefly (src/lib/parcels.ts). Private,
+# reached only through this worker. Lifecycle rule on the bucket: delete 1 day after upload.
+[[r2_buckets]]
+binding = "R2_PARCELS"
+bucket_name = "sa-parcels-dev"
+
 # Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
 # MUST be the same namespace in sa-api-dev and sa-websocket-dev: sa-api-dev signs
 # with it, sa-websocket-dev verifies with it. Keys: org:<orgId>, org:__global.
