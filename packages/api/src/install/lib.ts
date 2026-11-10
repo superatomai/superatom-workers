@@ -178,6 +178,18 @@ async function proxyAdmin(env: Env, path: string, body: unknown): Promise<Respon
   });
 }
 
+/** Disables a proxy client so its key stops working. True when disabled or already gone. */
+export async function disableProxyClient(env: Env, clientId: string): Promise<boolean> {
+  if (env.INSTALL_LLM_PROXY_MODE === "dummy") return true;
+  try {
+    const res = await proxyAdmin(env, `/${encodeURIComponent(clientId)}/disable`, {});
+    return res.ok || res.status === 404;
+  } catch (err) {
+    console.error(`[install] llm-proxy disable failed for ${clientId}:`, err);
+    return false;
+  }
+}
+
 /**
  * Creates the project's LLM proxy client and returns its key (shown nowhere, sent only to the VM).
  * `mayRotate`: this project's own install token created the client earlier (an install that failed) — safe to rotate.
