@@ -38,6 +38,7 @@ import { promisify } from "node:util";
 import { AwsClient } from "aws4fetch";
 import { neon, neonConfig } from "@neondatabase/serverless";
 import { depsKey, depsPointerKey, hasDepsStage } from "../src/install/deps-image";
+import { branchToRecord, layerSummary } from "../src/install/publish-summary";
 
 const run = promisify(execFile);
 const BUCKET = "superatom-install";
@@ -196,18 +197,19 @@ const blobPath = (layout: string, digest: string) => join(layout, "blobs", "sha2
  * machine's cache, else downloaded once from the registry, else built and uploaded once (new lockfiles).
  * Same layers every release, so a VM pulls and keeps only the code layers.
  */
-async function ensureDeps(repoName: string, tree: string, work: string): Promise<{ layout: string; digest: string }> {
+async function ensureDeps(repoName: string, tree: string, work: string): Promise<{ layout: string; digest: string; uploadedBytes: number }> {
   const key = depsKey(tree);
   const layout = join(DEPS_CACHE, repoName, key);
   const done = join(layout, "digest");
   if (existsSync(done)) {
     console.log(`deps    ${key.slice(0, 12)} (cached on this machine)`);
-    return { layout, digest: readFileSync(done, "utf8").trim() };
+    return { layout, digest: readFileSync(done, "utf8").trim(), uploadedBytes: 0 };
   }
   rmSync(layout, { recursive: true, force: true });
   mkdirSync(join(layout, "blobs", "sha256"), { recursive: true });
   const pointer = depsPointerKey(repoName, key);
   let digest: string;
+  let uploadedBytes = 0;
   if (await exists(pointer)) {
     console.log(`deps    ${key.slice(0, 12)} published before: downloading it once to this machine`);
     const ptr = join(work, "deps-pointer.json");
@@ -235,6 +237,7 @@ async function ensureDeps(repoName: string, tree: string, work: string): Promise
     for (const d of [manifest.config, ...manifest.layers]) {
       const k = `registry/${repoName}/blobs/${d.digest}`;
       if (await exists(k)) continue;
+      uploadedBytes += d.size ?? 0;
       console.log(`  ✓ ${d.digest.slice(0, 19)}… ${await upload(k, blobPath(layout, d.digest), "application/octet-stream")}`);
     }
     await putSmall(`registry/${repoName}/manifests/${digest}`, readFileSync(blobPath(layout, digest)), mDesc.mediaType);
@@ -242,7 +245,7 @@ async function ensureDeps(repoName: string, tree: string, work: string): Promise
     await putSmall(pointer, Buffer.from(JSON.stringify({ manifestDigest: digest, key, createdAt: new Date().toISOString() }) + "\n"), "application/json");
   }
   writeFileSync(done, digest);
-  return { layout, digest };
+  return { layout, digest, uploadedBytes };
 }
 
 /** The control-plane database for one environment, from the same files the migrations use. */
@@ -403,6 +406,7 @@ async function main() {
 
   const sql = db(env);
   let branch: string;
+  let storedBranch: string | undefined;
   let prev: Prev;
 
   if (baseline) {
@@ -419,10 +423,9 @@ async function main() {
     const [prevRow] = await sql`select version, commit from project_releases
       where project_id = ${projectId} order by published_at desc limit 1`;
     prev = prevRow ? { version: prevRow.version as string, commit: prevRow.commit as string } : undefined;
-    branch = arg("branch") ?? (project.code_branch as string);
-    if (arg("branch") && arg("branch") !== project.code_branch) {
-      console.log(`note: building ${branch}, but the project's code_branch is "${project.code_branch}"`);
-    }
+    storedBranch = project.code_branch as string;
+    branch = arg("branch") ?? storedBranch;
+    if (branch !== storedBranch) console.log(`note: building ${branch}; the project's code_branch is "${storedBranch}"`);
     console.log(`${env}: ${project.name} (${project.slug})`);
   }
 
@@ -456,8 +459,10 @@ async function main() {
     // authorise against (src/install/registry.ts), so it must match exactly.
     const repoTag = `${repoName}:${version}`;
     const depsArgs: string[] = [];
+    let depsUploadedBytes = 0;
     if (hasDepsStage(readFileSync(join(tree, "Dockerfile"), "utf8"))) {
       const deps = await ensureDeps(repoName, tree, work);
+      depsUploadedBytes = deps.uploadedBytes;
       depsArgs.push("--build-context", `deps=oci-layout://${deps.layout}@${deps.digest}`);
     }
     await sh("docker", ["buildx", "build", "--builder", "ocibuilder", ...depsArgs,
@@ -481,8 +486,7 @@ async function main() {
       console.log(`  ✓ ${d.digest.slice(0, 19)}… ${what}`);
     }
     // What a VM downloads and stores for this release; a code-only change should be tens of MB.
-    const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
-    console.log(`  layers: new ${mb(newBytes)}, reused ${mb(reusedBytes)}`);
+    console.log(`  ${layerSummary({ newBytes, reusedBytes, depsUploadedBytes })}`);
 
     // By tag AND by digest: the client resolves the tag, then re-fetches by digest.
     const manifestBody = await readFile(manifestFile);
@@ -542,6 +546,11 @@ async function main() {
              `  Artifacts were uploaded; they are content-addressed, so nothing is duplicated.`);
       }
       throw err;
+    }
+    const recordBranch = branchToRecord(storedBranch, branch, local);
+    if (recordBranch) {
+      await sql`update projects set code_branch = ${recordBranch}, updated_at = now() where id = ${projectId}`;
+      console.log(`code_branch: "${storedBranch}" → "${recordBranch}" (the branch this release was built from)`);
     }
     console.log(`\n✔ published and registered in ${env}\n${JSON.stringify(release, null, 2)}`);
     console.log(`\nA VM installs it with: curl -fsSL https://${env === "prod" ? "" : "dev."}install.superatom.ai | sh`);
