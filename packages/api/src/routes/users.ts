@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { eq, and, sql } from "drizzle-orm";
 import { users, appPermissions, apps } from "../db/schema";
 import { validatePassword } from "../lib/password-policy";
+import { orgRequiresSso } from "../lib/sso-required";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 
@@ -31,12 +32,17 @@ usersRouter.post("/", async (c) => {
   const { email, name, password, role, config } = await c.req.json<{
     email: string;
     name: string;
-    password: string;
+    password?: string;
     role?: "super_admin" | "org_admin" | "member";
     config?: unknown;
   }>();
 
-  if (!email || !name || !password) {
+  if (!email || !name) {
+    return c.json({ error: "email and name are required" }, 400);
+  }
+  // SSO-only users get no password, even if one is sent (the form may still send it).
+  const ssoOnly = await orgRequiresSso(db, orgId, email);
+  if (!ssoOnly && !password) {
     return c.json({ error: "email, name, and password are required" }, 400);
   }
 
@@ -45,7 +51,7 @@ usersRouter.post("/", async (c) => {
 
   // Enforce password strength on creation. Login is not gated, so existing
   // accounts with older passwords keep working.
-  const pwError = validatePassword(password);
+  const pwError = ssoOnly ? null : validatePassword(password);
   if (pwError) {
     return c.json({ error: pwError }, 400);
   }
@@ -70,7 +76,7 @@ usersRouter.post("/", async (c) => {
   if (existing) {
     if (!existing.isActive) {
       // Reactivate with new credentials
-      const passwordHash = await hashPassword(password);
+      const passwordHash = ssoOnly ? null : await hashPassword(password!);
       const [reactivated] = await db
         .update(users)
         .set({ name, passwordHash, role: role || "member", config, isActive: true, updatedAt: new Date() })
@@ -90,7 +96,7 @@ usersRouter.post("/", async (c) => {
     return c.json({ error: "A user with this email already exists in this organization" }, 409);
   }
 
-  const passwordHash = await hashPassword(password);
+  const passwordHash = ssoOnly ? null : await hashPassword(password!);
 
   const [user] = await db
     .insert(users)

@@ -5,6 +5,7 @@ import type { Env } from "../../types";
 import type { SuperAdminVariables } from "../types";
 import { validatePassword } from "../../lib/password-policy";
 import { revocationCutoff } from "../lib/session";
+import { orgRequiresSso } from "../../lib/sso-required";
 import { cleanEmail, cleanName, isUniqueViolation, isUuid, orgUserPasswordHash } from "../lib/validate";
 
 /** Org admins of one org (rows in `users` with role org_admin). Mounted at /api/orgs/:orgId/admins, behind requireSuperAdmin. */
@@ -67,10 +68,12 @@ orgAdmins.post("/", async (c) => {
   const name = cleanName(body?.name);
   const email = cleanEmail(body?.email);
   if (!name || !email) return c.json({ error: "Name and a valid email are required." }, 400);
-  const pwError = validatePassword(body?.password);
+  const db = c.var.db;
+  // SSO-only admins get no password, even if one is sent.
+  const ssoOnly = await orgRequiresSso(db, orgId, email);
+  const pwError = ssoOnly ? null : validatePassword(body?.password);
   if (pwError) return c.json({ error: pwError }, 400);
 
-  const db = c.var.db;
   const [existing] = await db
     .select({ role: users.role, isActive: users.isActive })
     .from(users)
@@ -93,7 +96,7 @@ orgAdmins.post("/", async (c) => {
         orgId,
         email,
         name,
-        passwordHash: await orgUserPasswordHash(body!.password as string),
+        passwordHash: ssoOnly ? null : await orgUserPasswordHash(body!.password as string),
         role: "org_admin",
       })
       .returning(adminColumns);
@@ -141,6 +144,10 @@ orgAdmins.post("/:userId/reset-password", async (c) => {
 
   const db = c.var.db;
   if (!(await isOrgAdmin(db, orgId, userId))) return c.json({ error: "Org admin not found" }, 404);
+  const [target] = await db.select({ email: users.email }).from(users).where(adminWhere(orgId, userId)).limit(1);
+  if (target && (await orgRequiresSso(db, orgId, target.email))) {
+    return c.json({ error: "This admin signs in with the organization's SSO; passwords aren't used." }, 400);
+  }
   const [[admin]] = await db.batch([
     db
       .update(users)
