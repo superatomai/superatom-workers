@@ -81,7 +81,8 @@ router.get("/", async (c) => {
       commit: r.commit || null, builtBy: r.builtBy, uploadedAt: r.uploadedAt, publishedBy: r.publishedBy, publishedAt: r.publishedAt,
       notes: r.notes, creatorId: r.creatorId, hasSource: Boolean(r.sourceKey),
       title: (r.manifest as any)?.title ?? null, description: (r.manifest as any)?.description ?? null,
-      default: Boolean((r.manifest as any)?.default), server: Boolean((r.manifest as any)?.server), web: (r.manifest as any)?.web?.kind ?? null,
+      // Manifest v2: `visibility.prompt` replaced `default`, `web` is a boolean (older rows still carry `default` / `web.kind`).
+      default: Boolean((r.manifest as any)?.visibility?.prompt ?? (r.manifest as any)?.default), server: Boolean((r.manifest as any)?.server), web: Boolean((r.manifest as any)?.web),
     })),
   });
 });
