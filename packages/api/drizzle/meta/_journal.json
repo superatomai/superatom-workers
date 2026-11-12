@@ -239,6 +239,13 @@
       "when": 1794220964331,
       "tag": "0033_email_footer",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1794383854493,
+      "tag": "0034_sso_required_domains",
+      "breakpoints": true
     }
   ]
 }

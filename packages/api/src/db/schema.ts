@@ -466,6 +466,8 @@ export const ssoConfigs = pgTable("sso_configs", {
   samlIdpEntityId: varchar("saml_idp_entity_id", { length: 1000 }),
   samlIdpSsoUrl: varchar("saml_idp_sso_url", { length: 1000 }),
   samlIdpCertificates: jsonb("saml_idp_certificates"),
+  // Email domains that must sign in through this SSO (no password login); null/empty = off.
+  ssoRequiredDomains: jsonb("sso_required_domains").$type<string[]>(),
   isActive: boolean("is_active").default(true).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
