@@ -83,10 +83,18 @@ function checkFile(raw: unknown, projectId: string): ImportFile {
   return f as ImportFile;
 }
 
-const isBuiltIn = (n: NodeRow) => {
+const isBuiltIn = (n: Pick<NodeRow, "name" | "meta">) => {
   const meta = (n.meta ?? {}) as { shared?: boolean; fallback?: boolean };
   return !!meta.shared || !!meta.fallback || ["shared", "generic"].includes(n.name.toLowerCase());
 };
+
+/**
+ * Owner of a node the import creates. The built-ins (shared / default) have none:
+ * any admin adds or removes their instructions directly, and each instruction's
+ * own owner reviews edits to it.
+ */
+export const newNodeOwner = (n: Pick<NodeRow, "kind" | "name" | "meta">, userId: string): string | null =>
+  n.kind === "domain" && isBuiltIn(n) ? null : userId;
 
 /** Proposal with edges and terms in a fixed order, so equal content compares equal. */
 const normal = (p: NodeProposal) =>
@@ -164,7 +172,7 @@ async function writeNodes(q: Q, s: Scope, writes: NodeWrite[], changes: ChangeRo
     const inserted = await inChunks(fresh, (chunk) =>
       q
         .insert(graphNodes)
-        .values(chunk.map((r) => ({ ...r, ownerId: s.userId, origin: "import", createdBy: s.userId })))
+        .values(chunk.map((r) => ({ ...r, ownerId: newNodeOwner(r, s.userId), origin: "import", createdBy: s.userId })))
         .returning({ id: graphNodes.id, kind: graphNodes.kind, name: graphNodes.name }),
     );
     for (const r of inserted) ids.set(key(r.kind, r.name), r.id);
