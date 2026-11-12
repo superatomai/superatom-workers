@@ -294,17 +294,33 @@ export async function importGraph(q: Q, s: Scope, raw: unknown, mode: ImportMode
   };
 
   // ── Concepts
-  const conceptByKey = new Map(wc.concepts.map((c) => [`${lower(c.name)}|${c.sourceId ?? ""}`, c]));
+  const conceptKey = (name: unknown, sourceId: string | null | undefined) => `${lower(String(name ?? ""))}|${sourceId ?? ""}`;
+  const conceptByKey = new Map(wc.concepts.map((c) => [conceptKey(c.name, c.sourceId), c]));
   const conceptIdByName = new Map<string, number>();
   for (const c of wc.concepts) if (!conceptIdByName.has(lower(c.name))) conceptIdByName.set(lower(c.name), c.id);
-  const fileConceptKeys = new Set<string>();
+  const fileConceptKeys = new Set(file.concepts.map((fc) => conceptKey(fc.name, fc.sourceId)));
+  /** Existing concepts the file updates. Replace mode keeps these. */
+  const matchedConceptIds = new Set<number>();
   const conceptCreates: ConceptFields[] = [];
   const conceptUpdates: { existing: ConceptRow; fields: ConceptFields }[] = [];
 
   for (const fc of file.concepts) {
-    const k = `${lower(String(fc.name ?? ""))}|${fc.sourceId ?? ""}`;
-    fileConceptKeys.add(k);
-    const existing = conceptByKey.get(k);
+    /*
+     * Same name and source first. Failing that, a concept with the same name and
+     * another source — so a file that adds or changes a concept's source updates
+     * it instead of adding a second one. Only a concept the file doesn't also
+     * name exactly, and each only once, so a file that really holds two
+     * same-name concepts (one per source) still gets two.
+     */
+    const existing =
+      conceptByKey.get(conceptKey(fc.name, fc.sourceId)) ??
+      wc.concepts.find(
+        (c) =>
+          lower(c.name) === lower(String(fc.name ?? "")) &&
+          !matchedConceptIds.has(c.id) &&
+          !fileConceptKeys.has(conceptKey(c.name, c.sourceId)),
+      );
+    if (existing) matchedConceptIds.add(existing.id);
     const fields = parseConceptInput({
       name: fc.name,
       body: fc.body,
@@ -431,7 +447,7 @@ export async function importGraph(q: Q, s: Scope, raw: unknown, mode: ImportMode
     const used = new Set([...finalEdges.values()].flatMap((list) => list.flatMap((e) => (e.conceptId !== null ? [e.conceptId] : []))));
     const gone: ConceptRow[] = [];
     for (const c of wc.concepts) {
-      if (fileConceptKeys.has(`${lower(c.name)}|${c.sourceId ?? ""}`) || used.has(c.id)) continue;
+      if (matchedConceptIds.has(c.id) || used.has(c.id)) continue;
       if (canEditDirectly(c, s)) {
         gone.push(c);
         counts.concepts.removed++;
