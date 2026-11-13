@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { builtKey, draftsFor, engineView, liveVersions, parseRegistration, sourceKey } from "./catalogue";
+import { builtKey, draftsFor, engineView, liveVersions, parseRegistration, sourceKey, currentRows, pinPlan, pinsOf, publishPlan, unpublishPlan } from "./catalogue";
 
 const H = "a".repeat(64);
 const base = { name: "orders-kpi", version: "1.2.0", hash: H, bytes: 1234, manifest: { name: "orders-kpi", version: "1.2.0", server: true } };
@@ -82,6 +82,44 @@ describe("draftsFor", () => {
     assert.deepEqual(draftsFor(rows, undefined), []);
   });
   it("engineView carries only what an engine needs", () => {
-    assert.deepEqual(Object.keys(engineView(row("a", "1.0.0"), true)), ["name", "version", "hash", "bytes", "manifest", "publishedAt", "draft"]);
+    assert.deepEqual(Object.keys(engineView(row("a", "1.0.0"), true)), ["name", "version", "hash", "bytes", "manifest", "publishedAt", "draft", "pinned"]);
+  });
+});
+
+describe("the current pointer", () => {
+  // Distinct hashes: a pin is by hash, and the shared fixture hash would make every row match.
+  const rows = [
+    row("a", "1.0.0", { publishedAt: "2026-10-01T00:00:00Z", hash: "1".repeat(64) }),
+    row("a", "1.1.0", { publishedAt: "2026-10-05T00:00:00Z", current: true, hash: "2".repeat(64) }),
+    row("a", "2.0.0", { publishedAt: null, hash: "3".repeat(64) }),
+    row("c", "3.0.0", { publishedAt: "2026-10-03T00:00:00Z", hash: "4".repeat(64) }),
+  ];
+  const ids = (r: any[]) => r.map((x) => `${x.name}@${x.version}`);
+  it("currentRows: the marked build per name; a name without a mark falls back to the newest published", () => {
+    assert.deepEqual(ids(currentRows(rows)), ["a@1.1.0", "c@3.0.0"]);
+    assert.deepEqual(ids(currentRows(rows.map((r) => ({ ...r, current: false })))), ["a@1.1.0", "c@3.0.0"]);
+  });
+  it("publish moves the pointer to the new build unless the current one is pinned", () => {
+    const a10 = rows[0], a11 = rows[1];
+    const p = publishPlan(rows, a10.id);
+    assert.deepEqual(p, { becameCurrent: true, changes: { [a10.id]: { current: true }, [a11.id]: { current: false, pinned: false } } });
+    const held = publishPlan(rows.map((r) => (r.id === a11.id ? { ...r, pinned: true } : r)), a10.id);
+    assert.deepEqual(held, { becameCurrent: false, changes: {} });
+  });
+  it("unpublish clears the pointer and the newest other published build takes it", () => {
+    const a10 = rows[0], a11 = rows[1];
+    assert.deepEqual(unpublishPlan(rows, a11.id), { nextId: a10.id, changes: { [a11.id]: { current: false, pinned: false }, [a10.id]: { current: true } } });
+    assert.deepEqual(unpublishPlan(rows, a10.id), { nextId: null, changes: { [a10.id]: { current: false, pinned: false } } });
+  });
+  it("pin by hash makes a published build current and frozen; unpin keeps current and thaws; a draft cannot be pinned", () => {
+    const a10 = rows[0], a11 = rows[1], a20 = rows[2];
+    assert.deepEqual(pinPlan(rows, "a", a10.hash), { ok: true, changes: { [a10.id]: { current: true, pinned: true }, [a11.id]: { current: false, pinned: false } } });
+    assert.deepEqual(pinPlan(rows, "a", null), { ok: true, changes: { [a11.id]: { current: true, pinned: false } } });
+    assert.equal((pinPlan(rows, "a", a20.hash) as any).ok, false);
+    assert.equal((pinPlan(rows, "a", "f".repeat(64)) as any).ok, false);
+  });
+  it("pinsOf derives the old name → version map from pinned current builds", () => {
+    assert.deepEqual(pinsOf(rows), {});
+    assert.deepEqual(pinsOf(rows.map((r) => (r.version === "1.1.0" ? { ...r, pinned: true } : r))), { a: "1.1.0" });
   });
 });

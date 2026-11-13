@@ -229,6 +229,9 @@ export const projectPrograms = pgTable(
     manifest: jsonb("manifest").$type<Record<string, unknown>>(),
     // pending until the archive is in R2 and its size checked; then ready. unpublished = retracted after a publish.
     status: varchar("status", { length: 16 }).notNull().default("pending"),
+    // The build the project's engines run (one per project + name). `pinned` freezes it against newer publishes.
+    current: boolean("current").notNull().default(false),
+    pinned: boolean("pinned").notNull().default(false),
     // R2 keys in the programs bucket: the built archive and the source archive.
     key: varchar("key", { length: 512 }),
     sourceKey: varchar("source_key", { length: 512 }),

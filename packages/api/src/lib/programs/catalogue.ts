@@ -78,6 +78,84 @@ export interface CatalogueRow {
   uploadedAt: Date | string;
   creatorId: string | null;
   manifest: Record<string, unknown> | null;
+  /** The build the project's engines run; one per name. */
+  current?: boolean;
+  /** `current` is frozen: a newer publish does not move it. */
+  pinned?: boolean;
+}
+
+const publishedReady = (r: CatalogueRow) => r.status === "ready" && Boolean(r.publishedAt);
+const newestFirst = <T extends CatalogueRow>(a: T, b: T) => +new Date(b.publishedAt!) - +new Date(a.publishedAt!);
+
+/**
+ * The build each program's engines run: the row marked `current`. A name with
+ * published rows but no mark (registered before the mark existed) falls back to
+ * the newest published one, so an un-backfilled project keeps working.
+ */
+export function currentRows<T extends CatalogueRow>(rows: T[]): T[] {
+  const byName = new Map<string, T[]>();
+  for (const r of rows) {
+    if (!publishedReady(r)) continue;
+    const list = byName.get(r.name) ?? [];
+    list.push(r);
+    byName.set(r.name, list);
+  }
+  const out: T[] = [];
+  for (const list of byName.values()) out.push(list.find((r) => r.current) ?? list.sort(newestFirst)[0]);
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Row ids whose `current` / `pinned` flags change, as `{ id: { current, pinned } }`. */
+export type FlagChanges = Record<string, { current: boolean; pinned?: boolean }>;
+
+/**
+ * Publishing a build makes it current, unless the name's current build is pinned:
+ * then the new build is published but the pointer stays until someone unpins or pins it.
+ */
+export function publishPlan<T extends CatalogueRow>(rows: T[], id: string): { changes: FlagChanges; becameCurrent: boolean } {
+  const target = rows.find((r) => r.id === id);
+  if (!target) return { changes: {}, becameCurrent: false };
+  const siblings = rows.filter((r) => r.name === target.name && r.id !== id);
+  const held = siblings.find((r) => r.current && r.pinned);
+  if (held) return { changes: {}, becameCurrent: false };
+  const changes: FlagChanges = { [id]: { current: true } };
+  for (const r of siblings) if (r.current) changes[r.id] = { current: false, pinned: false };
+  return { changes, becameCurrent: true };
+}
+
+/** Unpublishing clears the pointer (and any pin); the newest other published build takes it. */
+export function unpublishPlan<T extends CatalogueRow>(rows: T[], id: string): { changes: FlagChanges; nextId: string | null } {
+  const target = rows.find((r) => r.id === id);
+  if (!target) return { changes: {}, nextId: null };
+  const changes: FlagChanges = { [id]: { current: false, pinned: false } };
+  if (!target.current) return { changes, nextId: null };
+  const next = rows.filter((r) => r.name === target.name && r.id !== id && publishedReady(r)).sort(newestFirst)[0];
+  if (next) changes[next.id] = { current: true };
+  return { changes, nextId: next?.id ?? null };
+}
+
+/**
+ * Pin: the published build with this hash becomes current and frozen. Unpin
+ * (hash null): the current build stays current, no longer frozen.
+ */
+export function pinPlan<T extends CatalogueRow>(rows: T[], name: string, hash: string | null): { ok: true; changes: FlagChanges } | { ok: false; error: string } {
+  const mine = rows.filter((r) => r.name === name);
+  if (hash === null) {
+    const cur = currentRows(mine)[0];
+    return { ok: true, changes: cur ? { [cur.id]: { current: true, pinned: false } } : {} };
+  }
+  const target = mine.find((r) => r.hash === hash);
+  if (!target || !publishedReady(target)) return { ok: false, error: `${name}@${hash.slice(0, 12)} is not a published build` };
+  const changes: FlagChanges = { [target.id]: { current: true, pinned: true } };
+  for (const r of mine) if (r.id !== target.id && (r.current || r.pinned)) changes[r.id] = { current: false, pinned: false };
+  return { ok: true, changes };
+}
+
+/** `name → version` of the pinned current builds, for callers that still read the old pins map. */
+export function pinsOf<T extends CatalogueRow>(rows: T[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const r of currentRows(rows)) if (r.pinned) out[r.name] = r.version;
+  return out;
 }
 
 /**
@@ -115,5 +193,5 @@ export function draftsFor<T extends CatalogueRow>(rows: T[], creatorId: string |
 
 /** What an engine needs per program, nothing it should not have. */
 export function engineView<T extends CatalogueRow>(r: T, draft = false) {
-  return { name: r.name, version: r.version, hash: r.hash, bytes: r.bytes, manifest: r.manifest, publishedAt: r.publishedAt, draft };
+  return { name: r.name, version: r.version, hash: r.hash, bytes: r.bytes, manifest: r.manifest, publishedAt: r.publishedAt, draft, pinned: Boolean(r.pinned) };
 }

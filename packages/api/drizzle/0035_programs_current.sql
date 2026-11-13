@@ -1,0 +1,5 @@
+ALTER TABLE "project_programs" ADD COLUMN "current" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "project_programs" ADD COLUMN "pinned" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+-- Backfill the pointer from the rule it replaces: the pin in projects.program_pins, else the newest published build per name.
+UPDATE "project_programs" p SET "current" = true, "pinned" = true FROM "projects" pr WHERE p."project_id" = pr."id" AND p."status" = 'ready' AND p."published_at" IS NOT NULL AND pr."program_pins" ->> p."name" = p."version";--> statement-breakpoint
+UPDATE "project_programs" p SET "current" = true WHERE p."status" = 'ready' AND p."published_at" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "project_programs" q WHERE q."project_id" = p."project_id" AND q."name" = p."name" AND q."current") AND p."published_at" = (SELECT max(q."published_at") FROM "project_programs" q WHERE q."project_id" = p."project_id" AND q."name" = p."name" AND q."status" = 'ready' AND q."published_at" IS NOT NULL);

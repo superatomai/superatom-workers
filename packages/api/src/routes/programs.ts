@@ -13,7 +13,7 @@ import { projectPrograms, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authenticateRequest } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
-import { builtKey, draftsFor, engineView, liveVersions, parseRegistration, sourceKey } from "../lib/programs/catalogue";
+import { builtKey, currentRows, draftsFor, engineView, parseRegistration, pinPlan, pinsOf, publishPlan, sourceKey, unpublishPlan, type FlagChanges } from "../lib/programs/catalogue";
 import { notifyPrograms } from "../lib/programs/notify";
 
 const router = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -49,6 +49,13 @@ function runLater(c: AppContext, p: Promise<unknown>): void {
   try { c.executionCtx.waitUntil(p); } catch { void p; }
 }
 
+/** Writes a plan's current/pinned changes, one update per row. */
+async function applyFlags(db: AppContext["var"]["db"], changes: FlagChanges): Promise<void> {
+  for (const [id, f] of Object.entries(changes)) {
+    await db.update(projectPrograms).set({ current: f.current, ...(f.pinned !== undefined ? { pinned: f.pinned } : {}) }).where(eq(projectPrograms.id, id));
+  }
+}
+
 async function rowsOf(c: AppContext, projectId: string) {
   return c.get("db").select().from(projectPrograms).where(eq(projectPrograms.projectId, projectId)).orderBy(desc(projectPrograms.uploadedAt));
 }
@@ -60,24 +67,22 @@ router.get("/", async (c) => {
   const who = await caller(c, projectId, { adminOnly: false });
   if (!who.ok) return c.json({ error: who.error }, who.status);
   const db = c.get("db");
-  const [rows, [project]] = await Promise.all([
-    rowsOf(c, projectId),
-    db.select({ programPins: projects.programPins }).from(projects).where(eq(projects.id, projectId)).limit(1),
-  ]);
-  const pins = project?.programPins ?? {};
+  const rows = await rowsOf(c, projectId);
+  // The pointer on the row decides what runs; `pins` is derived for callers that still read the old map.
+  const pins = pinsOf(rows);
   if (who.caller.kind === "service" || c.req.query("view") === "engine") {
     // The engine view: what to run, plus the creator's drafts when asked for.
     const creatorId = c.req.query("drafts") ?? undefined;
-    const live = liveVersions(rows, pins);
+    const live = currentRows(rows);
     const drafts = draftsFor(rows, UUID.test(creatorId ?? "") ? creatorId : undefined);
     return c.json({ pins, programs: [...live.map((r) => engineView(r)), ...drafts.map((r) => engineView(r, true))] });
   }
-  const live = new Set(liveVersions(rows, pins).map((r) => r.id));
+  const live = new Set(currentRows(rows).map((r) => r.id));
   return c.json({
     pins,
     programs: rows.map((r) => ({
       id: r.id, name: r.name, version: r.version, hash: r.hash, bytes: r.bytes, status: r.status,
-      live: live.has(r.id), pinned: pins[r.name] === r.version,
+      live: live.has(r.id), current: Boolean(r.current), pinned: Boolean(r.pinned),
       commit: r.commit || null, builtBy: r.builtBy, uploadedAt: r.uploadedAt, publishedBy: r.publishedBy, publishedAt: r.publishedAt,
       notes: r.notes, creatorId: r.creatorId, hasSource: Boolean(r.sourceKey),
       title: (r.manifest as any)?.title ?? null, description: (r.manifest as any)?.description ?? null,
@@ -173,16 +178,24 @@ async function setPublished(c: AppContext, projish: boolean) {
   const db = c.get("db");
   const [row] = await db.select().from(projectPrograms).where(and(eq(projectPrograms.id, id), eq(projectPrograms.projectId, projectId))).limit(1);
   if (!row) return c.json({ error: "Program not found" }, 404);
+  const siblings = await db.select().from(projectPrograms).where(and(eq(projectPrograms.projectId, projectId), eq(projectPrograms.name, row.name)));
+  let current = false;
   if (projish) {
     if (row.status !== "ready") return c.json({ error: "The archive has not been uploaded yet" }, 409);
     const body = await c.req.json<{ notes?: unknown }>().catch(() => ({} as { notes?: unknown }));
     const notes = typeof body?.notes === "string" ? body.notes.slice(0, 4000) : row.notes;
-    await db.update(projectPrograms).set({ publishedAt: new Date(), publishedBy: actor(who.caller), notes }).where(eq(projectPrograms.id, id));
+    const publishedAt = new Date();
+    const plan = publishPlan(siblings.map((s) => (s.id === id ? { ...s, status: "ready", publishedAt } : s)), id);
+    await db.update(projectPrograms).set({ publishedAt, publishedBy: actor(who.caller), notes }).where(eq(projectPrograms.id, id));
+    await applyFlags(db, plan.changes);
+    current = plan.becameCurrent;
   } else {
+    const plan = unpublishPlan(siblings, id);
     await db.update(projectPrograms).set({ publishedAt: null, publishedBy: null, status: "unpublished" }).where(eq(projectPrograms.id, id));
+    await applyFlags(db, plan.changes);
   }
   runLater(c, notifyPrograms(c.env, projectId));
-  return c.json({ id, name: row.name, version: row.version, published: projish });
+  return c.json({ id, name: row.name, version: row.version, published: projish, current });
 }
 router.post("/:id/publish", (c) => setPublished(c, true));
 router.post("/:id/unpublish", (c) => setPublished(c, false));
@@ -191,22 +204,22 @@ router.post("/pin", async (c) => {
   const projectId = c.req.param("projectId")!;
   const who = await caller(c, projectId, { adminOnly: true });
   if (!who.ok) return c.json({ error: who.error }, who.status);
-  const body = await c.req.json<{ name?: unknown; version?: unknown }>().catch(() => null);
+  // Pin by hash (the build's identity); `version` is accepted for older callers and resolved to the row's hash.
+  const body = await c.req.json<{ name?: unknown; hash?: unknown; version?: unknown }>().catch(() => null);
   const name = typeof body?.name === "string" ? body.name : "";
-  const version = body?.version === null ? null : typeof body?.version === "string" ? body.version : undefined;
-  if (!name || version === undefined) return c.json({ error: "name and version (or null to unpin) are required" }, 400);
+  if (!name) return c.json({ error: "name and hash (or null to unpin) are required" }, 400);
   const db = c.get("db");
-  if (version) {
-    const [row] = await db.select({ publishedAt: projectPrograms.publishedAt, status: projectPrograms.status }).from(projectPrograms)
-      .where(and(eq(projectPrograms.projectId, projectId), eq(projectPrograms.name, name), eq(projectPrograms.version, version))).limit(1);
-    if (!row || row.status !== "ready" || !row.publishedAt) return c.json({ error: `${name}@${version} is not a published version` }, 404);
-  }
-  const [project] = await db.select({ programPins: projects.programPins }).from(projects).where(eq(projects.id, projectId)).limit(1);
-  const pins = { ...(project?.programPins ?? {}) };
-  if (version) pins[name] = version; else delete pins[name];
-  await db.update(projects).set({ programPins: pins }).where(eq(projects.id, projectId));
+  const mine = await db.select().from(projectPrograms).where(and(eq(projectPrograms.projectId, projectId), eq(projectPrograms.name, name)));
+  let hash: string | null | undefined;
+  if (body?.hash === null || body?.version === null) hash = null;
+  else if (typeof body?.hash === "string") hash = body.hash.toLowerCase();
+  else if (typeof body?.version === "string") hash = mine.find((r) => r.version === body.version)?.hash ?? "";
+  if (hash === undefined) return c.json({ error: "name and hash (or null to unpin) are required" }, 400);
+  const plan = pinPlan(mine, name, hash);
+  if (!plan.ok) return c.json({ error: plan.error }, 404);
+  await applyFlags(db, plan.changes);
   runLater(c, notifyPrograms(c.env, projectId));
-  return c.json({ pins });
+  return c.json({ pins: pinsOf(mine.map((r) => ({ ...r, ...(plan.changes[r.id] ?? {}) }))) });
 });
 
 /* ------------------------------ download (engine / admin) ------------------------------ */
