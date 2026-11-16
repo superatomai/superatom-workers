@@ -246,6 +246,27 @@
       "when": 1794383854493,
       "tag": "0034_sso_required_domains",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1794575473830,
+      "tag": "0035_nosy_ironclad",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1794576267322,
+      "tag": "0036_goofy_lightspeed",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1794815303535,
+      "tag": "0037_fluffy_night_nurse",
+      "breakpoints": true
     }
   ]
 }

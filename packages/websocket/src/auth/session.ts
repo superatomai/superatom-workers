@@ -43,6 +43,12 @@ export interface VerifiedSession {
 	 * arrive with no policy at all.
 	 */
 	config: unknown;
+	/**
+	 * Where `config` came from. The three cases are indistinguishable once
+	 * resolved, and the access trail has to tell them apart — "unrestricted"
+	 * and "the customer sent nothing this time" are different answers.
+	 */
+	configSource: 'token' | 'stored' | 'none';
 }
 
 export type SessionResult =
@@ -220,11 +226,13 @@ export async function verifyBrowserSession(
 		// user created through the SDK is restricted by what their own backend
 		// sent this time; `users.config` is the default an admin can edit here,
 		// used when a token says nothing about access.
+		const config = tokenConfig ?? account.config ?? null;
 		session = {
 			userId,
 			orgId: account.org_id,
 			role: account.role,
-			config: tokenConfig ?? account.config ?? null,
+			config,
+			configSource: tokenConfig != null ? 'token' : account.config != null ? 'stored' : 'none',
 		};
 	} catch (error: any) {
 		console.error('[auth] account lookup failed:', error?.message);

@@ -1,6 +1,8 @@
-import { BroadcastClient, BroadcastMessage, ClientInfo, Env, DataSourceRecord } from './types';
+import { AccessConfigSource, BroadcastClient, BroadcastMessage, ClientInfo, Env, DataSourceRecord } from './types';
 import { UsageStats } from '../usage/types';
 import { KnowledgeGraph } from './knowledge-graph';
+import { AccessRecord } from './access-record';
+import { accessHash } from '../auth/access-hash';
 
 // Storage keys (the knowledge graph keeps its own: see knowledge-graph/versions.ts)
 const STORAGE_KEY_TOTAL_REQUESTS = 'totalRequests';
@@ -35,6 +37,11 @@ function traceErrorText(payload: any): string | null {
 	return text.length > TRACE_ERROR_MAX ? `${text.slice(0, TRACE_ERROR_MAX)}…` : text;
 }
 
+/** The worker's source header, narrowed. Anything unexpected reads as no restriction. */
+function accessConfigSource(header: string | null): AccessConfigSource {
+	return header === 'token' || header === 'stored' ? header : 'none';
+}
+
 /**
  * Decode the base64 config header the worker set from the verified session.
  *
@@ -61,6 +68,7 @@ export class Broadcaster implements DurableObject {
 	private lastActivity: number;
 	/** Engine replication and per-user graph versions; graph messages and sa-api's notices are handed to it. */
 	private graph: KnowledgeGraph;
+	private accessRecord: AccessRecord;
 
 	constructor(state: DurableObjectState, env: Env) {
 		this.state = state;
@@ -79,6 +87,7 @@ export class Broadcaster implements DurableObject {
 			},
 			sendError: (clientId, message) => this.sendError(clientId, message),
 		});
+		this.accessRecord = new AccessRecord({ storage: state.storage, databaseUrl: env.DATABASE_URL });
 	}
 
 	/**
@@ -380,6 +389,13 @@ export class Broadcaster implements DurableObject {
 			// ?type=runtime&apiKey=anything used to unlock the data plane.
 			const authenticated = request.headers.get('x-sa-authenticated') === 'true';
 
+			// The access config and its fingerprint, computed ONCE here. Everything
+			// downstream — the audit row, every message's authContext, the engine —
+			// carries this same string rather than hashing the config again, so no
+			// two implementations can drift apart.
+			const sessionConfig = decodeSessionConfig(request.headers.get('x-sa-session-config'));
+			const sessionAccessHash = sessionConfig == null ? null : await accessHash(sessionConfig);
+
 			// Attach metadata using serializeAttachment for hibernatable WebSockets
 			const clientMetadata = {
 				clientId: clientId,
@@ -395,11 +411,24 @@ export class Broadcaster implements DurableObject {
 				// The verified data-access config, decoded from the base64 header the
 				// worker set. Stored on the attachment (not this.clients) so it
 				// survives hibernation, exactly like userId/role.
-				config: decodeSessionConfig(request.headers.get('x-sa-session-config')),
+				config: sessionConfig,
+				configSource: accessConfigSource(request.headers.get('x-sa-session-config-source')),
+				...(sessionAccessHash ? { accessHash: sessionAccessHash } : {}),
 				userAgent: request.headers.get('User-Agent') || 'unknown',
 				origin: request.headers.get('Origin') || 'unknown'
 			};
 			(server as any).serializeAttachment(clientMetadata);
+
+			// Write down what this user was allowed to see, so the questions they
+			// ask from here can point back at it. Not awaited: a handshake does not
+			// wait on an audit row, and the DO stays alive to finish it.
+			if (authenticated && clientMetadata.userId) {
+				void this.accessRecord.record(
+					{ userId: clientMetadata.userId, orgId: clientMetadata.orgId },
+					sessionConfig,
+					sessionAccessHash,
+				);
+			}
 
 			const broadcastClient: BroadcastClient = {
 				id: clientId,
@@ -662,6 +691,8 @@ export class Broadcaster implements DurableObject {
 					orgId: metadata.orgId ?? undefined,
 					role: metadata.role ?? undefined,
 					config: metadata.config ?? undefined,
+					configSource: metadata.configSource ?? undefined,
+					accessHash: metadata.accessHash ?? undefined,
 					authenticated: metadata.authenticated === true,
 				}
 			: null;
@@ -787,6 +818,8 @@ export class Broadcaster implements DurableObject {
 				...(clientInfo.orgId ? { orgId: clientInfo.orgId } : {}),
 				...(clientInfo.role ? { role: clientInfo.role } : {}),
 				...(clientInfo.config != null ? { config: clientInfo.config } : {}),
+				...(clientInfo.configSource ? { configSource: clientInfo.configSource } : {}),
+				...(clientInfo.accessHash ? { accessHash: clientInfo.accessHash } : {}),
 				...(graphVersion !== undefined ? { graphVersion } : {}),
 			};
 		}

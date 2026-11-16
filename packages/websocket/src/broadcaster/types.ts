@@ -6,12 +6,28 @@
  * deployment with WS_AUTH_ENFORCE off simply never sees it. Consumers must
  * treat its ABSENCE as "unknown", never as "trusted".
  */
+export type AccessConfigSource = 'token' | 'stored' | 'none';
+
 export interface MessageAuthContext {
 	userId: string;
 	orgId?: string;
 	role?: string;
 	/** Verified data-access config from the users table — see VerifiedSession.config. */
 	config?: unknown;
+	/**
+	 * Where that config came from — the customer's token, the platform's stored
+	 * copy, or neither. The engine records it per question, and it cannot be
+	 * worked out from `config` alone: an absent config could be either "the
+	 * customer sent nothing" or "the user has no restriction".
+	 */
+	configSource?: AccessConfigSource;
+	/**
+	 * Fingerprint of `config`, resolving to a row in access_configs. Computed
+	 * HERE and only here: the engine forwards this string rather than hashing
+	 * the same config again, so the two can never drift apart. Absent when the
+	 * user has no restriction — `configSource` says 'none' instead.
+	 */
+	accessHash?: string;
 	/** The knowledge graph this user's questions use: "draft" or a release seq. Absent = the live release. */
 	graphVersion?: 'draft' | number;
 }
@@ -28,6 +44,8 @@ export type ClientInfo = {
 	orgId?: string;
 	role?: string;
 	config?: unknown;
+	configSource?: AccessConfigSource;
+	accessHash?: string;
 	authenticated?: boolean;
 };
 

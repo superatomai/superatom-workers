@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { eq, and, sql, desc, gt, gte, lte, count, sum, avg, getTableColumns } from "drizzle-orm";
-import { chatAnalytics } from "../db/schema";
+import { accessConfigs, chatAnalytics } from "../db/schema";
 import { typeCondition, statusCondition, attachmentCountSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
@@ -45,6 +45,14 @@ analyticsRouter.post("/analytics/chat", async (c) => {
     latencyMs: number;
     status: "success" | "error" | "aborted";
     errorMessage?: string;
+    // What the asker was allowed to see — see ACCESS-AUDIT-PLAN.md. Optional:
+    // an SDK that predates them simply sends neither, which is recorded as
+    // "never stamped" rather than "no restriction".
+    //
+    // Self-asserted, like everything else on this route: the relay's own
+    // access_configs row is the trustworthy half.
+    accessSource?: "token" | "stored" | "none";
+    accessHash?: string;
   }>();
 
   const type = body.type || "chat_agent";
@@ -78,6 +86,10 @@ analyticsRouter.post("/analytics/chat", async (c) => {
       latencyMs: body.latencyMs,
       status: body.status,
       errorMessage: body.errorMessage || null,
+      accessSource: body.accessSource ?? null,
+      // Only alongside a source: a hash with nothing saying where it came from
+      // is a dangling reference, and the trail is better off recording nothing.
+      accessHash: body.accessSource ? body.accessHash ?? null : null,
     })
     .returning({ id: chatAnalytics.id, conversationId: chatAnalytics.conversationId });
 
@@ -151,8 +163,20 @@ analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
       // question on that thread and up to this one (0 when none, or no thread). A thread can hold
       // several uploads — e.g. the same question re-asked after deleting the earlier one.
       attachmentCount: attachmentCountSql,
+      // What the asker could reach when this was answered. `accessSource` says
+      // which of the three cases it is — see the chat_analytics columns — and
+      // this resolves the hash to the access itself so the caller needs no
+      // second request. Null for 'none' and for rows that predate recording.
+      accessConfig: accessConfigs.config,
     })
     .from(chatAnalytics)
+    .leftJoin(
+      accessConfigs,
+      and(
+        eq(accessConfigs.userId, chatAnalytics.userId),
+        eq(accessConfigs.accessHash, chatAnalytics.accessHash),
+      ),
+    )
     .where(where)
     .orderBy(desc(chatAnalytics.createdAt))
     .limit(limit)
@@ -332,8 +356,18 @@ analyticsRouter.get("/analytics/chat/:id", authMiddleware, adminOnly, async (c) 
   if (orgId) conditions.push(eq(chatAnalytics.orgId, orgId));
 
   const [event] = await db
-    .select()
+    .select({
+      ...getTableColumns(chatAnalytics),
+      accessConfig: accessConfigs.config,
+    })
     .from(chatAnalytics)
+    .leftJoin(
+      accessConfigs,
+      and(
+        eq(accessConfigs.userId, chatAnalytics.userId),
+        eq(accessConfigs.accessHash, chatAnalytics.accessHash),
+      ),
+    )
     .where(and(...conditions))
     .limit(1);
 
