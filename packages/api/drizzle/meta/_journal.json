@@ -267,6 +267,41 @@
       "when": 1794815303535,
       "tag": "0037_fluffy_night_nurse",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1794910578784,
+      "tag": "0038_fine_archangel",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1794915475652,
+      "tag": "0039_purple_ravenous",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1794917172686,
+      "tag": "0040_mature_tony_stark",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1794919625330,
+      "tag": "0041_overjoyed_ezekiel_stane",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1794920823549,
+      "tag": "0042_wise_nick_fury",
+      "breakpoints": true
     }
   ]
 }

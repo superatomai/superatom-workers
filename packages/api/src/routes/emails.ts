@@ -3,7 +3,7 @@ import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { emailApiKeys, emailAttachments, emailBranding, emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
+import { authMiddleware, requirePermission, orgScopeGuard } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
 import { checkObject, deleteObject, signObjectUrl } from "../lib/r2-objects";
 import { fromAddress, sendEmail } from "../lib/email";
@@ -34,7 +34,8 @@ import { matchesMagicBytes } from "./upload";
  */
 const emails = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
-emails.use("*", authMiddleware, adminOnly, orgScopeGuard);
+// emails.manage; creating an email API key further needs an Owner or Admin (below).
+emails.use("*", authMiddleware, requirePermission("emails.manage"), orgScopeGuard);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;

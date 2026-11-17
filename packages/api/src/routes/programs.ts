@@ -15,6 +15,7 @@ import { authenticateRequest } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
 import { builtKey, draftsFor, engineView, liveVersions, parseRegistration, sourceKey } from "../lib/programs/catalogue";
 import { notifyPrograms } from "../lib/programs/notify";
+import { projectAllowed } from "../lib/project-scope";
 
 const router = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -27,7 +28,10 @@ function hasServiceToken(c: AppContext): boolean {
   return Boolean(token) && token === c.env.SA_INTERNAL_SERVICE_TOKEN;
 }
 
-/** Service token, or a signed-in admin of the project's org. */
+/**
+ * Service token, or a signed-in user of the project's org. `adminOnly` routes
+ * (register, upload, publish, unpublish, pin) need the programs.publish permission.
+ */
 async function caller(c: AppContext, projectId: string, opts: { adminOnly: boolean }): Promise<{ ok: true; caller: Caller; orgId: string } | { ok: false; status: 401 | 403 | 404; error: string }> {
   if (!UUID.test(projectId)) return { ok: false, status: 404, error: "Project not found" };
   const db = c.get("db");
@@ -36,9 +40,12 @@ async function caller(c: AppContext, projectId: string, opts: { adminOnly: boole
   if (hasServiceToken(c)) return { ok: true, caller: { kind: "service", who: c.req.header("X-SA-Actor") ?? "service" }, orgId: project.orgId };
   const auth = await authenticateRequest(c as any);
   if (!auth.ok) return { ok: false, status: 401, error: auth.error };
-  const isAdmin = auth.role === "org_admin" || auth.role === "super_admin";
   if (auth.role !== "super_admin" && auth.orgId !== project.orgId) return { ok: false, status: 403, error: "Not permitted for this project" };
-  if (opts.adminOnly && !isAdmin) return { ok: false, status: 403, error: "Forbidden: admin role required" };
+  // Project scope (lib/project-scope.ts): a project outside it is closed to them.
+  if (!(await projectAllowed(db, { userId: auth.userId, userRole: auth.role, orgRole: auth.orgRole, projectScope: auth.projectScope }, projectId))) {
+    return { ok: false, status: 403, error: "Not permitted for this project" };
+  }
+  if (opts.adminOnly && !auth.permissions.includes("programs.publish")) return { ok: false, status: 403, error: "Forbidden: requires programs.publish" };
   const [u] = await db.select({ email: users.email }).from(users).where(eq(users.id, auth.userId)).limit(1);
   return { ok: true, caller: { kind: "user", userId: auth.userId, email: u?.email ?? auth.userId, role: auth.role, orgId: auth.orgId }, orgId: project.orgId };
 }

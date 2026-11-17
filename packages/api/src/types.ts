@@ -103,6 +103,14 @@ export type AppVariables = {
   userId: string;
   orgId: string | null;
   userRole: "super_admin" | "org_admin" | "member";
+  /** The caller's organization role: owner, admin, member, a custom role's key, or super_admin. */
+  orgRole: string;
+  /** The caller's role row (users.role_id), for grants made to a role; null when unset. */
+  roleId: string | null;
+  /** all, or selected (only their projects); see lib/project-scope.ts. */
+  projectScope: string;
+  /** What the caller may do (lib/permissions.ts), resolved from their role on every request. */
+  permissions: readonly string[];
   /** The caller's login session (refresh-token family), from the token's `sid`; null for older tokens. */
   sessionId: string | null;
   /** "sdk" when the token came from the SDK exchange — such a session always acts as a member. */

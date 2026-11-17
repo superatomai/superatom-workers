@@ -14,6 +14,7 @@ import samlRoutes from "./routes/saml";
 import bootstrapRoutes from "./routes/bootstrap";
 import orgRoutes from "./routes/orgs";
 import usersRoutes from "./routes/users";
+import rolesRoutes from "./routes/roles";
 import projectsRoutes from "./routes/projects";
 import appsRoutes from "./routes/apps";
 import permissionsRoutes from "./routes/permissions";
@@ -139,6 +140,7 @@ app.route("/auth/sdk", sdkAuthRoutes);
 app.route("/auth", bootstrapRoutes);
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);
+app.route("/orgs/:orgId/roles", rolesRoutes);
 app.route("/orgs/:orgId/projects", projectsRoutes);
 app.route("/orgs/:orgId/emails/messages", emailMessagesRoutes); // email API key, so before emailsRoutes' login middleware
 app.route("/orgs/:orgId/emails", emailsRoutes); // org announcements (org admins)

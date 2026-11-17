@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { and, desc, eq, gte, lte } from "drizzle-orm";
 import { checklistRuns } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
+import { authMiddleware, requirePermission, scopedOrgId } from "../middleware/auth";
 import { parseChecklistReportBody, storeChecklistReport } from "../lib/checklist-reports";
 
 const checklistReportsRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -39,7 +39,7 @@ checklistReportsRouter.post("/checklist-reports", async (c) => {
  * GET /checklist-reports?checklistId=&orgId=&projectId=&status=&from=&to=&limit=&offset=
  * List runs for the analytics/reports page (admin only). Index-only — no R2 reads.
  */
-checklistReportsRouter.get("/checklist-reports", authMiddleware, adminOnly, async (c) => {
+checklistReportsRouter.get("/checklist-reports", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const checklistId = c.req.query("checklistId");
   const orgId = scopedOrgId(c);
@@ -74,7 +74,7 @@ checklistReportsRouter.get("/checklist-reports", authMiddleware, adminOnly, asyn
  * R2, for the run-detail view (admin only). Registered after the list route
  * above so ":id" never shadows a more specific literal segment later added.
  */
-checklistReportsRouter.get("/checklist-reports/:id", authMiddleware, adminOnly, async (c) => {
+checklistReportsRouter.get("/checklist-reports/:id", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const id = c.req.param("id");
 

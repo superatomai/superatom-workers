@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { and, desc, eq, gt } from "drizzle-orm";
 import { projectInstalls, projectReleases, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, requirePermission } from "../middleware/auth";
 import { assertProjectAccess } from "../lib/project-access";
 
 /**
@@ -13,7 +13,7 @@ import { assertProjectAccess } from "../lib/project-access";
  * is behind, updating or in sync is derived here, so the rows cannot go stale.
  */
 const releaseRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
-releaseRouter.use("*", authMiddleware, adminOnly);
+releaseRouter.use("*", authMiddleware, requirePermission("updates.manage"));
 
 type Install = typeof projectInstalls.$inferSelect;
 type Release = typeof projectReleases.$inferSelect;

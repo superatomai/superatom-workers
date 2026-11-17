@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { eq, and, sql, desc, gte, lte, count, sum, avg } from "drizzle-orm";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
+import { authMiddleware, requirePermission, scopedOrgId } from "../middleware/auth";
 import { speechUsage } from "../db/schema";
 
 const speechRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -124,7 +124,7 @@ function parseUsageScopeParams(c: any) {
  * content is never logged (docs/SPEECH-TO-TEXT-DESIGN.md §9), so there's
  * nothing sensitive in these rows beyond the usual usage-metering shape.
  */
-speechRouter.get("/usage", adminOnly, async (c) => {
+speechRouter.get("/usage", requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const { where } = parseUsageScopeParams(c);
   const ok = c.req.query("ok");
@@ -150,7 +150,7 @@ speechRouter.get("/usage", adminOnly, async (c) => {
  * GET /speech/usage/summary?orgId=&projectId=&from=&to=
  * Aggregated totals plus per-user and per-org breakdowns (admin only).
  */
-speechRouter.get("/usage/summary", adminOnly, async (c) => {
+speechRouter.get("/usage/summary", requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const { where } = parseUsageScopeParams(c);
 
@@ -203,7 +203,7 @@ const MAX_USAGE_TRENDS_SPAN_DAYS = 366;
  * GET /speech/usage/trends?orgId=&projectId=&from=&to=
  * Per-day request counts plus a success/error breakdown (admin only).
  */
-speechRouter.get("/usage/trends", adminOnly, async (c) => {
+speechRouter.get("/usage/trends", requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const { where, from, to } = parseUsageScopeParams(c);
 

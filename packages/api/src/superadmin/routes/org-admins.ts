@@ -7,6 +7,7 @@ import { validatePassword } from "../../lib/password-policy";
 import { revocationCutoff } from "../lib/session";
 import { orgRequiresSso } from "../../lib/sso-required";
 import { cleanEmail, cleanName, isUniqueViolation, isUuid, orgUserPasswordHash } from "../lib/validate";
+import { builtInRoleId, recordRoleChange } from "../../lib/permissions";
 
 /** Org admins of one org (rows in `users` with role org_admin). Mounted at /api/orgs/:orgId/admins, behind requireSuperAdmin. */
 const orgAdmins = new Hono<{ Bindings: Env; Variables: SuperAdminVariables }>();
@@ -89,6 +90,19 @@ orgAdmins.post("/", async (c) => {
     return c.json({ error: `${email} ${detail}.` }, 409);
   }
 
+  // The organization's first admin becomes its Owner: someone has to be able to
+  // manage admins, and only an Owner can. Later ones are ordinary admins.
+  const ownerRoleId = await builtInRoleId(db, "owner");
+  const [hasOwner] = ownerRoleId
+    ? await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(eq(users.orgId, orgId), eq(users.roleId, ownerRoleId), eq(users.isActive, true)))
+        .limit(1)
+    : [undefined];
+  const orgRole = ownerRoleId && !hasOwner ? "owner" : "admin";
+  const roleId = orgRole === "owner" ? ownerRoleId : await builtInRoleId(db, "admin");
+
   try {
     const [admin] = await db
       .insert(users)
@@ -98,9 +112,12 @@ orgAdmins.post("/", async (c) => {
         name,
         passwordHash: ssoOnly ? null : await orgUserPasswordHash(body!.password as string),
         role: "org_admin",
+        roleId,
       })
       .returning(adminColumns);
-    return c.json({ admin }, 201);
+    // No changedBy: a super admin is not a user of this organization.
+    await recordRoleChange(db, { orgId, userId: admin.id, changedBy: null, fromRole: null, toRole: orgRole });
+    return c.json({ admin: { ...admin, orgRole } }, 201);
   } catch (err) {
     if (isUniqueViolation(err)) return c.json({ error: `${email} already exists in this organization.` }, 409);
     throw err;

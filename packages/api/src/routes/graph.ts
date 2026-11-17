@@ -3,7 +3,8 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { concepts, graphChangeHeads, graphChangeRequests, graphChanges, graphEdges, graphEngineState, graphNodes, graphReleaseEvents, graphReleases, users } from "../db/schema";
 import { withTransaction, type Tx } from "../db/tx";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, requirePermission } from "../middleware/auth";
+import { roleAndPermissions } from "../lib/permissions";
 import { assertProjectAccess, type AppContext } from "../lib/project-access";
 import { HttpError } from "../lib/graph/errors";
 import {
@@ -36,10 +37,10 @@ import {
 import { currentRelease, diffItems, discardDraft, getRelease, notifyChanges, notifyRelease, pendingChanges, publish, releaseContent, rollback, type ReleaseItem } from "../lib/graph/release";
 import { importGraph, type ImportMode } from "../lib/graph/import";
 
-/** Composition graph routes (/projects/:projectId/graph), org admins only; engines get every edit as their draft and answer from the published release. */
+/** Composition graph routes (/projects/:projectId/graph), for whoever holds graph.manage; engines get every edit as their draft and answer from the published release. */
 
 const graphRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
-graphRouter.use("*", authMiddleware, adminOnly);
+graphRouter.use("*", authMiddleware, requirePermission("graph.manage"));
 
 /** Resolves the project, builds the caller's scope, and turns HttpError into a JSON response. */
 function handler(fn: (c: AppContext, s: Scope) => Promise<Response>) {
@@ -87,17 +88,21 @@ const withOwner = <T extends { ownerId: string | null }>(row: T, owners: Map<str
   owner: row.ownerId ? { id: row.ownerId, ...(owners.get(row.ownerId) ?? { name: null, email: null }) } : null,
 });
 
-/** The new owner must be an active org admin of the project's org. */
+/** The new owner must be an active member of the project's org who may manage the graph. */
 async function assertAdminOfOrg(c: AppContext, s: Scope, userId: unknown): Promise<string> {
   if (typeof userId !== "string" || !/^[0-9a-f-]{36}$/i.test(userId)) throw new HttpError(400, "ownerId must be a user id");
-  const [u] = await c
-    .get("db")
-    .select({ orgId: users.orgId, role: users.role, isActive: users.isActive })
+  const db = c.get("db");
+  const [u] = await db
+    .select({ orgId: users.orgId, role: users.role, roleId: users.roleId, isActive: users.isActive })
     .from(users)
     .where(eq(users.id, userId))
     .limit(1);
-  if (!u || !u.isActive || u.orgId !== s.orgId || u.role !== "org_admin") {
-    throw new HttpError(400, "The new owner must be an active org admin of this organization");
+  if (!u || !u.isActive || u.orgId !== s.orgId) {
+    throw new HttpError(400, "The new owner must be an active member of this organization who can manage the graph");
+  }
+  const { permissions } = await roleAndPermissions(db, u);
+  if (!permissions.includes("graph.manage")) {
+    throw new HttpError(400, "The new owner must be an active member of this organization who can manage the graph");
   }
   return userId;
 }

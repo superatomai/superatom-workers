@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import { eq } from "drizzle-orm";
 import { projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
+import { projectAllowed, scopeOfRequest } from "./project-scope";
 
 export type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 
@@ -25,6 +26,12 @@ export async function assertProjectAccess(c: AppContext, projectId: string): Pro
 
   if (!row) return { ok: false, status: 404, error: "Project not found" };
   if (c.get("userRole") !== "super_admin" && row.orgId !== c.get("orgId")) {
+    return { ok: false, status: 403, error: "Not permitted for this project" };
+  }
+  // Project scope (lib/project-scope.ts): a project outside it is closed to them.
+  // A service token has no user, and no scope.
+  const scope = await scopeOfRequest(c);
+  if (scope && !(await projectAllowed(c.get("db"), scope, projectId))) {
     return { ok: false, status: 403, error: "Not permitted for this project" };
   }
   return { ok: true, orgId: row.orgId };

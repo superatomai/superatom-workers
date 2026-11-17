@@ -3,7 +3,7 @@ import { eq, and, sql } from "drizzle-orm";
 import { SignJWT, jwtVerify, createRemoteJWKSet } from "jose";
 import { users, organizations, ssoConfigs } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, requirePermission } from "../middleware/auth";
 import {
   generateRequestId,
   buildAuthnRequest,
@@ -462,7 +462,7 @@ sso.get("/callback", async (c) => {
  * GET /auth/sso/config
  * Get the SSO configuration for the current user's org.
  */
-sso.get("/config", authMiddleware, adminOnly, async (c) => {
+sso.get("/config", authMiddleware, requirePermission("org.settings"), async (c) => {
   const db = c.get("db");
   const orgId = c.get("orgId");
   if (!orgId) {
@@ -498,7 +498,7 @@ sso.get("/config", authMiddleware, adminOnly, async (c) => {
  * POST /auth/sso/config
  * Create or update SSO configuration for the current user's org.
  */
-sso.post("/config", authMiddleware, adminOnly, async (c) => {
+sso.post("/config", authMiddleware, requirePermission("org.settings"), async (c) => {
   const db = c.get("db");
   const orgId = c.get("orgId");
   if (!orgId) {
@@ -639,7 +639,7 @@ sso.post("/config", authMiddleware, adminOnly, async (c) => {
  * DELETE /auth/sso/config
  * Remove SSO configuration for the current user's org.
  */
-sso.delete("/config", authMiddleware, adminOnly, async (c) => {
+sso.delete("/config", authMiddleware, requirePermission("org.settings"), async (c) => {
   const db = c.get("db");
   const orgId = c.get("orgId");
   if (!orgId) {

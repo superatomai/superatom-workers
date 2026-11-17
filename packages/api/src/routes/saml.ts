@@ -12,7 +12,7 @@ import {
   parseIdpMetadata,
   SamlError,
 } from "../lib/saml";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, requirePermission } from "../middleware/auth";
 import { isAllowedRedirect } from "../lib/origins";
 import { mintAccessToken } from "../lib/access-token";
 import { issueRefreshToken } from "../lib/refresh-tokens";
@@ -383,7 +383,7 @@ saml.post("/acs", async (c) => {
  * POST /auth/sso/saml/from-metadata
  * Parse a SAML metadata URL and extract IdP configuration.
  */
-saml.post("/from-metadata", authMiddleware, adminOnly, async (c) => {
+saml.post("/from-metadata", authMiddleware, requirePermission("org.settings"), async (c) => {
   const body = await c.req.json<{ metadataUrl: string }>();
 
   if (!body.metadataUrl) {

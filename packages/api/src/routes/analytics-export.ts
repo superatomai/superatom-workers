@@ -3,7 +3,7 @@ import { eq, and, sql, desc, gt, gte, lte, count } from "drizzle-orm";
 import { chatAnalytics, organizations, projects, users } from "../db/schema";
 import { typeCondition, statusCondition, attachmentNamesSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
+import { authMiddleware, requirePermission, scopedOrgId } from "../middleware/auth";
 
 const analyticsExportRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -20,7 +20,7 @@ const analyticsExportRouter = new Hono<{ Bindings: Env; Variables: AppVariables 
  * uses it for a progress percentage. Page with limit/offset until `rows` has
  * fewer than `limit` entries.
  */
-analyticsExportRouter.get("/", authMiddleware, adminOnly, async (c) => {
+analyticsExportRouter.get("/", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
