@@ -52,6 +52,7 @@ analyticsExportRouter.get("/", authMiddleware, adminOnly, async (c) => {
       type: chatAnalytics.type,
       status: chatAnalytics.status,
       latencyMs: chatAnalytics.latencyMs,
+      model: chatAnalytics.model,
       orgId: chatAnalytics.orgId,
       orgName: organizations.name,
       projectId: chatAnalytics.projectId,
