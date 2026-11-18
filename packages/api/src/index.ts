@@ -12,6 +12,7 @@ import authRoutes from "./routes/auth";
 import ssoRoutes from "./routes/sso";
 import samlRoutes from "./routes/saml";
 import bootstrapRoutes from "./routes/bootstrap";
+import superAdminUsersRoutes from "./routes/super-admin-users";
 import orgRoutes from "./routes/orgs";
 import usersRoutes from "./routes/users";
 import projectsRoutes from "./routes/projects";
@@ -137,6 +138,7 @@ app.route("/auth/sso", ssoRoutes);
 app.route("/auth/sso/saml", samlRoutes);
 app.route("/auth/sdk", sdkAuthRoutes);
 app.route("/auth", bootstrapRoutes);
+app.route("/admin/super-admins", superAdminUsersRoutes); // super admin only: add another super admin
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);
 app.route("/orgs/:orgId/projects", projectsRoutes);
