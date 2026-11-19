@@ -1,7 +1,15 @@
 import { eq, inArray, sql } from "drizzle-orm";
-import { chatAnalytics, files } from "../db/schema";
+import { chatAnalytics, files, projects } from "../db/schema";
 
 // The type / status filters and the attachment lookups shared by GET /analytics/chat and GET /analytics/export.
+
+/**
+ * The org a row really belongs to: its project's org. chat_analytics.org_id is whatever the
+ * client's SA_ORG_ID said when the event was posted, which can disagree with the project, so
+ * every read (filter, display, totals) goes through the project instead. Falls back to the
+ * stored org_id only if the project is gone.
+ */
+export const projectOrgSql = sql<string | null>`coalesce((select ${projects.orgId} from ${projects} where ${projects.id} = ${chatAnalytics.projectId}), ${chatAnalytics.orgId})`;
 
 const TYPES = ["chat_agent", "dashboard", "report"] as const;
 type AnalyticsType = (typeof TYPES)[number];

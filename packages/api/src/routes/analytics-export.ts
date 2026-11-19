@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { eq, and, sql, desc, gt, gte, lte, count } from "drizzle-orm";
 import { chatAnalytics, organizations, projects, users } from "../db/schema";
-import { typeCondition, statusCondition, attachmentNamesSql } from "../lib/analytics-filters";
+import { typeCondition, statusCondition, attachmentNamesSql, projectOrgSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
 
@@ -37,7 +37,7 @@ analyticsExportRouter.get("/", authMiddleware, adminOnly, async (c) => {
   if (Number.isFinite(minLatencyMs) && minLatencyMs > 0) conditions.push(gt(chatAnalytics.latencyMs, minLatencyMs));
   const typeCond = typeCondition(c.req.query("type"));
   if (typeCond) conditions.push(typeCond);
-  if (orgId) conditions.push(eq(chatAnalytics.orgId, orgId));
+  if (orgId) conditions.push(eq(projectOrgSql, orgId));
   if (projectId) conditions.push(eq(chatAnalytics.projectId, projectId));
   if (userId) conditions.push(eq(chatAnalytics.userId, userId));
   const statusCond = statusCondition(status);
@@ -53,7 +53,7 @@ analyticsExportRouter.get("/", authMiddleware, adminOnly, async (c) => {
       status: chatAnalytics.status,
       latencyMs: chatAnalytics.latencyMs,
       model: chatAnalytics.model,
-      orgId: chatAnalytics.orgId,
+      orgId: projects.orgId,
       orgName: organizations.name,
       projectId: chatAnalytics.projectId,
       projectName: projects.name,
@@ -75,7 +75,7 @@ analyticsExportRouter.get("/", authMiddleware, adminOnly, async (c) => {
     .from(chatAnalytics)
     .innerJoin(users, eq(users.id, chatAnalytics.userId))
     .innerJoin(projects, eq(projects.id, chatAnalytics.projectId))
-    .leftJoin(organizations, eq(organizations.id, chatAnalytics.orgId))
+    .leftJoin(organizations, eq(organizations.id, projects.orgId))
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     // id as tiebreaker so rows with the same timestamp don't shuffle between pages
     .orderBy(desc(chatAnalytics.createdAt), desc(chatAnalytics.id))

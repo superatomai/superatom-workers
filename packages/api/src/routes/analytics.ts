@@ -1,9 +1,11 @@
 import { Hono } from "hono";
 import { eq, and, sql, desc, gt, gte, lte, count, sum, avg, getTableColumns } from "drizzle-orm";
-import { accessConfigs, chatAnalytics } from "../db/schema";
-import { typeCondition, statusCondition, attachmentCountSql } from "../lib/analytics-filters";
+import { accessConfigs, chatAnalytics, projects } from "../db/schema";
+import { typeCondition, statusCondition, attachmentCountSql, projectOrgSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const analyticsRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -64,12 +66,36 @@ analyticsRouter.post("/analytics/chat", async (c) => {
     return c.json({ error: "question is required for type=chat_agent" }, 400);
   }
 
+  // The org is the project's own, not the one the client's env claims: SA_ORG_ID is typed
+  // by hand per deployment and can disagree with the project. Falls back to what the client
+  // sent when the project can't be found, so no event is dropped.
+  let orgId: string | null = body.orgId || null;
+  if (UUID_RE.test(body.projectId)) {
+    try {
+      const [project] = await db
+        .select({ orgId: projects.orgId })
+        .from(projects)
+        .where(eq(projects.id, body.projectId))
+        .limit(1);
+      if (project) {
+        if (orgId && orgId !== project.orgId) {
+          console.warn(
+            `[analytics] org mismatch for project ${body.projectId}: client sent ${orgId}, project belongs to ${project.orgId}`,
+          );
+        }
+        orgId = project.orgId;
+      }
+    } catch (err) {
+      console.error("[analytics] project org lookup failed, using the client's orgId:", err);
+    }
+  }
+
   const [event] = await db
     .insert(chatAnalytics)
     .values({
       type,
       userId: body.userId,
-      orgId: body.orgId || null,
+      orgId,
       projectId: body.projectId,
       threadId: body.threadId || null,
       messageIndex: body.messageIndex ?? null,
@@ -146,7 +172,7 @@ analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
   if (Number.isFinite(minLatencyMs) && minLatencyMs > 0) conditions.push(gt(chatAnalytics.latencyMs, minLatencyMs));
   const typeCond = typeCondition(c.req.query("type"));
   if (typeCond) conditions.push(typeCond);
-  if (orgId) conditions.push(eq(chatAnalytics.orgId, orgId));
+  if (orgId) conditions.push(eq(projectOrgSql, orgId));
   if (projectId) conditions.push(eq(chatAnalytics.projectId, projectId));
   if (userId) conditions.push(eq(chatAnalytics.userId, userId));
   const statusCond = statusCondition(status);
@@ -159,6 +185,7 @@ analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
   const events = await db
     .select({
       ...getTableColumns(chatAnalytics),
+      orgId: projectOrgSql,
       // Ready chat attachments uploaded for THIS question: on its thread, after the previous
       // question on that thread and up to this one (0 when none, or no thread). A thread can hold
       // several uploads — e.g. the same question re-asked after deleting the earlier one.
@@ -195,7 +222,7 @@ function parseScopeParams(c: any) {
   const to = c.req.query("to");
 
   const scopeConditions = [];
-  if (orgId) scopeConditions.push(eq(chatAnalytics.orgId, orgId));
+  if (orgId) scopeConditions.push(eq(projectOrgSql, orgId));
   if (projectId) scopeConditions.push(eq(chatAnalytics.projectId, projectId));
   if (from) scopeConditions.push(gte(chatAnalytics.createdAt, new Date(from)));
   if (to) scopeConditions.push(lte(chatAnalytics.createdAt, new Date(to)));
@@ -353,11 +380,12 @@ analyticsRouter.get("/analytics/chat/:id", authMiddleware, adminOnly, async (c) 
   const orgId = scopedOrgId(c);
 
   const conditions = [eq(chatAnalytics.id, id)];
-  if (orgId) conditions.push(eq(chatAnalytics.orgId, orgId));
+  if (orgId) conditions.push(eq(projectOrgSql, orgId));
 
   const [event] = await db
     .select({
       ...getTableColumns(chatAnalytics),
+      orgId: projectOrgSql,
       accessConfig: accessConfigs.config,
     })
     .from(chatAnalytics)
