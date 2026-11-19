@@ -1,12 +1,34 @@
 import { Hono } from "hono";
-import { eq, and, sql } from "drizzle-orm";
-import { users, appPermissions, apps } from "../db/schema";
+import { eq, and, sql, desc, inArray } from "drizzle-orm";
+import { accessConfigs, users, appPermissions, apps } from "../db/schema";
 import { validatePassword } from "../lib/password-policy";
 import { orgRequiresSso } from "../lib/sso-required";
+import { revokeAllForUser } from "../lib/refresh-tokens";
+import { buildFiltersConfig } from "../lib/sdk-access";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 
 const usersRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
+
+/**
+ * `users.config` is data access, so it gets the same check an SDK token's
+ * `access` claim gets at sign-in — the one validator, so the two ways of
+ * stating a user's access cannot drift into accepting different shapes.
+ *
+ * Worth doing because an unreadable policy is not ignored downstream: the
+ * policy gate refuses every query against that whole source rather than
+ * guessing. Written unchecked, a typo here looks fine until someone asks a
+ * question and gets refused, with nothing connecting the two.
+ *
+ * Returns the NORMALISED config to store, matching what the token path keeps,
+ * so the relay only ever reads a shape the validator has passed. `null` means
+ * no restriction and is left alone.
+ */
+function checkedConfig(config: unknown): { ok: true; config: unknown } | { ok: false; error: string } {
+  if (config === undefined || config === null) return { ok: true, config: null };
+  const result = buildFiltersConfig(config);
+  return result.ok ? { ok: true, config: result.config } : { ok: false, error: result.error };
+}
 
 usersRouter.use("*", authMiddleware, adminOnly, orgScopeGuard);
 
@@ -66,6 +88,11 @@ usersRouter.post("/", async (c) => {
     return c.json({ error: "Only admins can create org_admin users" }, 403);
   }
 
+  const checked = checkedConfig(config);
+  if (!checked.ok) {
+    return c.json({ error: `config is not valid data access: ${checked.error}` }, 400);
+  }
+
   // Case-insensitive email lookup within this org
   const [existing] = await db
     .select()
@@ -79,7 +106,7 @@ usersRouter.post("/", async (c) => {
       const passwordHash = ssoOnly ? null : await hashPassword(password!);
       const [reactivated] = await db
         .update(users)
-        .set({ name, passwordHash, role: role || "member", config, isActive: true, updatedAt: new Date() })
+        .set({ name, passwordHash, role: role || "member", config: checked.config, isActive: true, updatedAt: new Date() })
         .where(eq(users.id, existing.id))
         .returning({
           id: users.id,
@@ -106,7 +133,7 @@ usersRouter.post("/", async (c) => {
       name,
       passwordHash,
       role: role || "member",
-      config,
+      config: checked.config,
     })
     .returning({
       id: users.id,
@@ -153,6 +180,64 @@ usersRouter.get("/", async (c) => {
  * GET /orgs/:orgId/users/:userId
  * Get user details + their app permissions
  */
+/**
+ * GET /orgs/:orgId/users/:userId/access-history[?hash=a,b,c]
+ *
+ * Deliberately not `/access`: that reads as the user's CURRENT access, which is
+ * `users.config` and a different thing. This is the record of what they have
+ * had, by fingerprint.
+ *
+ * What this user was allowed to see, by fingerprint. The feedback screen gets a
+ * hash from the answer's own conversation row — which lives in the CLIENT's
+ * database, so it cannot join to this one — and resolves it here.
+ *
+ * Several hashes per call because a thread is read beside one answer: showing
+ * where access changed between questions means resolving a few at once. With no
+ * `hash`, every config this user has ever had, newest first.
+ *
+ * Keyed on (user_id, access_hash), the table's own primary key, so knowing a
+ * hash is not enough to read another user's — or another org's — access.
+ */
+usersRouter.get("/:userId/access-history", async (c) => {
+  const db = c.get("db");
+  const orgId = c.req.param("orgId")!;
+  const userId = c.req.param("userId");
+
+  // The user must be in the org in the path. orgScopeGuard proves the caller
+  // owns the ROUTE's org, not that the target user belongs to it.
+  const [owner] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.id, userId), eq(users.orgId, orgId)))
+    .limit(1);
+  if (!owner) return c.json({ error: "User not found" }, 404);
+
+  const hashes = (c.req.query("hash") || "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter((h) => /^[0-9a-f]{64}$/.test(h));
+  if (c.req.query("hash") !== undefined && hashes.length === 0) {
+    return c.json({ error: "hash must be one or more 64-character hex fingerprints" }, 400);
+  }
+
+  const conditions = [eq(accessConfigs.userId, userId)];
+  if (hashes.length) conditions.push(inArray(accessConfigs.accessHash, hashes));
+
+  const rows = await db
+    .select({
+      accessHash: accessConfigs.accessHash,
+      config: accessConfigs.config,
+      firstSeenAt: accessConfigs.firstSeenAt,
+    })
+    .from(accessConfigs)
+    .where(and(...conditions))
+    .orderBy(desc(accessConfigs.firstSeenAt));
+
+  // A hash with no row is not an error: the caller holds a fingerprint from
+  // somewhere else, and "we have never seen this one" is the answer.
+  return c.json(rows);
+});
+
 usersRouter.get("/:userId", async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
@@ -213,6 +298,7 @@ usersRouter.put("/:userId", async (c) => {
   // any value at runtime — which is exactly how super_admin got through.
   const body = await c.req.json<{
     name?: string;
+    email?: string;
     role?: string;
     isActive?: boolean;
     config?: unknown;
@@ -257,6 +343,7 @@ usersRouter.put("/:userId", async (c) => {
   // identity mapping). Unknown keys are now ignored instead of written.
   const updates: {
     name?: string;
+    email?: string;
     role?: "org_admin" | "member";
     isActive?: boolean;
     config?: unknown;
@@ -270,6 +357,28 @@ usersRouter.put("/:userId", async (c) => {
     updates.name = body.name;
   }
 
+  // Email is the login identity, so a change here is how this user signs in from
+  // now on. Taken on the admin's word — there is no confirmation to the new
+  // address — which means a typo locks the account out, since nothing else
+  // identifies it. Worth a confirm step in the UI.
+  if (body.email !== undefined) {
+    const email = typeof body.email === "string" ? body.email.trim() : "";
+    if (!email || email.length > 255 || !email.includes("@")) {
+      return c.json({ error: "Invalid email" }, 400);
+    }
+    // Case-insensitive within the org, matching how login looks an address up —
+    // otherwise two rows could differ only by case and either could win.
+    const [clash] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(sql`lower(${users.email}) = lower(${email})`, eq(users.orgId, orgId)))
+      .limit(1);
+    if (clash && clash.id !== userId) {
+      return c.json({ error: "A user with this email already exists in this organization" }, 409);
+    }
+    updates.email = email;
+  }
+
   if (body.isActive !== undefined) {
     if (typeof body.isActive !== "boolean") {
       return c.json({ error: "Invalid isActive" }, 400);
@@ -278,7 +387,12 @@ usersRouter.put("/:userId", async (c) => {
   }
 
   if (body.config !== undefined) {
-    updates.config = body.config;
+    // `null` is how an admin clears a restriction, so it stays allowed.
+    const checked = checkedConfig(body.config);
+    if (!checked.ok) {
+      return c.json({ error: `config is not valid data access: ${checked.error}` }, 400);
+    }
+    updates.config = checked.config;
   }
 
   // Role comes from the validated variable, never straight off the body.
@@ -307,6 +421,49 @@ usersRouter.put("/:userId", async (c) => {
   }
 
   return c.json(updated);
+});
+
+/**
+ * POST /orgs/:orgId/users/:userId/password
+ * Set a user's password. No current password: this is an admin resetting someone
+ * else's, which is the case where they do not have it.
+ *
+ * Its own route rather than a field on PUT, so an ordinary profile save never
+ * carries a password and cannot change one by accident.
+ *
+ * Every session of that user ends — the same cutoff logout uses. A reset exists
+ * because something is wrong with the account; leaving the old sessions alive
+ * would mean the password changed but whoever was already in stayed in.
+ */
+usersRouter.post("/:userId/password", async (c) => {
+  const db = c.get("db");
+  const orgId = c.req.param("orgId")!;
+  const userId = c.req.param("userId");
+
+  const body = await c.req.json<{ password?: unknown }>().catch(() => ({}) as { password?: unknown });
+  const pwError = validatePassword(body.password);
+  if (pwError) return c.json({ error: pwError }, 400);
+
+  const [updated] = await db
+    .update(users)
+    .set({
+      passwordHash: await hashPassword(body.password as string),
+      // Seconds, matching the `iat` resolution tokens are compared against.
+      tokensValidAfter: new Date(Math.floor(Date.now() / 1000) * 1000),
+      updatedAt: new Date(),
+    })
+    // Org-scoped: orgScopeGuard only proves the caller owns the ROUTE's org.
+    .where(and(eq(users.id, userId), eq(users.orgId, orgId)))
+    .returning({ id: users.id, email: users.email });
+
+  if (!updated) return c.json({ error: "User not found" }, 404);
+
+  // The access token dies at the cutoff; without this the refresh cookie could
+  // still mint new ones and the reset would not stick.
+  await revokeAllForUser(db, userId);
+
+  console.log(`[audit] password reset: actor=${c.get("userId")} target=${userId}`);
+  return c.json({ success: true });
 });
 
 /**

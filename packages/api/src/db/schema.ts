@@ -498,6 +498,15 @@ export const analyticsStatusEnum = pgEnum("analytics_status", [
 // ingest/query path rather than per-type tables so all three can be
 // queried/filtered together via a single `type` param instead of juggling
 // separate endpoints.
+export const accessSourceEnum = pgEnum("access_source", [
+  // The customer's own backend signed the access into the token.
+  "token",
+  // Nothing in the token, so the platform's `users.config` applied.
+  "stored",
+  // Neither — the user was unrestricted.
+  "none",
+]);
+
 export const analyticsTypeEnum = pgEnum("analytics_type", [
   "chat_agent",
   "dashboard",
@@ -550,6 +559,15 @@ export const chatAnalytics = pgTable(
     status: analyticsStatusEnum("status").notNull(),
     errorMessage: text("error_message"),
     feedback: varchar("feedback", { length: 50 }), // 'thumbs_up' | 'thumbs_down' | null
+    // Where this answer's access came from, and what it was. Read together:
+    //   'token' | 'stored' + a hash  → restricted; the hash resolves in access_configs
+    //   'none'              + NULL   → no restriction, and we know that
+    //   NULL                + NULL   → never recorded (older SDK, or the write
+    //                                  never arrived) — the one case worth chasing
+    // The source is stated rather than inferred, so a NULL never has to mean two
+    // things at once.
+    accessSource: accessSourceEnum("access_source"),
+    accessHash: varchar("access_hash", { length: 64 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
@@ -562,6 +580,7 @@ export const chatAnalytics = pgTable(
     index("chat_analytics_created_at_idx").on(table.createdAt),
     index("chat_analytics_model_idx").on(table.model),
     index("chat_analytics_status_idx").on(table.status),
+    index("chat_analytics_access_hash_idx").on(table.accessHash),
   ]
 );
 
@@ -579,6 +598,49 @@ export const chatAnalyticsRelations = relations(chatAnalytics, ({ one }) => ({
     references: [projects.id],
   }),
 }));
+
+// ─── Access Configs ──────────────────────────────────────
+//
+// What a user was allowed to see, kept so a question answered last week can say
+// what it was answered under. Access is decided per connection and otherwise
+// thrown away (sdk-auth.ts never writes it to the user), so this is the only
+// record.
+//
+// Only ever holds real restrictions. A user with no restriction gets no row —
+// chat_analytics.access_source says 'none' and that is the whole answer.
+//
+// Keyed by a sha256 of the canonical config, per user. Written once per user per
+// distinct config and never updated — the relay keeps the hashes it has already
+// written, so a returning config costs nothing.
+//
+// A DICTIONARY, not a log: a user going A → B → A leaves two rows, and the
+// sequence lives in the analytics rows, which carry the hash and a timestamp.
+// Neither `effective_from` nor `last_seen_at` belongs here; both would read as a
+// timeline this table cannot give.
+
+export const accessConfigs = pgTable(
+  "access_configs",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    // Canonical form is a contract shared with the engine (access-hash.ts in the
+    // websocket package, mirrored in sdk-nodejs). Change the rules in both or
+    // every lookup silently misses.
+    accessHash: varchar("access_hash", { length: 64 }).notNull(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "set null" }),
+    // Holds real customer values, as chat_analytics.question and .sql_generated
+    // already do. Whatever clears a user's analytics rows should clear these.
+    config: jsonb("config").notNull(),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.accessHash] }),
+    // Who else is on this exact access?
+    index("access_configs_access_hash_idx").on(table.accessHash),
+    index("access_configs_org_id_idx").on(table.orgId),
+  ]
+);
 
 // ─── Speech (voice input) Usage ──────────────────────────
 //
@@ -656,6 +718,25 @@ export const refreshTokens = pgTable(
 
 export const feedbackStatus = pgEnum('feedback_status', ['correct', 'incorrect', 'partial'])
 
+/**
+ * Where a piece of feedback GOT TO, which is not what it SAID.
+ *
+ * `status` is the reader's verdict on the answer. This is the triage outcome,
+ * set afterwards by whoever worked through it. Two different questions, so two
+ * columns — and the reason this one is not also called `status`.
+ *
+ * Short codes: the wording on screen is the UI's to change. "Won't fix / Not an
+ * issue" is a label; `not_an_issue` is the value.
+ */
+export const feedbackResolution = pgEnum('feedback_resolution', [
+  'open',
+  'resolved',
+  'later_scope',
+  'not_an_issue',
+  'duplicate',
+  'needs_info',
+])
+
 export const answerFeedback = pgTable("answer_feedback", {
   id: uuid("id").defaultRandom().primaryKey(),
   orgId: varchar("org_id", { length: 255 }),
@@ -667,6 +748,13 @@ export const answerFeedback = pgTable("answer_feedback", {
   status: feedbackStatus(),
   feedbackText: text("feedback_text"),
   answerSnapshot: jsonb("answer_snapshot"),
+  /* Every row that exists already becomes `open`, which is what it is. */
+  resolution: feedbackResolution("resolution").default('open').notNull(),
+  /* Why it was closed. Kept on the row rather than in a thread: one reason is
+     what a closure has. A conversation about it would be a second table. */
+  resolutionNote: text("resolution_note"),
+  resolvedBy: varchar("resolved_by", { length: 255 }),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   // Unique constraint for UPSERT: (userId, uiBlockId) — mirrors the local
@@ -679,6 +767,7 @@ export const answerFeedback = pgTable("answer_feedback", {
   index("answer_feedback_thread_id_idx").on(table.threadId),
   index("answer_feedback_ui_block_id_idx").on(table.uiBlockId),
   index("answer_feedback_created_at_idx").on(table.createdAt),
+  index("answer_feedback_resolution_idx").on(table.resolution),
 ]);
 
 // ─── Product Feedback (Feedback 2) ──────────────────────

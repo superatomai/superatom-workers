@@ -26,6 +26,7 @@ const INTERNAL_IDENTITY_HEADERS = [
 	'x-sa-session-org',
 	'x-sa-session-role',
 	'x-sa-session-config',
+	'x-sa-session-config-source',
 ];
 
 /** Browser clients that authenticate with a user JWT rather than an API key. */
@@ -204,6 +205,9 @@ export default {
 						btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(session.config)))),
 					);
 				}
+				// Sent even when there is no config, because "unrestricted" is itself
+				// something the access trail records.
+				forwardedHeaders.set('x-sa-session-config-source', session.configSource);
 			}
 
 			const forwardedRequest = new Request(request, { headers: forwardedHeaders });

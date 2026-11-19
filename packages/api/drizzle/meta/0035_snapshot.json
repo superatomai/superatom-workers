@@ -1,9 +1,119 @@
 {
-  "id": "203006be-4576-4703-babf-9ea76ff8cdc4",
+  "id": "42bca61b-37e1-4a88-8c79-31b4a439e8a1",
   "prevId": "5adb9411-8c19-49c2-85fa-55e0fd53061f",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
+    "public.access_configs": {
+      "name": "access_configs",
+      "schema": "",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "access_hash": {
+          "name": "access_hash",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "org_id": {
+          "name": "org_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "config": {
+          "name": "config",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "first_seen_at": {
+          "name": "first_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "access_configs_access_hash_idx": {
+          "name": "access_configs_access_hash_idx",
+          "columns": [
+            {
+              "expression": "access_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "access_configs_org_id_idx": {
+          "name": "access_configs_org_id_idx",
+          "columns": [
+            {
+              "expression": "org_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "access_configs_user_id_users_id_fk": {
+          "name": "access_configs_user_id_users_id_fk",
+          "tableFrom": "access_configs",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "access_configs_org_id_organizations_id_fk": {
+          "name": "access_configs_org_id_organizations_id_fk",
+          "tableFrom": "access_configs",
+          "tableTo": "organizations",
+          "columnsFrom": [
+            "org_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "access_configs_user_id_access_hash_pk": {
+          "name": "access_configs_user_id_access_hash_pk",
+          "columns": [
+            "user_id",
+            "access_hash"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.answer_feedback": {
       "name": "answer_feedback",
       "schema": "",
@@ -640,6 +750,25 @@
           "primaryKey": false,
           "notNull": false
         },
+        "access_source": {
+          "name": "access_source",
+          "type": "access_source",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "access_hash": {
+          "name": "access_hash",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "access_applied": {
+          "name": "access_applied",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -774,6 +903,21 @@
           "columns": [
             {
               "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "chat_analytics_access_hash_idx": {
+          "name": "chat_analytics_access_hash_idx",
+          "columns": [
+            {
+              "expression": "access_hash",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -4852,20 +4996,6 @@
           "notNull": true,
           "default": "'pending'"
         },
-        "current": {
-          "name": "current",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true,
-          "default": false
-        },
-        "pinned": {
-          "name": "pinned",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true,
-          "default": false
-        },
         "key": {
           "name": "key",
           "type": "varchar(512)",
@@ -5941,6 +6071,15 @@
     }
   },
   "enums": {
+    "public.access_source": {
+      "name": "access_source",
+      "schema": "public",
+      "values": [
+        "token",
+        "stored",
+        "none"
+      ]
+    },
     "public.analytics_status": {
       "name": "analytics_status",
       "schema": "public",

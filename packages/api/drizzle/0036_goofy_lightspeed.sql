@@ -1,0 +1,1 @@
+ALTER TABLE "chat_analytics" DROP COLUMN "access_applied";
