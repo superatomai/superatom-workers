@@ -2,9 +2,12 @@ import { createMiddleware } from "hono/factory";
 import type { Context } from "hono";
 import { decodeJwt, jwtVerify } from "jose";
 import { eq, sql } from "drizzle-orm";
-import { users, refreshTokens } from "../db/schema";
+import { users, refreshTokens, roles, rolePermissions, userPermissionLimits } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from "../lib/org-secrets";
+import { FIXED, hasFixedPower, orgRoleOf, permissionsOf, type FixedPower, type Permission } from "../lib/permissions";
+import { withDbRetry } from "../lib/db-retry";
+import { logRefusal } from "../lib/access-log";
 
 type AuthContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 
@@ -14,6 +17,11 @@ export type AuthResult =
       userId: string;
       orgId: string | null;
       role: AppVariables["userRole"];
+      /** Organization role (owner, admin, member, a custom key) and what it may do. */
+      orgRole: string;
+      roleId: string | null;
+      projectScope: string;
+      permissions: string[];
       /** The login session (refresh-token family) the token belongs to; null for pre-`sid` tokens. */
       sessionId: string | null;
       /** "sdk" for a token from the SDK exchange (always acts as a member); "app" otherwise. */
@@ -104,6 +112,12 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     | {
         orgId: string | null;
         role: AppVariables["userRole"];
+        roleId: string | null;
+        projectScope: string;
+        roleKey: string | null;
+        roleIsSystem: boolean | null;
+        customPermissions: string[] | null;
+        limits: string[] | null;
         isActive: boolean;
         tokensValidAfter: Date | null;
         sessionActive: boolean;
@@ -111,10 +125,21 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     | undefined;
   try {
     const db = c.get("db");
-    [user] = await db
+    // Retried once: every authenticated request runs this lookup, so one
+    // dropped connection to Neon would otherwise fail the whole request.
+    [user] = await withDbRetry("auth:user-lookup", () => db
       .select({
         orgId: users.orgId,
         role: users.role,
+        roleId: users.roleId,
+        projectScope: users.projectScope,
+        // The organization role, in the same round trip. A custom role's
+        // permissions come along as an array; built-in roles use code.
+        roleKey: roles.key,
+        roleIsSystem: roles.isSystem,
+        customPermissions: sql<string[] | null>`(select array_agg(${rolePermissions.permission}) from ${rolePermissions} where ${rolePermissions.roleId} = ${users.roleId})`,
+        // This person's limits (an Admin the Owner narrowed), in the same round trip.
+        limits: sql<string[] | null>`(select array_agg(${userPermissionLimits.permission}) from ${userPermissionLimits} where ${userPermissionLimits.userId} = ${users.id})`,
         isActive: users.isActive,
         tokensValidAfter: users.tokensValidAfter,
         // Folded into the same query so ending one session costs no extra round
@@ -124,8 +149,9 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
           : sql<boolean>`true`,
       })
       .from(users)
+      .leftJoin(roles, eq(roles.id, users.roleId))
       .where(eq(users.id, userId))
-      .limit(1);
+      .limit(1), { retries: 1 });
   } catch (error) {
     // Fail closed, but as 503 rather than 401: a transient DB fault must not
     // look like an expired session, or every client signs the user out.
@@ -190,7 +216,18 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
     return { ok: false, status: 401, error: "Invalid token payload" };
   }
 
-  return { ok: true, userId, orgId: user.orgId, role: user.role, sessionId, tokenSource };
+  return {
+    ok: true,
+    userId,
+    orgId: user.orgId,
+    role: user.role,
+    orgRole: orgRoleOf(user),
+    roleId: user.roleId,
+    projectScope: user.projectScope,
+    permissions: permissionsOf(user),
+    sessionId,
+    tokenSource,
+  };
 }
 
 /** JWT auth middleware — see authenticateRequest. */
@@ -206,6 +243,10 @@ export const authMiddleware = createMiddleware<{
   c.set("userId", result.userId);
   c.set("orgId", result.orgId);
   c.set("userRole", result.role);
+  c.set("orgRole", result.orgRole);
+  c.set("roleId", result.roleId);
+  c.set("projectScope", result.projectScope);
+  c.set("permissions", result.permissions);
   c.set("sessionId", result.sessionId);
   c.set("tokenSource", result.tokenSource);
 
@@ -229,6 +270,68 @@ export const adminOnly = createMiddleware<{
   }
   await next();
 });
+
+/**
+ * Requires every listed permission (lib/permissions.ts). Must be used after
+ * authMiddleware. A change from an SDK session is refused, as in adminOnly.
+ */
+// Typed as Permission, not string: a misspelt or retired permission name is a
+// compile error, never a check that silently refuses everyone.
+export function requirePermission(...needed: Permission[]) {
+  return createMiddleware<{ Bindings: Env; Variables: AppVariables }>(async (c, next) => {
+    const held = c.get("permissions") ?? [];
+    const missing = needed.filter((p) => !held.includes(p));
+    if (missing.length) {
+      await logRefusal(c, `requires ${missing.join(", ")}`);
+      return c.json({ error: `Forbidden: requires ${missing.join(", ")}` }, 403);
+    }
+    if (isSdkWrite(c)) {
+      return c.json({ error: "Not available to SDK sessions" }, 403);
+    }
+    await next();
+  });
+}
+
+/**
+ * Requires the read permission for GET and HEAD, the write one for everything
+ * else: for routers whose reads and changes are different permissions
+ * (`email.view` / `email.send`).
+ */
+export function requireReadWrite(read: Permission, write: Permission) {
+  return createMiddleware<{ Bindings: Env; Variables: AppVariables }>(async (c, next) => {
+    const isRead = c.req.method === "GET" || c.req.method === "HEAD";
+    return requirePermission(isRead ? read : write)(c, next);
+  });
+}
+
+/**
+ * Requires a power fixed to the built-in roles (lib/permissions.ts FIXED):
+ * managing members, admins and roles, and the org's settings. No role can carry
+ * these, so they are checked against the org role, never the permission list.
+ */
+export function requireFixed(power: FixedPower) {
+  return createMiddleware<{ Bindings: Env; Variables: AppVariables }>(async (c, next) => {
+    if (!hasFixedPower(c.get("orgRole"), power)) {
+      const who = FIXED[power].length === 1 ? "the Owner" : "the Owner or an Admin";
+      await logRefusal(c, `only ${who} (${power})`);
+      return c.json({ error: `Forbidden: only ${who} can do this` }, 403);
+    }
+    if (isSdkWrite(c)) {
+      return c.json({ error: "Not available to SDK sessions" }, 403);
+    }
+    await next();
+  });
+}
+
+/** Whether the caller has a fixed power. For checks inside a route. */
+export function hasFixed(c: { get: (k: "orgRole") => string }, power: FixedPower): boolean {
+  return hasFixedPower(c.get("orgRole"), power);
+}
+
+/** Whether the caller holds a permission. For checks inside a route. */
+export function hasPermission(c: { get: (k: "permissions") => readonly string[] }, permission: Permission): boolean {
+  return (c.get("permissions") ?? []).includes(permission);
+}
 
 /**
  * A change requested with an SDK token. An admin signed in through a customer's

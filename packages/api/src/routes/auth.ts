@@ -1,8 +1,13 @@
 import { Hono } from "hono";
 import { eq, and, inArray, sql } from "drizzle-orm";
-import { users, organizations, appPermissions, apps, projects } from "../db/schema";
+import { users, organizations, apps, projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware } from "../middleware/auth";
+import { roleAndPermissions } from "../lib/permissions";
+import { accessibleApps, legacyPermission } from "../lib/objects";
+import { allowedProjects } from "../lib/project-scope";
+// Sign-in's database calls get two retries (three attempts) through this helper.
+import { errorInfo, withDbRetry } from "../lib/db-retry";
 import { verifyTurnstile } from "../lib/turnstile";
 import { SSO_REQUIRED_MESSAGE, passwordLoginUsers, ssoRequiredOrgs } from "../lib/sso-required";
 import { mintAccessToken } from "../lib/access-token";
@@ -54,53 +59,6 @@ function logRefreshOutcome(
   );
 }
 
-// Neon's HTTP SQL endpoint occasionally returns 520 or hangs when routed
-// through certain Cloudflare colos. Bound each call and retry once so a
-// transient blip doesn't strand the user on a 95-second spinner.
-async function withDbRetry<T>(
-  label: string,
-  fn: () => Promise<T>,
-  opts: { timeoutMs?: number; retries?: number } = {}
-): Promise<T> {
-  const timeoutMs = opts.timeoutMs ?? 6000;
-  const retries = opts.retries ?? 1;
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await Promise.race([
-        fn(),
-        new Promise<T>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`db:${label} timed out after ${timeoutMs}ms`)),
-            timeoutMs
-          )
-        ),
-      ]);
-    } catch (err) {
-      lastErr = err;
-      console.warn(JSON.stringify({ ev: "db_retry", label, attempt: attempt + 1, error: errorInfo(err) }));
-    }
-  }
-  throw lastErr;
-}
-
-/**
- * An error as plain fields, for a one-line JSON log. Logged as the object
- * itself, an Error often shows up in Cloudflare observability as `{}` — the
- * message, its cause (where Postgres and fetch put the real reason) and the
- * code are what say why.
- */
-function errorInfo(err: unknown) {
-  const e = err as { name?: string; message?: string; code?: string; cause?: { message?: string; code?: string }; stack?: string };
-  return {
-    name: e?.name,
-    message: e?.message ?? String(err),
-    code: e?.code,
-    cause: e?.cause?.message,
-    causeCode: e?.cause?.code,
-    at: e?.stack?.split("\n").slice(1, 4).map((l) => l.trim()),
-  };
-}
 
 /**
  * POST /auth/login
@@ -206,6 +164,12 @@ auth.post("/login", async (c) => {
     // (the multi-org picker) needs it to filter out orgs this email can't
     // actually get into before ever showing them.
     const roleByOrgId = new Map(validUsers.map((u) => [u.orgId, u.role]));
+    // Whether each org's row may enter the platform: the platform.access
+    // permission, which a custom role can carry too, not only org_admin.
+    const platformAccessByOrgId = new Map<string | null, boolean>();
+    for (const u of validUsers) {
+      platformAccessByOrgId.set(u.orgId, (await roleAndPermissions(db, u)).permissions.includes("platform.access"));
+    }
     const orgRows = allOrgIds.length
       ? await withDbRetry("login:orgs-by-ids", () =>
           db
@@ -214,7 +178,7 @@ auth.post("/login", async (c) => {
             .where(inArray(organizations.id, allOrgIds))
         )
       : [];
-    const orgs = orgRows.map((o) => ({ ...o, role: roleByOrgId.get(o.id) }));
+    const orgs = orgRows.map((o) => ({ ...o, role: roleByOrgId.get(o.id), platformAccess: platformAccessByOrgId.get(o.id) ?? false }));
 
     // Short-lived access token (15m) plus a rotating refresh token held in an
     // httpOnly cookie — see lib/access-token.ts and lib/refresh-cookie.ts.
@@ -235,6 +199,9 @@ auth.post("/login", async (c) => {
     // it was for, and leaves every other site alone.
     setRefreshCookie(c, refresh.token, siteFromOrigin(c.req.header("Origin")));
 
+    step = "resolve role";
+    const { orgRole, permissions } = await roleAndPermissions(db, user);
+
     return c.json({
       token,
       user: {
@@ -242,6 +209,8 @@ auth.post("/login", async (c) => {
         email: user.email,
         name: user.name,
         role: user.role,
+        orgRole,
+        permissions,
         orgId: user.orgId,
       },
       orgs,
@@ -452,6 +421,9 @@ auth.get("/me", authMiddleware, async (c) => {
   // SDK session, which is always a member — so it neither sees an admin's app list
   // nor reports an admin role.
   const role = c.get("userRole");
+  // Resolved by authMiddleware from the user's role row, on this request.
+  const orgRole = c.get("orgRole");
+  const permissions = c.get("permissions");
 
   // Super admin: no org, no app list
   if (role === "super_admin") {
@@ -461,6 +433,8 @@ auth.get("/me", authMiddleware, async (c) => {
         email: user.email,
         name: user.name,
         role,
+        orgRole,
+        permissions,
         config: user.config,
       },
       organization: null,
@@ -476,70 +450,31 @@ auth.get("/me", authMiddleware, async (c) => {
         .limit(1)
     : [null];
 
-  // Get permitted apps
-  let permittedApps;
-  if (role === "org_admin") {
-    // Admin sees all active apps in the org
-    permittedApps = await db
-      .select({
-        id: apps.id,
-        name: apps.name,
-        type: apps.type,
-        projectId: apps.projectId,
-        projectName: projects.name,
-        isDefault: apps.isDefault,
-        permission: appPermissions.permission,
-      })
-      .from(apps)
-      .innerJoin(projects, eq(projects.id, apps.projectId))
-      .leftJoin(
-        appPermissions,
-        and(
-          eq(appPermissions.appId, apps.id),
-          eq(appPermissions.userId, userId)
-        )
-      )
-      .where(and(eq(projects.orgId, user.orgId!), eq(apps.isActive, true)));
-  } else {
-    // Member sees explicitly permitted apps + org's default app
-    permittedApps = await db
-      .select({
-        id: apps.id,
-        name: apps.name,
-        type: apps.type,
-        projectId: apps.projectId,
-        projectName: projects.name,
-        isDefault: apps.isDefault,
-        permission: appPermissions.permission,
-      })
-      .from(appPermissions)
-      .innerJoin(apps, eq(apps.id, appPermissions.appId))
-      .innerJoin(projects, eq(projects.id, apps.projectId))
-      .where(
-        and(eq(appPermissions.userId, userId), eq(apps.isActive, true))
-      );
-
-    // Include org's default app if not already in the list
-    if (org?.defaultAppId && !permittedApps.find((a) => a.id === org.defaultAppId)) {
-      const [defaultApp] = await db
-        .select({
-          id: apps.id,
-          name: apps.name,
-          type: apps.type,
-          projectId: apps.projectId,
-          projectName: projects.name,
-          isDefault: apps.isDefault,
-        })
-        .from(apps)
-        .innerJoin(projects, eq(projects.id, apps.projectId))
-        .where(and(eq(apps.id, org.defaultAppId), eq(apps.isActive, true)))
-        .limit(1);
-
-      if (defaultApp) {
-        permittedApps.unshift({ ...defaultApp, permission: "view" });
-      }
-    }
-  }
+  // The apps this user may use: the same rule /my/apps uses (lib/objects.ts),
+  // so the two lists cannot disagree.
+  const caller = {
+    userId,
+    orgId: user.orgId,
+    userRole: role,
+    roleId: c.get("roleId") ?? null,
+    orgRole,
+    projectScope: c.get("projectScope") ?? null,
+    permissions,
+  };
+  // The projects they may reach (lib/project-scope.ts); null: every project.
+  const reachable = await allowedProjects(db, caller);
+  const permittedApps = (await accessibleApps(db, caller)).map((a) => ({
+    id: a.app.id,
+    name: a.app.name,
+    type: a.app.type,
+    projectId: a.app.projectId,
+    projectName: a.projectName,
+    isDefault: a.app.isDefault,
+    status: a.object.status,
+    level: a.level,
+    actions: a.actions,
+    permission: legacyPermission(a.level),
+  }));
 
   return c.json({
     user: {
@@ -547,6 +482,10 @@ auth.get("/me", authMiddleware, async (c) => {
       email: user.email,
       name: user.name,
       role,
+      orgRole,
+      permissions,
+      projectScope: reachable ? "selected" : "all",
+      projectIds: reachable ? [...reachable] : null,
       config: user.config,
     },
     organization: org

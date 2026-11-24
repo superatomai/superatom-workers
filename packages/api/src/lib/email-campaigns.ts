@@ -5,8 +5,11 @@
 import { and, eq, gte, inArray, lt, lte, ne, or, sql } from "drizzle-orm";
 import type { Database } from "../db";
 import {
-  appPermissions,
   apps,
+  objects,
+  objectGrants,
+  projectMembers,
+  roles,
   emailAttachments,
   emailBranding,
   emailCampaigns,
@@ -88,17 +91,38 @@ export async function resolveRecipients(
   if (audience.type === "members") conds.push(eq(users.role, "member"));
   if (audience.type === "users") conds.push(inArray(users.id, audience.userIds));
   if (audience.type === "project") {
-    // Same rule as /my/apps: admins see every app; members see granted apps and default apps.
+    // Same rule as /my/apps (lib/objects.ts): admins see every app; others see
+    // what they own, what is shared with them, their role or the org, and default apps.
     const pid = audience.projectId;
     conds.push(
       or(
         eq(users.role, "org_admin"),
-        sql`exists (select 1 from ${appPermissions} ap join ${apps} a on a.id = ap.app_id
-                    where ap.user_id = ${users.id} and a.project_id = ${pid} and a.is_active)`,
+        sql`exists (select 1 from ${objects} o join ${apps} a on a.id::text = o.ref_id
+                    where a.project_id = ${pid} and a.is_active and o.status = 'active'
+                      and (o.owner_id = ${users.id}
+                        or exists (select 1 from ${objectGrants} g where g.object_id = o.id
+                                     and ((g.principal_type = 'user' and g.principal_id = ${users.id})
+                                       or (g.principal_type = 'role' and g.principal_id = ${users.roleId})
+                                       or (g.principal_type = 'org' and g.principal_id = ${users.orgId})
+                                       or (g.principal_type = 'project' and exists (select 1 from ${projectMembers} pm
+                                             where pm.project_id = g.principal_id and pm.user_id = ${users.id}))))))`,
+        // A role on the project itself covers every app in it.
+        sql`exists (select 1 from ${objects} po join ${objectGrants} g on g.object_id = po.id
+                    where po.type = 'project' and po.ref_id = ${pid}
+                      and ((g.principal_type = 'user' and g.principal_id = ${users.id})
+                        or (g.principal_type = 'role' and g.principal_id = ${users.roleId})
+                        or (g.principal_type = 'org' and g.principal_id = ${users.orgId})))`,
         sql`exists (select 1 from ${apps} a where a.project_id = ${pid} and a.is_active and a.is_default)`,
         sql`exists (select 1 from ${organizations} o join ${apps} a on a.id = o.default_app_id
                     where o.id = ${orgId} and a.project_id = ${pid} and a.is_active)`
       )!
+    );
+    // Project scope (lib/project-scope.ts): someone limited to other projects
+    // cannot reach this one, so its emails are not theirs. Owners reach all.
+    conds.push(
+      sql`(${users.projectScope} <> 'selected'
+           or exists (select 1 from ${roles} r where r.id = ${users.roleId} and r.org_id is null and r.key = 'owner')
+           or exists (select 1 from ${projectMembers} pm where pm.project_id = ${pid} and pm.user_id = ${users.id}))`
     );
   }
 

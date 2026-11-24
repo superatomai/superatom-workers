@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "project_scope" varchar(16) DEFAULT 'all' NOT NULL;

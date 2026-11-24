@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { apps, projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly } from "../middleware/auth";
+import { authMiddleware, requirePermission, hasPermission, hasFixed } from "../middleware/auth";
+import { appAccess, callerOf } from "../lib/objects";
 
 /**
  * Icon upload.
@@ -26,7 +27,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const uploadRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
-uploadRouter.use("*", authMiddleware, adminOnly);
+// Who may change an icon is whoever may edit what it belongs to (denyEntityAccess).
+uploadRouter.use("*", authMiddleware, requirePermission("platform.access"));
 
 /**
  * Confirm the bytes really are the declared image type. `file.type` is just a
@@ -87,7 +89,7 @@ async function denyEntityAccess(
   const db = c.get("db");
 
   if (entity === "org") {
-    return entityId === callerOrgId ? null : DENIED;
+    return entityId === callerOrgId && hasFixed(c, "editOrg") ? null : DENIED;
   }
 
   if (entity === "project") {
@@ -96,17 +98,12 @@ async function denyEntityAccess(
       .from(projects)
       .where(eq(projects.id, entityId))
       .limit(1);
-    return row && row.orgId === callerOrgId ? null : DENIED;
+    return row && row.orgId === callerOrgId && hasPermission(c, "project.edit") ? null : DENIED;
   }
 
-  // app → project → org
-  const [row] = await db
-    .select({ orgId: projects.orgId })
-    .from(apps)
-    .innerJoin(projects, eq(projects.id, apps.projectId))
-    .where(eq(apps.id, entityId))
-    .limit(1);
-  return row && row.orgId === callerOrgId ? null : DENIED;
+  // app → project → org, and the caller may edit it.
+  const access = await appAccess(db, callerOf(c), entityId);
+  return access && access.actions.includes("edit") ? null : DENIED;
 }
 
 /**

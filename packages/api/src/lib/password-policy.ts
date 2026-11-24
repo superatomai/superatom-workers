@@ -1,8 +1,8 @@
 /**
  * Password strength policy.
  *
- * One definition, applied at every point a password is SET (bootstrap, org
- * creation, user creation/reactivation) so the rules cannot drift between them.
+ * One definition, applied at every point a password is SET (org creation,
+ * user creation, a password reset) so the rules cannot drift between them.
  * Login is not gated — an existing account must still be able to sign in even
  * if its password predates this policy.
  *

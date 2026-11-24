@@ -11,13 +11,16 @@ import type { Env, AppVariables } from "./types";
 import authRoutes from "./routes/auth";
 import ssoRoutes from "./routes/sso";
 import samlRoutes from "./routes/saml";
-import bootstrapRoutes from "./routes/bootstrap";
 import superAdminUsersRoutes from "./routes/super-admin-users";
 import orgRoutes from "./routes/orgs";
 import usersRoutes from "./routes/users";
+import rolesRoutes from "./routes/roles";
+import accessLogRoutes from "./routes/access-log";
 import projectsRoutes from "./routes/projects";
 import appsRoutes from "./routes/apps";
 import permissionsRoutes from "./routes/permissions";
+import accessRoutes from "./routes/access";
+import objectRolesRoutes from "./routes/object-roles";
 import myAppsRoutes from "./routes/my-apps";
 import uploadRoutes from "./routes/upload";
 import sourceUploadRoutes from "./routes/source-upload";
@@ -137,10 +140,12 @@ app.route("/auth", authRoutes);
 app.route("/auth/sso", ssoRoutes);
 app.route("/auth/sso/saml", samlRoutes);
 app.route("/auth/sdk", sdkAuthRoutes);
-app.route("/auth", bootstrapRoutes);
 app.route("/admin/super-admins", superAdminUsersRoutes); // super admin only: add another super admin
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);
+app.route("/orgs/:orgId/roles", rolesRoutes);
+app.route("/orgs/:orgId/object-roles", objectRolesRoutes);
+app.route("/orgs/:orgId/access-log", accessLogRoutes); // who changed whose access, for the Owner and Admins
 app.route("/orgs/:orgId/projects", projectsRoutes);
 app.route("/orgs/:orgId/emails/messages", emailMessagesRoutes); // email API key, so before emailsRoutes' login middleware
 app.route("/orgs/:orgId/emails", emailsRoutes); // org announcements (org admins)
@@ -156,6 +161,7 @@ app.route("/apps", permissionsRoutes); // handles /apps/:appId/permissions
 app.route("/projects/:projectId/graph", graphRoutes); // composition graph (org admins only)
 app.route("/projects/:projectId/release", releaseRoutes); // release status + the Update button (org admins)
 app.route("/projects/:projectId/programs", programsRoutes); // program catalogue: engines (service token) and admins
+app.route("/projects", accessRoutes); // roles on a project and its data sources: /projects/:projectId/{grants,sources/:id/grants,access,my-access}
 app.route("/", appsRoutes); // handles /projects/:projectId/apps and /apps/:appId
 app.route("/answer-feedback", answerFeedbackRoutes); // feedback 1: server-to-server (service token auth)
 app.route("/feedback", feedbackRoutes); // feedback 2: product feedback (public + superadmin list)

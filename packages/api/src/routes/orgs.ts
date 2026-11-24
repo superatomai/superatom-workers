@@ -2,8 +2,9 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { organizations, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly, superAdminOnly, orgScopeGuard } from "../middleware/auth";
+import { authMiddleware, requirePermission, requireFixed, superAdminOnly, orgScopeGuard } from "../middleware/auth";
 import { validatePassword } from "../lib/password-policy";
+import { builtInRoleId } from "../lib/permissions";
 import { createOrgSecret } from "../lib/org-secrets";
 
 const orgs = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -86,7 +87,8 @@ orgs.post("/", authMiddleware, superAdminOnly, async (c) => {
 
   let orgAdmin = null;
 
-  // Optionally create org_admin (already validated above)
+  // Optionally create the org's first admin (already validated above). They are
+  // its Owner: someone has to be able to manage admins, and only an Owner can.
   if (admin) {
     const passwordHash = await hashPassword(admin.password);
 
@@ -98,6 +100,7 @@ orgs.post("/", authMiddleware, superAdminOnly, async (c) => {
         name: admin.name,
         passwordHash,
         role: "org_admin",
+        roleId: await builtInRoleId(db, "owner"),
         isActive: true,
       })
       .returning({
@@ -129,7 +132,7 @@ orgs.get("/", authMiddleware, superAdminOnly, async (c) => {
  * GET /orgs/:orgId
  * Get organization details (admin of that org, or super_admin).
  */
-orgs.get("/:orgId", authMiddleware, adminOnly, orgScopeGuard, async (c) => {
+orgs.get("/:orgId", authMiddleware, requirePermission("platform.access"), orgScopeGuard, async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId");
 
@@ -150,7 +153,7 @@ orgs.get("/:orgId", authMiddleware, adminOnly, orgScopeGuard, async (c) => {
  * PUT /orgs/:orgId
  * Update organization (admin of that org, or super_admin).
  */
-orgs.put("/:orgId", authMiddleware, adminOnly, orgScopeGuard, async (c) => {
+orgs.put("/:orgId", authMiddleware, requireFixed("editOrg"), orgScopeGuard, async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId");
   const body = await c.req.json<{ name?: string; slug?: string; icon?: string; defaultAppId?: string | null }>();

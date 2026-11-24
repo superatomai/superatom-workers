@@ -73,6 +73,20 @@ export const users = pgTable(
     passwordHash: varchar("password_hash", { length: 255 }),
     ssoSubject: varchar("sso_subject", { length: 500 }),
     role: userRoleEnum("role").default("member").notNull(),
+    /**
+     * The user's role inside their organization (Owner, Admin, Member, or a custom
+     * role). `role` above stays the coarse kind every other service reads: an
+     * Owner is an `org_admin` whose role_id is the built-in `owner` role. Empty
+     * falls back to `role` (lib/permissions.ts orgRoleOf).
+     */
+    roleId: uuid("role_id").references((): AnyPgColumn => roles.id, { onDelete: "set null" }),
+    /**
+     * Which projects this user may reach: `all`, or `selected` (only the
+     * projects they are a member of, project_members). Strict: nothing in a
+     * project outside it is visible, whatever is shared. An Owner and the
+     * platform super admin always reach every project (lib/project-scope.ts).
+     */
+    projectScope: varchar("project_scope", { length: 16 }).default("all").notNull(),
     isActive: boolean("is_active").default(true).notNull(),
     /**
      * Data-access config: row filters the relay stamps on every request.
@@ -104,6 +118,101 @@ export const users = pgTable(
   (table) => [
     uniqueIndex("users_org_email_idx").on(table.orgId, table.email),
     uniqueIndex("users_org_sso_subject_idx").on(table.orgId, table.ssoSubject),
+  ]
+);
+
+/**
+ * Organization roles. Built-in ones (owner, admin, member) have no org_id and
+ * their permissions are defined in code (lib/permissions.ts BUILT_IN_ROLES), so
+ * they cannot drift; a custom role belongs to one org and its permissions are
+ * rows in role_permissions.
+ */
+export const roles = pgTable(
+  "roles",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "cascade" }),
+    key: varchar("key", { length: 64 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: text("description"),
+    isSystem: boolean("is_system").default(false).notNull(),
+    // Where the role applies: `org` (Owner, Admin, Member and custom roles: what
+    // an organization hands out) or `platform` (super_admin: access to every
+    // organization and its data). Organizations only ever see and assign `org` roles.
+    scope: varchar("scope", { length: 16 }).default("org").notNull(),
+    createdBy: uuid("created_by").references((): AnyPgColumn => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("roles_org_key_idx").on(table.orgId, table.key),
+    // Postgres treats NULLs as distinct, so built-in keys need their own index.
+    uniqueIndex("roles_builtin_key_idx").on(table.key).where(sql`${table.orgId} IS NULL`),
+  ]
+);
+
+/** A custom role's permissions, one `module.action` per row (built-in roles use code). */
+export const rolePermissions = pgTable(
+  "role_permissions",
+  {
+    roleId: uuid("role_id")
+      .notNull()
+      .references(() => roles.id, { onDelete: "cascade" }),
+    permission: varchar("permission", { length: 64 }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.roleId, table.permission] })]
+);
+
+/**
+ * Per-person limits: permissions one person does NOT get, though their role
+ * carries them. Only ever narrows a role, never widens it. Used for Admins,
+ * whose built-in role cannot be edited: the Owner unticks what one Admin may do
+ * (for example the people powers, members.*, which a new Admin starts without).
+ */
+export const userPermissionLimits = pgTable(
+  "user_permission_limits",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    permission: varchar("permission", { length: 64 }).notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.permission] })]
+);
+
+/**
+ * The access audit log: one row for every change to who can do what, never
+ * edited or deleted (lib/access-log.ts). Like GitHub's audit log or AWS
+ * CloudTrail: one table for every kind of change, with before and after as
+ * JSON so a new kind needs no new column.
+ */
+export const accessLog = pgTable(
+  "access_log",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    // Who did it; empty for the system or a service token. Kept when they leave.
+    actorId: uuid("actor_id").references(() => users.id, { onDelete: "set null" }),
+    // What happened, as thing.verb: member.role_changed, grant.added, object.handed_over…
+    action: varchar("action", { length: 64 }).notNull(),
+    // What it was done to: user | role | project | object (an app, a shared project or data source).
+    targetType: varchar("target_type", { length: 16 }).notNull(),
+    targetId: varchar("target_id", { length: 255 }).notNull(),
+    // Who it affects, when that is a person (whose access changed), for "everything about Ravi".
+    subjectId: uuid("subject_id").references(() => users.id, { onDelete: "set null" }),
+    before: jsonb("before"),
+    after: jsonb("after"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("access_log_org_idx").on(table.orgId, table.createdAt),
+    index("access_log_target_idx").on(table.targetType, table.targetId),
+    index("access_log_subject_idx").on(table.subjectId),
+    index("access_log_actor_idx").on(table.actorId),
   ]
 );
 
@@ -397,6 +506,152 @@ export const appPermissions = pgTable(
   },
   (table) => [
     uniqueIndex("app_permissions_user_app_idx").on(table.userId, table.appId),
+  ]
+);
+
+// ─── Objects and sharing ────────────────────────────────
+//
+// Ownership and sharing for every kind of thing, in one place (see
+// ROLES-AND-PERMISSIONS.md). An object points at its row by `type` + `ref_id`
+// rather than a foreign key, so objects that live in a project's engine
+// database can be registered too. Today: every app, all four app types.
+// app_permissions is superseded by object_grants and no longer read.
+
+export const objects = pgTable(
+  "objects",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id").references(() => projects.id, { onDelete: "cascade" }),
+    // dashboard | chat_agent | report | app (the app types); more kinds later.
+    type: varchar("type", { length: 32 }).notNull(),
+    // The id of the row this object stands for, in its own table.
+    refId: varchar("ref_id", { length: 255 }).notNull(),
+    // Can be handed over; created_by never changes.
+    ownerId: uuid("owner_id").references(() => users.id, { onDelete: "set null" }),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    // active | disabled. A disabled object stays listed for whoever manages it.
+    status: varchar("status", { length: 16 }).default("active").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("objects_type_ref_idx").on(table.type, table.refId),
+    index("objects_org_idx").on(table.orgId),
+  ]
+);
+
+/**
+ * Reusable action sets for one object. System roles are shared by every org;
+ * custom roles belong to one org. A null object type means the role works on
+ * every supported object type.
+ */
+export const objectRoles = pgTable(
+  "object_roles",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "cascade" }),
+    key: varchar("key", { length: 64 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: text("description"),
+    objectType: varchar("object_type", { length: 32 }),
+    isSystem: boolean("is_system").default(false).notNull(),
+    createdBy: uuid("created_by").references((): AnyPgColumn => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("object_roles_org_key_idx").on(table.orgId, table.key),
+    uniqueIndex("object_roles_builtin_key_idx").on(table.key).where(sql`${table.orgId} IS NULL`),
+    check(
+      "object_roles_scope_chk",
+      sql`(${table.isSystem} AND ${table.orgId} IS NULL) OR (NOT ${table.isSystem} AND ${table.orgId} IS NOT NULL)`
+    ),
+  ]
+);
+
+/** Allowed actions in an object role; the API validates action applicability. */
+export const objectRoleActions = pgTable(
+  "object_role_actions",
+  {
+    roleId: uuid("role_id")
+      .notNull()
+      .references(() => objectRoles.id, { onDelete: "cascade" }),
+    action: varchar("action", { length: 32 }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.roleId, table.action] })]
+);
+
+export const objectGrants = pgTable(
+  "object_grants",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    objectId: uuid("object_id")
+      .notNull()
+      .references(() => objects.id, { onDelete: "cascade" }),
+    // user | role | project | org — whose grant this is.
+    principalType: varchar("principal_type", { length: 16 }).notNull(),
+    principalId: uuid("principal_id").notNull(),
+    // The sharing role given (Viewer, Editor, Manager or the org's own): its
+    // actions are what this grant allows. Owner is objects.owner_id, never a grant.
+    objectRoleId: uuid("object_role_id").notNull().references(() => objectRoles.id, { onDelete: "restrict" }),
+    grantedBy: uuid("granted_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("object_grants_principal_idx").on(table.objectId, table.principalType, table.principalId),
+    index("object_grants_lookup_idx").on(table.principalType, table.principalId),
+    index("object_grants_role_idx").on(table.objectRoleId),
+  ]
+);
+
+/**
+ * Explicit action denies. A deny on a project object can also cover its
+ * descendants when the authorization evaluator implements inheritance.
+ */
+export const objectDenials = pgTable(
+  "object_denials",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    objectId: uuid("object_id")
+      .notNull()
+      .references(() => objects.id, { onDelete: "cascade" }),
+    // user | role | project | org, with the same meaning as object_grants.
+    principalType: varchar("principal_type", { length: 16 }).notNull(),
+    principalId: uuid("principal_id").notNull(),
+    action: varchar("action", { length: 32 }).notNull(),
+    reason: text("reason"),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("object_denials_rule_idx").on(table.objectId, table.principalType, table.principalId, table.action),
+    index("object_denials_lookup_idx").on(table.principalType, table.principalId),
+  ]
+);
+
+/**
+ * Who belongs to a project. Today it decides one thing: a grant to the project
+ * (object_grants.principal_type = 'project') reaches its members. Who may open
+ * a project in the platform is unchanged (any org admin, as before).
+ */
+export const projectMembers = pgTable(
+  "project_members",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    addedBy: uuid("added_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.projectId, table.userId] }),
+    index("project_members_user_idx").on(table.userId),
   ]
 );
 

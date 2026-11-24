@@ -3,7 +3,7 @@ import { eq, and, sql, desc, gt, gte, lte, count, sum, avg, getTableColumns } fr
 import { accessConfigs, chatAnalytics, projects } from "../db/schema";
 import { typeCondition, statusCondition, attachmentCountSql, projectOrgSql } from "../lib/analytics-filters";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, adminOnly, scopedOrgId } from "../middleware/auth";
+import { authMiddleware, requirePermission, scopedOrgId } from "../middleware/auth";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -155,7 +155,7 @@ analyticsRouter.patch("/analytics/chat/:id/feedback", async (c) => {
  * existing callers that predate dashboard/report tracking see the same rows
  * they always have.
  */
-analyticsRouter.get("/analytics/chat", authMiddleware, adminOnly, async (c) => {
+analyticsRouter.get("/analytics/chat", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");
@@ -242,7 +242,7 @@ function parseScopeParams(c: any) {
  * Aggregated summary: total queries, total cost, avg latency, model breakdown
  * (admin only). Same `type` semantics as GET /analytics/chat above.
  */
-analyticsRouter.get("/analytics/chat/summary", authMiddleware, adminOnly, async (c) => {
+analyticsRouter.get("/analytics/chat/summary", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const { where, whereWithoutType } = parseScopeParams(c);
 
@@ -328,7 +328,7 @@ const MAX_TRENDS_SPAN_DAYS = 366;
  * to) — bundling them would mean every call computes aggregates it doesn't
  * use. Same `type` semantics as GET /analytics/chat above.
  */
-analyticsRouter.get("/analytics/chat/trends", authMiddleware, adminOnly, async (c) => {
+analyticsRouter.get("/analytics/chat/trends", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const { where, from, to } = parseScopeParams(c);
 
@@ -374,7 +374,7 @@ analyticsRouter.get("/analytics/chat/trends", authMiddleware, adminOnly, async (
  * /analytics/chat is (scopedOrgId: only super admins may pass `orgId`), so a
  * non-super-admin can't fetch another org's event by guessing its id.
  */
-analyticsRouter.get("/analytics/chat/:id", authMiddleware, adminOnly, async (c) => {
+analyticsRouter.get("/analytics/chat/:id", authMiddleware, requirePermission("analytics.view"), async (c) => {
   const db = c.get("db");
   const id = c.req.param("id");
   const orgId = scopedOrgId(c);
