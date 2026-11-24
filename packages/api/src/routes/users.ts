@@ -1,8 +1,10 @@
 import { Hono } from "hono";
 import { eq, and, sql, desc, inArray } from "drizzle-orm";
-import { accessConfigs, users, apps, roles, objects, objectGrants, projects, projectMembers } from "../db/schema";
+import { accessConfigs, users, apps, roles, objects, objectGrants, projects, projectMembers, userPermissionLimits } from "../db/schema";
 import { PROJECT_SCOPES, allowedProjects, projectAllowed, scopeOfRequest, scopeOfUser } from "../lib/project-scope";
-import { legacyPermission, type Level } from "../lib/objects";
+import { actorOf, logAccess } from "../lib/access-log";
+import { legacyPermission, sharingRolesById } from "../lib/objects";
+import { levelForActions } from "../lib/object-policy";
 import type { Database } from "../db";
 import { validatePassword } from "../lib/password-policy";
 import { orgRequiresSso } from "../lib/sso-required";
@@ -10,22 +12,27 @@ import { revokeAllForUser } from "../lib/refresh-tokens";
 import { buildFiltersConfig } from "../lib/sdk-access";
 import {
   ADMIN_ROLES,
+  BUILT_IN_ROLES,
+  PEOPLE_PERMISSIONS,
   activeOwnersExcept,
+  limitsOf,
   mayGrantRole,
   orgRoleOf,
   recordRoleChange,
   resolveRole,
+  setLimits,
+  type Permission,
   type ResolvedRole,
 } from "../lib/permissions";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, requirePermission, orgScopeGuard, hasPermission } from "../middleware/auth";
+import { authMiddleware, requirePermission, orgScopeGuard, hasFixed, hasPermission } from "../middleware/auth";
 
 const usersRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
 /** A user of this org with their organization role, or undefined. */
 async function loadMember(db: Database, orgId: string, userId: string) {
   const [row] = await db
-    .select({ id: users.id, role: users.role, roleKey: roles.key, isActive: users.isActive })
+    .select({ id: users.id, role: users.role, roleKey: roles.key, isActive: users.isActive, config: users.config })
     .from(users)
     .leftJoin(roles, eq(roles.id, users.roleId))
     .where(and(eq(users.id, userId), eq(users.orgId, orgId)))
@@ -34,11 +41,11 @@ async function loadMember(db: Database, orgId: string, userId: string) {
 }
 
 /**
- * Admins and Owners are managed only by whoever holds `admins.manage` (the
- * Owner). Everyone else may act on them only when acting on themselves.
+ * Admins and Owners are managed only by the Owner (FIXED.manageAdmins).
+ * Everyone else may act on them only when acting on themselves.
  */
-function mayActOn(c: { get: (k: "permissions") => readonly string[] }, target: { orgRole: string }, isSelf: boolean): boolean {
-  return isSelf || !ADMIN_ROLES.includes(target.orgRole) || hasPermission(c, "admins.manage");
+function mayActOn(c: { get: (k: "orgRole") => string }, target: { orgRole: string }, isSelf: boolean): boolean {
+  return isSelf || !ADMIN_ROLES.includes(target.orgRole) || hasFixed(c, "manageAdmins");
 }
 
 /**
@@ -92,6 +99,7 @@ async function applyProjectScope(
   }
   if (checkOnly) return null;
 
+  const before = await scopeOf(db, target.id);
   if (scope !== undefined) {
     await db.update(users).set({ projectScope: scope as string, updatedAt: new Date() }).where(eq(users.id, target.id));
   }
@@ -107,9 +115,22 @@ async function applyProjectScope(
       await db.insert(projectMembers).values(added.map((projectId) => ({ projectId, userId: target.id, addedBy: c.get("userId") }))).onConflictDoNothing();
     }
   }
-  console.log(`[audit] project scope: actor=${c.get("userId")} target=${target.id} scope=${scope ?? "(unchanged)"} projects=${ids ? ids.join(",") : "(unchanged)"}`);
+  const after = await scopeOf(db, target.id);
+  if (before.projectScope !== after.projectScope || !sameIds(before.projectIds, after.projectIds)) {
+    await logAccess(db, {
+      orgId,
+      actorId: actorOf(c),
+      action: "member.projects_changed",
+      target: { type: "user", id: target.id },
+      subjectId: target.id,
+      before,
+      after,
+    });
+  }
   return null;
 }
+
+const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
 /**
  * Everything a member owns (objects: today every kind of app), with each one's
@@ -166,7 +187,18 @@ async function handOverOwned(
   }
 
   await db.update(objects).set({ ownerId: to, updatedAt: new Date() }).where(eq(objects.ownerId, fromUserId));
-  console.log(`[audit] handed over on removal: actor=${c.get("userId")} from=${fromUserId} to=${to} items=${owned.length}`);
+  // One entry per item, so each one's history shows who it went to and why.
+  for (const o of owned) {
+    await logAccess(db, {
+      orgId,
+      actorId: actorOf(c),
+      action: "object.handed_over",
+      target: { type: "object", id: o.objectId },
+      subjectId: to,
+      before: { ownerId: fromUserId },
+      after: { ownerId: to, reason: "previous owner removed" },
+    });
+  }
   return { moved: owned.length, to };
 }
 
@@ -197,13 +229,27 @@ function checkedConfig(config: unknown): { ok: true; config: unknown } | { ok: f
   return result.ok ? { ok: true, config: result.config } : { ok: false, error: result.error };
 }
 
-// Reading the member list is for anyone on the platform (other screens show
-// names from it); changing members needs members.manage, and each route adds
-// its own rules (admins and Owners, roles, data access).
+// Names and roles in the member list are for anyone on the platform (other
+// screens pick people from it); people's data rules, external roles and access
+// history need members.view. Each change needs its own people power (members.*),
+// and on top: nobody acts on Admins or the Owner but the Owner, nobody on
+// themselves, and only the Owner gives roles that carry people powers.
 usersRouter.use("*", authMiddleware, requirePermission("platform.access"), orgScopeGuard);
-usersRouter.post("*", requirePermission("members.manage"));
-usersRouter.put("*", requirePermission("members.manage"));
-usersRouter.delete("*", requirePermission("members.manage"));
+
+/** People powers (members.*) are the Owner's to hand out: in a role, or to an Admin. */
+const carriesPeoplePowers = (permissions: readonly string[]) => permissions.some((p) => p.startsWith("members."));
+
+/**
+ * The limits a request asks for, for an Admin: permissions they do NOT get.
+ * Each must be a permission the Admin role carries (limits only narrow).
+ */
+function checkedLimits(value: unknown): { ok: true; limits: string[] } | { ok: false; error: string } {
+  if (!Array.isArray(value) || value.some((p) => typeof p !== "string")) return { ok: false, error: "limits must be a list of permissions" };
+  const limits = [...new Set(value as string[])];
+  const unknown = limits.filter((p) => !(BUILT_IN_ROLES.admin as readonly string[]).includes(p));
+  if (unknown.length) return { ok: false, error: `Unknown permissions in limits: ${unknown.join(", ")}` };
+  return { ok: true, limits };
+}
 
 /**
  * Hash a password using SHA-256 (same as auth login check)
@@ -224,7 +270,7 @@ async function hashPassword(password: string): Promise<string> {
 usersRouter.post("/", async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
-  const { email, name, password, role, config, projectScope, projectIds } = await c.req.json<{
+  const { email, name, password, role, config, projectScope, projectIds, limits } = await c.req.json<{
     email: string;
     name: string;
     password?: string;
@@ -237,8 +283,14 @@ usersRouter.post("/", async (c) => {
     // to some projects themselves creates only limited users.
     projectScope?: unknown;
     projectIds?: unknown;
+    // For an Admin: permissions they do NOT get. A new Admin starts without the
+    // people powers (members.*) unless the Owner sends limits without them.
+    limits?: unknown;
   }>();
 
+  if (!hasPermission(c, "members.create")) {
+    return c.json({ error: "Forbidden: requires members.create" }, 403);
+  }
   if (!email || !name) {
     return c.json({ error: "email and name are required" }, 400);
   }
@@ -272,8 +324,16 @@ usersRouter.post("/", async (c) => {
   const roleId = resolved.id;
 
   // Admins and Owners are added only by the Owner: an admin cannot make another admin.
-  if (ADMIN_ROLES.includes(orgRole) && !hasPermission(c, "admins.manage")) {
+  if (ADMIN_ROLES.includes(orgRole) && !hasFixed(c, "manageAdmins")) {
     return c.json({ error: "Only an Owner can add admins" }, 403);
+  }
+  // Any role but plain Member, or a choice of projects, is giving a role and projects.
+  if ((orgRole !== "member" || projectScope !== undefined || projectIds !== undefined) && !hasPermission(c, "members.assign")) {
+    return c.json({ error: "Forbidden: requires members.assign" }, 403);
+  }
+  // A role carrying people powers is the Owner's to give.
+  if (carriesPeoplePowers(resolved.permissions) && !resolved.isSystem && !hasFixed(c, "manageAdmins")) {
+    return c.json({ error: "Only the Owner can give a role that manages members" }, 403);
   }
   // No one gives a role carrying more than they hold.
   if (!mayGrantRole(c.get("permissions"), resolved)) {
@@ -282,10 +342,15 @@ usersRouter.post("/", async (c) => {
   if (orgRole === "owner" && !roleId) {
     return c.json({ error: "The Owner role is not set up yet; run the roles migration" }, 400);
   }
-  // Data access rules are access.manage's, not just members.manage's.
-  if (config !== undefined && config !== null && !hasPermission(c, "access.manage")) {
-    return c.json({ error: "Forbidden: setting data access requires access.manage" }, 403);
+  if (config !== undefined && config !== null && !hasPermission(c, "members.data_rules")) {
+    return c.json({ error: "Forbidden: requires members.data_rules" }, 403);
   }
+  // Limits are only for an Admin; a new Admin starts without the people powers.
+  if (limits !== undefined && orgRole !== "admin") {
+    return c.json({ error: "Limits apply to Admins only" }, 400);
+  }
+  const startLimits = orgRole !== "admin" ? null : limits === undefined ? { ok: true as const, limits: [...PEOPLE_PERMISSIONS] } : checkedLimits(limits);
+  if (startLimits && !startLimits.ok) return c.json({ error: startLimits.error }, 400);
 
   const checked = checkedConfig(config);
   if (!checked.ok) {
@@ -308,29 +373,19 @@ usersRouter.post("/", async (c) => {
     .limit(1);
 
   if (existing) {
+    // A removed person is never overwritten by adding their email again: that
+    // replaced their password and role silently. They come back through
+    // reactivation (PUT { isActive: true }), which keeps their own credentials.
     if (!existing.isActive) {
-      // Reactivate with new credentials
-      const passwordHash = ssoOnly ? null : await hashPassword(password!);
-      const before = await loadMember(db, orgId, existing.id);
-      const [reactivated] = await db
-        .update(users)
-        .set({ name, passwordHash, role: resolved.kind, roleId, config: checked.config, isActive: true, updatedAt: new Date() })
-        .where(eq(users.id, existing.id))
-        .returning({
-          id: users.id,
-          orgId: users.orgId,
-          email: users.email,
-          name: users.name,
-          role: users.role,
-          config: users.config,
-          isActive: users.isActive,
-          createdAt: users.createdAt,
-        });
-      if (before?.orgRole !== orgRole) {
-        await recordRoleChange(db, { orgId, userId: existing.id, changedBy: c.get("userId"), fromRole: before?.orgRole ?? null, toRole: orgRole });
-      }
-      await applyProjectScope(c, db, orgId, { id: existing.id, orgRole }, startScope, projectIds);
-      return c.json({ ...reactivated, orgRole, ...(await scopeOf(db, existing.id)) }, 200);
+      return c.json(
+        {
+          error: `${existing.name} was removed from this organization. Reactivate them instead; their password and settings are kept.`,
+          removed: true,
+          userId: existing.id,
+          name: existing.name,
+        },
+        409
+      );
     }
     return c.json({ error: "A user with this email already exists in this organization" }, 409);
   }
@@ -361,7 +416,11 @@ usersRouter.post("/", async (c) => {
 
   await recordRoleChange(db, { orgId, userId: user.id, changedBy: c.get("userId"), fromRole: null, toRole: orgRole });
   await applyProjectScope(c, db, orgId, { id: user.id, orgRole }, startScope, projectIds);
-  return c.json({ ...user, orgRole, ...(await scopeOf(db, user.id)) }, 201);
+  if (startLimits?.ok) {
+    await setLimits(db, user.id, startLimits.limits, actorOf(c));
+    await logAccess(db, { orgId, actorId: actorOf(c), action: "member.limits_changed", target: { type: "user", id: user.id }, subjectId: user.id, before: null, after: { limits: startLimits.limits } });
+  }
+  return c.json({ ...user, orgRole, ...(await scopeOf(db, user.id)), limits: startLimits?.ok ? startLimits.limits : [] }, 201);
 });
 
 /**
@@ -398,9 +457,21 @@ usersRouter.get("/", async (c) => {
     .innerJoin(projects, eq(projects.id, projectMembers.projectId))
     .where(eq(projects.orgId, orgId));
 
+  // People's data rules, external roles and limits are members.view's; anyone
+  // else on the platform gets names and roles only (to pick people to share with).
+  const seesPeople = hasPermission(c, "members.view");
+  const limits = seesPeople
+    ? await db
+        .select({ userId: userPermissionLimits.userId, permission: userPermissionLimits.permission })
+        .from(userPermissionLimits)
+        .innerJoin(users, eq(users.id, userPermissionLimits.userId))
+        .where(eq(users.orgId, orgId))
+    : [];
+
   return c.json(
-    orgUsers.map(({ roleKey, ...u }) => ({
+    orgUsers.map(({ roleKey, config, externalRoles, ...u }) => ({
       ...u,
+      ...(seesPeople ? { config, externalRoles, limits: limits.filter((l) => l.userId === u.id).map((l) => l.permission) } : {}),
       orgRole: orgRoleOf({ role: u.role, roleKey }),
       projectIds: memberships.filter((m) => m.userId === u.id).map((m) => m.projectId),
     }))
@@ -429,7 +500,7 @@ usersRouter.get("/", async (c) => {
  * Keyed on (user_id, access_hash), the table's own primary key, so knowing a
  * hash is not enough to read another user's — or another org's — access.
  */
-usersRouter.get("/:userId/access-history", async (c) => {
+usersRouter.get("/:userId/access-history", requirePermission("members.view"), async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const userId = c.req.param("userId");
@@ -498,23 +569,36 @@ usersRouter.get("/:userId", async (c) => {
     return c.json({ error: "User not found" }, 404);
   }
 
-  // The apps shared with this user directly (object_grants), with their level.
+  // The apps shared with this user directly (object_grants), with the role given.
   const grants = await db
     .select({
       appId: apps.id,
       appName: apps.name,
       appType: apps.type,
-      level: objectGrants.level,
+      roleId: objectGrants.objectRoleId,
       createdAt: objectGrants.createdAt,
     })
     .from(objectGrants)
     .innerJoin(objects, eq(objects.id, objectGrants.objectId))
     .innerJoin(apps, sql`${apps.id}::text = ${objects.refId}`)
     .where(and(eq(objectGrants.principalType, "user"), eq(objectGrants.principalId, userId)));
-  const permissions = grants.map((g) => ({ ...g, permission: legacyPermission(g.level as Level) }));
+  const sharingRoles = await sharingRolesById(db, grants.map((g) => g.roleId));
+  const permissions = grants.map(({ roleId, ...g }) => {
+    const role = sharingRoles.get(roleId);
+    const level = role ? levelForActions(role.actions) : null;
+    return { ...g, role: role?.name ?? null, actions: role?.actions ?? [], level, permission: legacyPermission(level) };
+  });
 
-  const { roleKey, ...rest } = user;
-  return c.json({ ...rest, orgRole: orgRoleOf({ role: user.role, roleKey }), ...(await scopeOf(db, userId)), permissions });
+  // Data rules, external roles and limits are members.view's (except your own).
+  const seesPeople = hasPermission(c, "members.view") || userId === c.get("userId");
+  const { roleKey, config, externalRoles, ...rest } = user;
+  return c.json({
+    ...rest,
+    ...(seesPeople ? { config, externalRoles, limits: await limitsOf(db, userId) } : {}),
+    orgRole: orgRoleOf({ role: user.role, roleKey }),
+    ...(await scopeOf(db, userId)),
+    permissions,
+  });
 });
 
 /**
@@ -543,6 +627,8 @@ usersRouter.put("/:userId", async (c) => {
     projectIds?: unknown;
     // Deactivating: who gets what they own (default: whoever deactivates them).
     transferTo?: unknown;
+    // For an Admin, set by the Owner: exactly the permissions they do NOT get.
+    limits?: unknown;
   }>();
 
   const target = await loadMember(db, orgId, userId);
@@ -554,6 +640,22 @@ usersRouter.put("/:userId", async (c) => {
   // Admins and Owners are changed only by the Owner, except a person editing themselves.
   if (!mayActOn(c, target, isSelf)) {
     return c.json({ error: "Only an Owner can change an admin or Owner" }, 403);
+  }
+
+  // Each kind of change needs its own people power. Your own name and email are yours.
+  const need = (permission: Permission, asked: boolean) => asked && !hasPermission(c, permission);
+  if (!isSelf && need("members.edit", body.name !== undefined || body.email !== undefined || body.isActive !== undefined)) {
+    return c.json({ error: "Forbidden: requires members.edit" }, 403);
+  }
+  if (need("members.assign", body.role !== undefined || body.projectScope !== undefined || body.projectIds !== undefined)) {
+    return c.json({ error: "Forbidden: requires members.assign" }, 403);
+  }
+  if (need("members.data_rules", body.config !== undefined)) {
+    return c.json({ error: "Forbidden: requires members.data_rules" }, 403);
+  }
+  // Nobody changes their own data rules (as with role and projects).
+  if (body.config !== undefined && isSelf && actorRole !== "super_admin") {
+    return c.json({ error: "Cannot change your own data rules" }, 403);
   }
 
   // Resolved only after validation below; stays undefined when role is absent
@@ -580,11 +682,16 @@ usersRouter.put("/:userId", async (c) => {
 
     if (requested.key !== target.orgRole) {
       // Making or unmaking an admin or Owner is the Owner's alone.
-      if ((ADMIN_ROLES.includes(requested.key) || ADMIN_ROLES.includes(target.orgRole)) && !hasPermission(c, "admins.manage")) {
+      if ((ADMIN_ROLES.includes(requested.key) || ADMIN_ROLES.includes(target.orgRole)) && !hasFixed(c, "manageAdmins")) {
         return c.json({ error: "Only an Owner can make or change an admin" }, 403);
       }
-      // No one hands out, or strips, more than they hold themselves.
+      // A role carrying people powers is the Owner's to give or take away.
       const current = await resolveRole(db, orgId, target.orgRole);
+      const peoplePowers = [requested, current].some((r) => r && !r.isSystem && carriesPeoplePowers(r.permissions));
+      if (peoplePowers && !hasFixed(c, "manageAdmins")) {
+        return c.json({ error: "Only the Owner can give or take away a role that manages members" }, 403);
+      }
+      // No one hands out, or strips, more than they hold themselves.
       if (!mayGrantRole(c.get("permissions"), requested) || (current && !mayGrantRole(c.get("permissions"), current))) {
         return c.json({ error: "You can only give or take away a role whose permissions you hold yourself" }, 403);
       }
@@ -599,9 +706,22 @@ usersRouter.put("/:userId", async (c) => {
     }
   }
 
-  // Data access rules are access.manage's, not just members.manage's.
-  if (body.config !== undefined && !hasPermission(c, "access.manage")) {
-    return c.json({ error: "Forbidden: changing data access requires access.manage" }, 403);
+  // An Admin's limits: the Owner's alone, never your own, and only for an Admin.
+  const roleAfterChange = validatedRole?.key ?? target.orgRole;
+  let newLimits: string[] | undefined;
+  if (body.limits !== undefined) {
+    if (!hasFixed(c, "manageAdmins")) return c.json({ error: "Only the Owner can set what an Admin may do" }, 403);
+    if (isSelf) return c.json({ error: "Cannot change your own limits" }, 403);
+    if (roleAfterChange !== "admin") return c.json({ error: "Limits apply to Admins only" }, 400);
+    const checked = checkedLimits(body.limits);
+    if (!checked.ok) return c.json({ error: checked.error }, 400);
+    newLimits = checked.limits;
+  } else if (validatedRole && roleAfterChange === "admin" && target.orgRole !== "admin") {
+    // Made an Admin just now: starts without the people powers, as a new Admin does.
+    newLimits = [...PEOPLE_PERMISSIONS];
+  } else if (validatedRole && roleAfterChange !== "admin") {
+    // No longer an Admin: limits no longer mean anything.
+    newLimits = [];
   }
 
   if (body.isActive === false && target.isActive) {
@@ -719,11 +839,48 @@ usersRouter.put("/:userId", async (c) => {
   if (validatedRole !== undefined) {
     await recordRoleChange(db, { orgId, userId, changedBy: actorId, fromRole: target.orgRole, toRole: validatedRole.key });
   }
+  if (updates.config !== undefined && JSON.stringify(updates.config ?? null) !== JSON.stringify(target.config ?? null)) {
+    await logAccess(db, {
+      orgId,
+      actorId: actorOf(c),
+      action: "member.access_changed",
+      target: { type: "user", id: userId },
+      subjectId: userId,
+      before: { config: target.config ?? null },
+      after: { config: updates.config ?? null },
+    });
+  }
+  if (body.isActive !== undefined && body.isActive !== target.isActive) {
+    await logAccess(db, {
+      orgId,
+      actorId: actorOf(c),
+      action: body.isActive ? "member.reactivated" : "member.removed",
+      target: { type: "user", id: userId },
+      subjectId: userId,
+      before: { isActive: target.isActive },
+      after: { isActive: body.isActive },
+    });
+  }
   if (changesScope) {
     await applyProjectScope(c, db, orgId, { id: userId, orgRole: roleAfter }, body.projectScope, body.projectIds);
   }
+  if (newLimits !== undefined) {
+    const before = await limitsOf(db, userId);
+    if (!sameIds(before, newLimits)) {
+      await setLimits(db, userId, newLimits, actorId);
+      await logAccess(db, {
+        orgId,
+        actorId: actorOf(c),
+        action: "member.limits_changed",
+        target: { type: "user", id: userId },
+        subjectId: userId,
+        before: { limits: before },
+        after: { limits: newLimits },
+      });
+    }
+  }
 
-  return c.json({ ...updated, orgRole: roleAfter, ...(await scopeOf(db, userId)) });
+  return c.json({ ...updated, orgRole: roleAfter, ...(await scopeOf(db, userId)), limits: await limitsOf(db, userId) });
 });
 
 /**
@@ -745,6 +902,10 @@ usersRouter.post("/:userId/password", async (c) => {
 
   const target = await loadMember(db, orgId, userId);
   if (!target) return c.json({ error: "User not found" }, 404);
+  // Someone else's password needs members.reset_password; your own is yours.
+  if (userId !== c.get("userId") && !hasPermission(c, "members.reset_password")) {
+    return c.json({ error: "Forbidden: requires members.reset_password" }, 403);
+  }
   // An admin's or Owner's password is reset only by the Owner, or by themselves.
   if (!mayActOn(c, target, userId === c.get("userId"))) {
     return c.json({ error: "Only an Owner can set an admin's or Owner's password" }, 403);
@@ -772,7 +933,13 @@ usersRouter.post("/:userId/password", async (c) => {
   // still mint new ones and the reset would not stick.
   await revokeAllForUser(db, userId);
 
-  console.log(`[audit] password reset: actor=${c.get("userId")} target=${userId}`);
+  await logAccess(db, {
+    orgId,
+    actorId: actorOf(c),
+    action: "member.password_reset",
+    target: { type: "user", id: userId },
+    subjectId: userId,
+  });
   return c.json({ success: true });
 });
 
@@ -780,7 +947,7 @@ usersRouter.post("/:userId/password", async (c) => {
  * GET /orgs/:orgId/users/:userId/owned
  * What the member owns, which is handed over when they are removed.
  */
-usersRouter.get("/:userId/owned", async (c) => {
+usersRouter.get("/:userId/owned", requirePermission("members.view"), async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const userId = c.req.param("userId");
@@ -793,7 +960,7 @@ usersRouter.get("/:userId/owned", async (c) => {
  * Deactivate user (sets isActive = false, revokes all app access). Everything
  * they own is handed over first: to `transferTo`, or to whoever removes them.
  */
-usersRouter.delete("/:userId", async (c) => {
+usersRouter.delete("/:userId", requirePermission("members.edit"), async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const userId = c.req.param("userId");
@@ -828,9 +995,20 @@ usersRouter.delete("/:userId", async (c) => {
   }
 
   // Revoke everything shared with them directly.
-  await db
+  const revoked = await db
     .delete(objectGrants)
-    .where(and(eq(objectGrants.principalType, "user"), eq(objectGrants.principalId, userId)));
+    .where(and(eq(objectGrants.principalType, "user"), eq(objectGrants.principalId, userId)))
+    .returning({ objectId: objectGrants.objectId, roleId: objectGrants.objectRoleId });
+
+  await logAccess(db, {
+    orgId,
+    actorId: actorOf(c),
+    action: "member.removed",
+    target: { type: "user", id: userId },
+    subjectId: userId,
+    before: { isActive: true, role: target.orgRole, shares: revoked },
+    after: { isActive: false, handedOverTo: handed.to, handedOver: handed.moved },
+  });
 
   return c.json({
     message: "User deactivated and all permissions revoked",

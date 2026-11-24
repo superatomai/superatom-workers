@@ -459,6 +459,7 @@ auth.get("/me", authMiddleware, async (c) => {
     roleId: c.get("roleId") ?? null,
     orgRole,
     projectScope: c.get("projectScope") ?? null,
+    permissions,
   };
   // The projects they may reach (lib/project-scope.ts); null: every project.
   const reachable = await allowedProjects(db, caller);
@@ -471,6 +472,7 @@ auth.get("/me", authMiddleware, async (c) => {
     isDefault: a.app.isDefault,
     status: a.object.status,
     level: a.level,
+    actions: a.actions,
     permission: legacyPermission(a.level),
   }));
 

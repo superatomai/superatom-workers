@@ -2,8 +2,10 @@ import { Hono } from "hono";
 import { and, count, eq, inArray, isNull, or } from "drizzle-orm";
 import { rolePermissions, roles, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, orgScopeGuard, requirePermission } from "../middleware/auth";
-import { BUILT_IN_ROLES, OWNER_ONLY, PERMISSIONS, PERMISSION_CATALOGUE, type BuiltInRole } from "../lib/permissions";
+import { authMiddleware, orgScopeGuard, requireFixed, requirePermission } from "../middleware/auth";
+import { BUILT_IN_ROLES, PERMISSIONS, PERMISSION_CATALOGUE, type BuiltInRole } from "../lib/permissions";
+import { actorOf, logAccess } from "../lib/access-log";
+import { writeTogether } from "../lib/write-together";
 
 /**
  * Organization roles: the built-in ones (Owner, Admin, Member) and the org's
@@ -11,16 +13,16 @@ import { BUILT_IN_ROLES, OWNER_ONLY, PERMISSIONS, PERMISSION_CATALOGUE, type Bui
  * Mounted at /orgs/:orgId/roles.
  *
  * Anyone on the platform may read them (the members screen needs the list);
- * creating, editing and deleting a custom role is roles.manage, the Owner's.
- * A custom role can never carry an Owner-only permission, and built-in roles
+ * creating, editing and deleting a custom role is fixed to the Owner (FIXED in
+ * lib/permissions.ts), never a permission a role could carry. Built-in roles
  * cannot be edited or deleted.
  */
 const rolesRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
 rolesRouter.use("*", authMiddleware, requirePermission("platform.access"), orgScopeGuard);
-rolesRouter.post("*", requirePermission("roles.manage"));
-rolesRouter.put("*", requirePermission("roles.manage"));
-rolesRouter.delete("*", requirePermission("roles.manage"));
+rolesRouter.post("*", requireFixed("manageRoles"));
+rolesRouter.put("*", requireFixed("manageRoles"));
+rolesRouter.delete("*", requireFixed("manageRoles"));
 
 export const RESERVED_KEYS = ["owner", "admin", "member", "org_admin", "super_admin"];
 
@@ -39,8 +41,6 @@ export function checkedPermissions(value: unknown): { ok: true; permissions: str
   const list = [...new Set(value.map(String))];
   const unknown = list.filter((p) => !(PERMISSIONS as readonly string[]).includes(p));
   if (unknown.length) return { ok: false, error: `Unknown permissions: ${unknown.join(", ")}` };
-  const ownerOnly = list.filter((p) => (OWNER_ONLY as readonly string[]).includes(p));
-  if (ownerOnly.length) return { ok: false, error: `Only an Owner can hold ${ownerOnly.join(", ")}; a custom role cannot carry them` };
   return { ok: true, permissions: list };
 }
 
@@ -136,14 +136,22 @@ rolesRouter.post("/", async (c) => {
     .limit(1);
   if (clash) return c.json({ error: `A role named "${name}" already exists` }, 409);
 
-  const [role] = await db
-    .insert(roles)
-    .values({ orgId, key, name, description: (body.description as string | undefined) ?? null, isSystem: false, createdBy: c.get("userId") })
-    .returning();
-  if (checked.permissions.length) {
-    await db.insert(rolePermissions).values(checked.permissions.map((permission) => ({ roleId: role.id, permission })));
-  }
-  console.log(`[audit] role created: actor=${c.get("userId")} org=${orgId} role=${key} permissions=${checked.permissions.join(",")}`);
+  // The id is made here so the role and its permissions are saved together.
+  const roleId = crypto.randomUUID();
+  const description = (body.description as string | undefined) ?? null;
+  await writeTogether(db, [
+    db.insert(roles).values({ id: roleId, orgId, key, name, description, isSystem: false, createdBy: c.get("userId") }),
+    checked.permissions.length > 0 &&
+      db.insert(rolePermissions).values(checked.permissions.map((permission) => ({ roleId, permission }))),
+  ]);
+  const [role] = await db.select().from(roles).where(eq(roles.id, roleId)).limit(1);
+  await logAccess(db, {
+    orgId,
+    actorId: actorOf(c),
+    action: "role.created",
+    target: { type: "role", id: role.id },
+    after: { key, name: role.name, permissions: checked.permissions },
+  });
   return c.json({ ...role, permissions: checked.permissions, members: 0 }, 201);
 });
 
@@ -176,15 +184,22 @@ rolesRouter.put("/:roleId", async (c) => {
     permissions = checked.permissions;
   }
 
-  const [updated] = await db.update(roles).set(updates).where(eq(roles.id, role.id)).returning();
-  if (permissions) {
-    await db.delete(rolePermissions).where(eq(rolePermissions.roleId, role.id));
-    if (permissions.length) {
-      await db.insert(rolePermissions).values(permissions.map((permission) => ({ roleId: role.id, permission })));
-    }
-    console.log(`[audit] role permissions changed: actor=${c.get("userId")} org=${orgId} role=${role.key} permissions=${permissions.join(",")}`);
-  }
-  const current = permissions ?? (await db.select().from(rolePermissions).where(eq(rolePermissions.roleId, role.id))).map((p) => p.permission);
+  const previous = (await db.select().from(rolePermissions).where(eq(rolePermissions.roleId, role.id))).map((p) => p.permission);
+  await writeTogether(db, [
+    db.update(roles).set(updates).where(eq(roles.id, role.id)),
+    permissions && db.delete(rolePermissions).where(eq(rolePermissions.roleId, role.id)),
+    !!permissions?.length && db.insert(rolePermissions).values(permissions.map((permission) => ({ roleId: role.id, permission }))),
+  ]);
+  const [updated] = await db.select().from(roles).where(eq(roles.id, role.id)).limit(1);
+  const current = permissions ?? previous;
+  await logAccess(db, {
+    orgId,
+    actorId: actorOf(c),
+    action: "role.edited",
+    target: { type: "role", id: role.id },
+    before: { name: role.name, description: role.description, permissions: previous },
+    after: { name: updated.name, description: updated.description, permissions: current },
+  });
   return c.json({ ...updated, permissions: current });
 });
 
@@ -208,8 +223,15 @@ rolesRouter.delete("/:roleId", async (c) => {
     return c.json({ error: `${n} active member(s) have this role. Give them another role first.` }, 409);
   }
 
+  const permissions = (await db.select().from(rolePermissions).where(eq(rolePermissions.roleId, role.id))).map((p) => p.permission);
   await db.delete(roles).where(eq(roles.id, role.id));
-  console.log(`[audit] role deleted: actor=${c.get("userId")} org=${orgId} role=${role.key}`);
+  await logAccess(db, {
+    orgId,
+    actorId: actorOf(c),
+    action: "role.deleted",
+    target: { type: "role", id: role.id },
+    before: { key: role.key, name: role.name, permissions },
+  });
   return c.json({ message: "Role deleted" });
 });
 

@@ -20,7 +20,7 @@ const analyticsExportRouter = new Hono<{ Bindings: Env; Variables: AppVariables 
  * uses it for a progress percentage. Page with limit/offset until `rows` has
  * fewer than `limit` entries.
  */
-analyticsExportRouter.get("/", authMiddleware, requirePermission("analytics.view"), async (c) => {
+analyticsExportRouter.get("/", authMiddleware, requirePermission("analytics.export"), async (c) => {
   const db = c.get("db");
   const orgId = scopedOrgId(c);
   const projectId = c.req.query("projectId");

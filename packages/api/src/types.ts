@@ -1,4 +1,5 @@
 import type { Database } from "./db";
+import type { ProjectAccess } from "./lib/objects";
 
 export type Env = {
   DATABASE_URL: string;
@@ -115,4 +116,6 @@ export type AppVariables = {
   sessionId: string | null;
   /** "sdk" when the token came from the SDK exchange — such a session always acts as a member. */
   tokenSource: "app" | "sdk";
+  /** The project in the path with the caller's access to it, looked up once by the project routes' guard. */
+  projectAccess?: ProjectAccess | null;
 };

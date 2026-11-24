@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { organizations, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, requirePermission, superAdminOnly, orgScopeGuard } from "../middleware/auth";
+import { authMiddleware, requirePermission, requireFixed, superAdminOnly, orgScopeGuard } from "../middleware/auth";
 import { validatePassword } from "../lib/password-policy";
 import { builtInRoleId } from "../lib/permissions";
 import { createOrgSecret } from "../lib/org-secrets";
@@ -153,7 +153,7 @@ orgs.get("/:orgId", authMiddleware, requirePermission("platform.access"), orgSco
  * PUT /orgs/:orgId
  * Update organization (admin of that org, or super_admin).
  */
-orgs.put("/:orgId", authMiddleware, requirePermission("org.edit"), orgScopeGuard, async (c) => {
+orgs.put("/:orgId", authMiddleware, requireFixed("editOrg"), orgScopeGuard, async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId");
   const body = await c.req.json<{ name?: string; slug?: string; icon?: string; defaultAppId?: string | null }>();

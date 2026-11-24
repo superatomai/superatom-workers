@@ -45,7 +45,7 @@ async function caller(c: AppContext, projectId: string, opts: { adminOnly: boole
   if (!(await projectAllowed(db, { userId: auth.userId, userRole: auth.role, orgRole: auth.orgRole, projectScope: auth.projectScope }, projectId))) {
     return { ok: false, status: 403, error: "Not permitted for this project" };
   }
-  if (opts.adminOnly && !auth.permissions.includes("programs.publish")) return { ok: false, status: 403, error: "Forbidden: requires programs.publish" };
+  if (opts.adminOnly && !auth.permissions.includes("program.publish")) return { ok: false, status: 403, error: "Forbidden: requires program.publish" };
   const [u] = await db.select({ email: users.email }).from(users).where(eq(users.id, auth.userId)).limit(1);
   return { ok: true, caller: { kind: "user", userId: auth.userId, email: u?.email ?? auth.userId, role: auth.role, orgId: auth.orgId }, orgId: project.orgId };
 }

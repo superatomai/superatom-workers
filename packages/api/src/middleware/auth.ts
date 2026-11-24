@@ -2,11 +2,12 @@ import { createMiddleware } from "hono/factory";
 import type { Context } from "hono";
 import { decodeJwt, jwtVerify } from "jose";
 import { eq, sql } from "drizzle-orm";
-import { users, refreshTokens, roles, rolePermissions } from "../db/schema";
+import { users, refreshTokens, roles, rolePermissions, userPermissionLimits } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { getOrgSecret, isSecretBoundToUser, secretKeyFor } from "../lib/org-secrets";
-import { orgRoleOf, permissionsOf } from "../lib/permissions";
+import { FIXED, hasFixedPower, orgRoleOf, permissionsOf, type FixedPower, type Permission } from "../lib/permissions";
 import { withDbRetry } from "../lib/db-retry";
+import { logRefusal } from "../lib/access-log";
 
 type AuthContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 
@@ -116,6 +117,7 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
         roleKey: string | null;
         roleIsSystem: boolean | null;
         customPermissions: string[] | null;
+        limits: string[] | null;
         isActive: boolean;
         tokensValidAfter: Date | null;
         sessionActive: boolean;
@@ -136,6 +138,8 @@ export async function authenticateRequest(c: AuthContext): Promise<AuthResult> {
         roleKey: roles.key,
         roleIsSystem: roles.isSystem,
         customPermissions: sql<string[] | null>`(select array_agg(${rolePermissions.permission}) from ${rolePermissions} where ${rolePermissions.roleId} = ${users.roleId})`,
+        // This person's limits (an Admin the Owner narrowed), in the same round trip.
+        limits: sql<string[] | null>`(select array_agg(${userPermissionLimits.permission}) from ${userPermissionLimits} where ${userPermissionLimits.userId} = ${users.id})`,
         isActive: users.isActive,
         tokensValidAfter: users.tokensValidAfter,
         // Folded into the same query so ending one session costs no extra round
@@ -271,11 +275,14 @@ export const adminOnly = createMiddleware<{
  * Requires every listed permission (lib/permissions.ts). Must be used after
  * authMiddleware. A change from an SDK session is refused, as in adminOnly.
  */
-export function requirePermission(...needed: string[]) {
+// Typed as Permission, not string: a misspelt or retired permission name is a
+// compile error, never a check that silently refuses everyone.
+export function requirePermission(...needed: Permission[]) {
   return createMiddleware<{ Bindings: Env; Variables: AppVariables }>(async (c, next) => {
     const held = c.get("permissions") ?? [];
     const missing = needed.filter((p) => !held.includes(p));
     if (missing.length) {
+      await logRefusal(c, `requires ${missing.join(", ")}`);
       return c.json({ error: `Forbidden: requires ${missing.join(", ")}` }, 403);
     }
     if (isSdkWrite(c)) {
@@ -285,8 +292,44 @@ export function requirePermission(...needed: string[]) {
   });
 }
 
+/**
+ * Requires the read permission for GET and HEAD, the write one for everything
+ * else: for routers whose reads and changes are different permissions
+ * (`email.view` / `email.send`).
+ */
+export function requireReadWrite(read: Permission, write: Permission) {
+  return createMiddleware<{ Bindings: Env; Variables: AppVariables }>(async (c, next) => {
+    const isRead = c.req.method === "GET" || c.req.method === "HEAD";
+    return requirePermission(isRead ? read : write)(c, next);
+  });
+}
+
+/**
+ * Requires a power fixed to the built-in roles (lib/permissions.ts FIXED):
+ * managing members, admins and roles, and the org's settings. No role can carry
+ * these, so they are checked against the org role, never the permission list.
+ */
+export function requireFixed(power: FixedPower) {
+  return createMiddleware<{ Bindings: Env; Variables: AppVariables }>(async (c, next) => {
+    if (!hasFixedPower(c.get("orgRole"), power)) {
+      const who = FIXED[power].length === 1 ? "the Owner" : "the Owner or an Admin";
+      await logRefusal(c, `only ${who} (${power})`);
+      return c.json({ error: `Forbidden: only ${who} can do this` }, 403);
+    }
+    if (isSdkWrite(c)) {
+      return c.json({ error: "Not available to SDK sessions" }, 403);
+    }
+    await next();
+  });
+}
+
+/** Whether the caller has a fixed power. For checks inside a route. */
+export function hasFixed(c: { get: (k: "orgRole") => string }, power: FixedPower): boolean {
+  return hasFixedPower(c.get("orgRole"), power);
+}
+
 /** Whether the caller holds a permission. For checks inside a route. */
-export function hasPermission(c: { get: (k: "permissions") => readonly string[] }, permission: string): boolean {
+export function hasPermission(c: { get: (k: "permissions") => readonly string[] }, permission: Permission): boolean {
   return (c.get("permissions") ?? []).includes(permission);
 }
 

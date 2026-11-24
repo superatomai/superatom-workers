@@ -10,13 +10,32 @@
  * whose role_id is the built-in `owner` role. See ROLES-IMPLEMENTATION.md.
  */
 import { and, count, eq, isNull, ne } from "drizzle-orm";
-import { roleChanges, rolePermissions, roles, users } from "../db/schema";
+import { rolePermissions, roles, userPermissionLimits, users } from "../db/schema";
 import type { Database } from "../db";
+import { logAccess } from "./access-log";
+import { writeTogether } from "./write-together";
+
+/** The same four actions on every kind of object. */
+const crud = <R extends string>(resource: R, label: string) =>
+  [
+    { key: `${resource}.view` as `${R}.view`, label: `View ${label}` },
+    { key: `${resource}.create` as `${R}.create`, label: `Create ${label}` },
+    { key: `${resource}.edit` as `${R}.edit`, label: `Edit ${label}` },
+    { key: `${resource}.delete` as `${R}.delete`, label: `Delete ${label}` },
+  ] as const;
 
 /**
- * Every permission there is, as `module.action`, grouped by module with what
- * each one allows. A role is a set of these; this is the list a role screen
- * offers. Built-in roles take theirs from BUILT_IN_ROLES below.
+ * Every permission a role can carry, as `resource.action`, grouped by module
+ * with what each one allows: the list a role screen offers. Built-in roles take
+ * theirs from BUILT_IN_ROLES below.
+ *
+ * Managing people (members.*) is here, so the Owner can give it deliberately,
+ * but only the Owner can put it in a role or give such a role (routes/roles.ts,
+ * routes/users.ts), and nobody acts on Admins, the Owner or themselves.
+ *
+ * Deliberately NOT here, and so never part of any role: managing admins and
+ * roles, and the organization's settings and SSO. Those are fixed to the Owner
+ * (and Admins, for org settings) in code (see FIXED below).
  */
 export const PERMISSION_CATALOGUE = [
   {
@@ -25,101 +44,150 @@ export const PERMISSION_CATALOGUE = [
     permissions: [{ key: "platform.access", label: "Sign in to the platform" }],
   },
   {
-    module: "organization",
-    label: "Organization",
-    permissions: [
-      { key: "org.edit", label: "Edit the organization's name, icon and landing app" },
-      { key: "org.settings", label: "Change SSO and sign-in rules", ownerOnly: true },
-      { key: "roles.manage", label: "Create and edit roles", ownerOnly: true },
-      { key: "admins.manage", label: "Add, promote, demote and remove admins and Owners", ownerOnly: true },
-    ],
-  },
-  {
     module: "members",
     label: "Members",
     permissions: [
-      { key: "members.manage", label: "Add, edit and deactivate members, and give them roles" },
-      { key: "access.manage", label: "Edit members' data access rules" },
+      { key: "members.view", label: "See members, their data rules and access history" },
+      { key: "members.history", label: "See the access log: who gave or took away whose access, and when" },
+      { key: "members.create", label: "Add members" },
+      { key: "members.edit", label: "Change members' name and email, deactivate and reactivate them" },
+      { key: "members.assign", label: "Give members a role and choose their projects" },
+      { key: "members.data_rules", label: "Set members' data access rules" },
+      { key: "members.reset_password", label: "Reset members' passwords" },
     ],
   },
+  { module: "projects", label: "Projects", permissions: crud("project", "projects") },
+  { module: "sources", label: "Data sources", permissions: crud("source", "data sources") },
+  { module: "dashboards", label: "Dashboards", permissions: crud("dashboard", "dashboards") },
+  { module: "reports", label: "Reports", permissions: crud("report", "reports") },
+  { module: "agents", label: "Chat agents", permissions: crud("agent", "chat agents") },
+  { module: "apps", label: "Apps", permissions: crud("app", "mobile apps") },
   {
-    module: "projects",
-    label: "Projects",
-    permissions: [
-      { key: "projects.create", label: "Create projects" },
-      { key: "projects.edit", label: "Edit projects and their members" },
-      { key: "projects.delete", label: "Delete projects" },
-    ],
-  },
-  {
-    module: "sources",
-    label: "Data sources",
-    permissions: [{ key: "sources.manage", label: "Connect, edit and delete data sources" }],
-  },
-  {
-    module: "apps",
-    label: "Dashboards, chat agents, reports and apps",
-    permissions: [
-      { key: "dashboards.create", label: "Create dashboards" },
-      { key: "chat_agents.create", label: "Create chat agents" },
-      { key: "reports.create", label: "Create reports" },
-      { key: "apps.create", label: "Create mobile apps" },
-    ],
-  },
-  {
-    module: "data_model",
+    module: "model",
     label: "Data model",
     permissions: [
-      { key: "graph.manage", label: "Edit, review and publish the composition graph" },
-      { key: "concepts.create", label: "Create concepts" },
-      { key: "intents.create", label: "Create intents" },
+      { key: "model.view", label: "View the data model (graph, concepts, intents)" },
+      { key: "model.edit", label: "Edit, review and publish the data model" },
     ],
   },
   {
     module: "design",
     label: "Design system",
-    permissions: [{ key: "design.edit", label: "Edit the design system" }],
-  },
-  {
-    module: "follow_up",
-    label: "Feedback, analytics and emails",
     permissions: [
-      { key: "feedback.triage", label: "Set feedback resolutions" },
-      { key: "analytics.view", label: "See analytics, usage and checklist reports" },
-      { key: "emails.manage", label: "Send organization emails and manage their settings" },
+      { key: "design.view", label: "View the design system" },
+      { key: "design.edit", label: "Edit the design system" },
     ],
   },
   {
     module: "releases",
     label: "Programs and updates",
     permissions: [
-      { key: "programs.publish", label: "Publish, unpublish and pin dashboard programs" },
-      { key: "updates.manage", label: "Update the project's engine servers" },
+      { key: "program.view", label: "View dashboard programs" },
+      { key: "program.publish", label: "Publish, unpublish and pin dashboard programs" },
+      { key: "update.view", label: "View the project's engine updates" },
+      { key: "update.apply", label: "Update the project's engine servers" },
+    ],
+  },
+  {
+    module: "feedback",
+    label: "Feedback",
+    permissions: [
+      { key: "feedback.view", label: "View feedback" },
+      { key: "feedback.triage", label: "Set feedback resolutions" },
+    ],
+  },
+  {
+    module: "analytics",
+    label: "Analytics",
+    permissions: [
+      { key: "analytics.view", label: "See analytics, usage and checklist reports" },
+      { key: "analytics.export", label: "Export analytics" },
+    ],
+  },
+  {
+    module: "emails",
+    label: "Emails",
+    permissions: [
+      { key: "email.view", label: "View organization emails" },
+      { key: "email.send", label: "Write, schedule and send organization emails" },
     ],
   },
 ] as const;
 
-/** Every permission there is, as `module.action`. */
+/** Every permission a role can carry. */
 export const PERMISSIONS = PERMISSION_CATALOGUE.flatMap((m) => m.permissions.map((p) => p.key));
 
 export type Permission = (typeof PERMISSION_CATALOGUE)[number]["permissions"][number]["key"];
 
-/** Only an Owner holds these; a custom role can never carry them. */
-export const OWNER_ONLY: readonly Permission[] = PERMISSION_CATALOGUE.flatMap((m) =>
-  m.permissions.filter((p) => "ownerOnly" in p && p.ownerOnly).map((p) => p.key)
-);
-
 export type BuiltInRole = "owner" | "admin" | "member";
 
-/** What each built-in role may do. Members use the runtime only, so they hold none. */
+/**
+ * What an Admin holds, written out on purpose rather than "everything": a
+ * permission added to the catalogue later goes to the Owner only, until someone
+ * deliberately adds it here (or to ADMIN_WITHHELD). A test checks every
+ * permission is in one list or the other, so none is decided by accident.
+ */
+const ADMIN_PERMISSIONS: readonly Permission[] = [
+  "platform.access",
+  "members.view", "members.history", "members.create", "members.edit", "members.assign", "members.data_rules", "members.reset_password",
+  "project.view", "project.create", "project.edit", "project.delete",
+  "source.view", "source.create", "source.edit", "source.delete",
+  "dashboard.view", "dashboard.create", "dashboard.edit", "dashboard.delete",
+  "report.view", "report.create", "report.edit", "report.delete",
+  "agent.view", "agent.create", "agent.edit", "agent.delete",
+  "app.view", "app.create", "app.edit", "app.delete",
+  "model.view", "model.edit",
+  "design.view", "design.edit",
+  "program.view", "program.publish",
+  "update.view", "update.apply",
+  "feedback.view", "feedback.triage",
+  "analytics.view", "analytics.export",
+  "email.view", "email.send",
+];
+
+/** Permissions deliberately kept from Admins (the Owner's alone). None today. */
+export const ADMIN_WITHHELD: readonly Permission[] = [];
+
+/**
+ * What each built-in role may do from the catalogue. The Owner holds all of it;
+ * an Admin holds ADMIN_PERMISSIONS; what else separates them is FIXED, below.
+ * Members use the runtime only. One Admin can hold less: the Owner's per-person
+ * limits (user_permission_limits).
+ */
 export const BUILT_IN_ROLES: Record<BuiltInRole, readonly Permission[]> = {
   owner: PERMISSIONS,
-  admin: PERMISSIONS.filter((p) => !OWNER_ONLY.includes(p)),
+  admin: ADMIN_PERMISSIONS,
   member: [],
 };
 
-/** Roles that may manage other members, and so need `admins.manage` to be acted on. */
+/** The people powers: what a new Admin starts WITHOUT, until the Owner ticks them. */
+export const PEOPLE_PERMISSIONS = PERMISSIONS.filter((p) => p.startsWith("members.")) as Permission[];
+
+/** Roles that manage other members; only the Owner gives, changes or removes them. */
 export const ADMIN_ROLES: readonly string[] = ["owner", "admin"];
+
+/**
+ * Powers fixed to the built-in roles in code, never part of any role. Each maps
+ * to the org roles allowed (the platform super admin is always allowed).
+ * Nobody may use any of them on themselves; routes/users.ts enforces that.
+ */
+export const FIXED = {
+  /** Make, change or remove Admins and Owners, and set an Admin's limits. */
+  manageAdmins: ["owner"],
+  /** Create, edit and delete custom roles. */
+  manageRoles: ["owner"],
+  /** The organization's name, icon and landing app. */
+  editOrg: ["owner", "admin"],
+  /** SSO and sign-in rules. */
+  orgSettings: ["owner"],
+} as const satisfies Record<string, readonly BuiltInRole[]>;
+
+export type FixedPower = keyof typeof FIXED;
+
+/** Whether an org role (or the platform super admin) has a fixed power. */
+export function hasFixedPower(orgRole: string | null | undefined, power: FixedPower): boolean {
+  return orgRole === "super_admin" || (FIXED[power] as readonly string[]).includes(orgRole ?? "");
+}
 
 export type UserRoleKind = "super_admin" | "org_admin" | "member";
 
@@ -136,22 +204,26 @@ export function orgRoleOf(user: { role: UserRoleKind; roleKey?: string | null })
 /**
  * The permissions a user holds. The platform super admin holds all of them; a
  * built-in role holds its list from BUILT_IN_ROLES; a custom role holds its rows
- * (passed in as `customPermissions`), minus anything Owner-only.
+ * (passed in as `customPermissions`).
  */
 export function permissionsOf(user: {
   role: UserRoleKind;
   roleKey?: string | null;
   roleIsSystem?: boolean | null;
   customPermissions?: readonly string[] | null;
+  /** Per-person limits (user_permission_limits): removed, applied to Admins only. */
+  limits?: readonly string[] | null;
 }): Permission[] {
   if (user.role === "super_admin") return [...PERMISSIONS];
   const key = orgRoleOf(user);
   if (!user.roleKey || user.roleIsSystem) {
-    return [...(BUILT_IN_ROLES[key as BuiltInRole] ?? [])];
+    const builtIn = [...(BUILT_IN_ROLES[key as BuiltInRole] ?? [])];
+    // Limits only narrow an Admin; an Owner always holds everything.
+    return key === "admin" && user.limits?.length ? builtIn.filter((p) => !user.limits!.includes(p)) : builtIn;
   }
-  return (user.customPermissions ?? []).filter(
-    (p): p is Permission => (PERMISSIONS as readonly string[]).includes(p) && !OWNER_ONLY.includes(p as Permission)
-  );
+  // Only what is still in the catalogue: a permission renamed or retired since
+  // the role was saved grants nothing.
+  return (user.customPermissions ?? []).filter((p): p is Permission => (PERMISSIONS as readonly string[]).includes(p));
 }
 
 /** The `users.role` value an organization role is stored with. */
@@ -241,7 +313,7 @@ export async function builtInRoleId(db: Database, key: BuiltInRole): Promise<str
  */
 export async function roleAndPermissions(
   db: Database,
-  user: { role: UserRoleKind; roleId?: string | null }
+  user: { id?: string; role: UserRoleKind; roleId?: string | null }
 ): Promise<{ orgRole: string; permissions: Permission[] }> {
   let roleKey: string | null = null;
   let roleIsSystem: boolean | null = null;
@@ -260,8 +332,28 @@ export async function roleAndPermissions(
       ).map((r) => r.p);
     }
   }
-  const resolved = { role: user.role, roleKey, roleIsSystem, customPermissions };
+  const limits = user.id && orgRoleOf({ role: user.role, roleKey }) === "admin" ? await limitsOf(db, user.id) : [];
+  const resolved = { role: user.role, roleKey, roleIsSystem, customPermissions, limits };
   return { orgRole: orgRoleOf(resolved), permissions: permissionsOf(resolved) };
+}
+
+/** One person's limits: the permissions their role carries that they do not get. */
+export async function limitsOf(db: Database, userId: string): Promise<string[]> {
+  return (await db.select({ p: userPermissionLimits.permission }).from(userPermissionLimits).where(eq(userPermissionLimits.userId, userId))).map(
+    (r) => r.p
+  );
+}
+
+/**
+ * Sets one Admin's limits to exactly `limits` (permissions they do not get).
+ * Only ever narrows: every entry must be a permission the Admin role carries.
+ */
+export async function setLimits(db: Database, userId: string, limits: readonly string[], setBy: string | null): Promise<void> {
+  await writeTogether(db, [
+    db.delete(userPermissionLimits).where(eq(userPermissionLimits.userId, userId)),
+    limits.length > 0 &&
+      db.insert(userPermissionLimits).values(limits.map((permission) => ({ userId, permission, createdBy: setBy }))),
+  ]);
 }
 
 /** How many active Owners an organization has, leaving one user out (the one being changed). */
@@ -275,10 +367,18 @@ export async function activeOwnersExcept(db: Database, orgId: string, exceptUser
   return Number(row?.n ?? 0);
 }
 
-/** Records a change of a user's organization role. */
+/** Records a change of a user's organization role in the access log (a new member: fromRole null). */
 export async function recordRoleChange(
   db: Database,
   change: { orgId: string; userId: string; changedBy: string | null; fromRole: string | null; toRole: string | null }
 ): Promise<void> {
-  await db.insert(roleChanges).values(change);
+  await logAccess(db, {
+    orgId: change.orgId,
+    actorId: change.changedBy,
+    action: change.fromRole === null ? "member.added" : "member.role_changed",
+    target: { type: "user", id: change.userId },
+    subjectId: change.userId,
+    before: change.fromRole === null ? null : { role: change.fromRole },
+    after: { role: change.toRole },
+  });
 }

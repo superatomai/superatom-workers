@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { projectAllowed, scopeOfRequest } from "./project-scope";
+import { callerOf, projectActionDenied } from "./objects";
 
 export type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 
@@ -28,10 +29,14 @@ export async function assertProjectAccess(c: AppContext, projectId: string): Pro
   if (c.get("userRole") !== "super_admin" && row.orgId !== c.get("orgId")) {
     return { ok: false, status: 403, error: "Not permitted for this project" };
   }
-  // Project scope (lib/project-scope.ts): a project outside it is closed to them.
-  // A service token has no user, and no scope.
+  // Project scope (lib/project-scope.ts): a project outside it is closed to them,
+  // and so is one whose View a deny takes from them. A service token has no
+  // user, so neither applies to it.
   const scope = await scopeOfRequest(c);
   if (scope && !(await projectAllowed(c.get("db"), scope, projectId))) {
+    return { ok: false, status: 403, error: "Not permitted for this project" };
+  }
+  if (scope && (await projectActionDenied(c.get("db"), callerOf(c), projectId, "view"))) {
     return { ok: false, status: 403, error: "Not permitted for this project" };
   }
   return { ok: true, orgId: row.orgId };

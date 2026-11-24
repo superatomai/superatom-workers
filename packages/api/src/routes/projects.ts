@@ -1,10 +1,12 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { eq, and } from "drizzle-orm";
 import { projects, apps, projectMembers, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, requirePermission, hasPermission, orgScopeGuard } from "../middleware/auth";
 import { deleteProject, projectDeleteSteps } from "../lib/project-delete";
-import { allowedProjects, projectAllowed, scopeOfRequest } from "../lib/project-scope";
+import { allowedProjects, scopeOfRequest } from "../lib/project-scope";
+import { actorOf, logAccess } from "../lib/access-log";
+import { callerOf, projectAccess, projectPowers, projectsAccess, projectsSharedWith, type ProjectAccess } from "../lib/objects";
 
 export const DEFAULT_DESIGN_SYSTEM = {
   colors: {
@@ -21,33 +23,52 @@ const projectsRouter = new Hono<{
 // Read routes: any authenticated user in the org (including members)
 projectsRouter.get("*", authMiddleware, orgScopeGuard);
 // Write routes: platform users; each route then needs its own permission
-// (projects.create, projects.edit, projects.delete, design.edit).
+// (project.create, project.edit, project.delete, design.edit).
 projectsRouter.post("*", authMiddleware, requirePermission("platform.access"), orgScopeGuard);
 projectsRouter.put("*", authMiddleware, requirePermission("platform.access"), orgScopeGuard);
 projectsRouter.delete("*", authMiddleware, requirePermission("platform.access"), orgScopeGuard);
 
+type ProjectsContext = Context<{ Bindings: Env; Variables: AppVariables }>;
+
 /**
- * Project scope (lib/project-scope.ts): a project outside the caller's scope is
- * closed to them, for reading, editing, deleting and its members alike.
+ * Closes a project outside the caller's scope, or whose View a deny takes away.
+ * Keeps the access it looked up on the request for the route.
  */
-const scopeGuard = async (c: any, next: () => Promise<void>) => {
+const scopeGuard = async (c: ProjectsContext, next: () => Promise<void>) => {
   const projectId = c.req.param("projectId");
-  if (projectId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projectId)) {
-    const scope = await scopeOfRequest(c);
-    if (scope && !(await projectAllowed(c.get("db"), scope, projectId))) {
+  // A service token has no scope and reaches every project.
+  if (projectId && (await scopeOfRequest(c))) {
+    const access = await projectAccess(c.get("db"), callerOf(c), projectId);
+    if (access && (!access.inScope || access.denied.includes("view"))) {
       return c.json({ error: "Not permitted for this project" }, 403);
     }
+    c.set("projectAccess", access);
   }
   await next();
 };
 projectsRouter.use("/:projectId", scopeGuard);
 projectsRouter.use("/:projectId/*", scopeGuard);
 
+/** The caller's access to the project in the path: the guard's, or looked up now. */
+const accessFor = async (c: ProjectsContext, projectId: string) =>
+  c.get("projectAccess") ?? (await projectAccess(c.get("db"), callerOf(c), projectId));
+
+/** Whether the caller may rename or delete the project (lib/objects.ts projectPowers). */
+const powersOf = (c: ProjectsContext, access: ProjectAccess | null | undefined) =>
+  projectPowers(access && { actions: access.actions, ownerId: access.object.ownerId }, callerOf(c));
+
+/** A project with the caller's actions on it and their powers over it. */
+const withPowers = (c: ProjectsContext, project: typeof projects.$inferSelect, access: ProjectAccess | null | undefined) => ({
+  ...project,
+  actions: access?.actions ?? [],
+  ...powersOf(c, access),
+});
+
 /**
  * POST /orgs/:orgId/projects
  * Create project
  */
-projectsRouter.post("/", requirePermission("projects.create"), async (c) => {
+projectsRouter.post("/", requirePermission("project.create"), async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const userId = c.get("userId");
@@ -86,13 +107,16 @@ projectsRouter.post("/", requirePermission("projects.create"), async (c) => {
   // reach what they just made (lib/project-scope.ts).
   await db.insert(projectMembers).values({ projectId: project.id, userId, addedBy: userId }).onConflictDoNothing();
 
-  return c.json(project, 201);
+  // As the projects list returns it.
+  return c.json(withPowers(c, project, await projectAccess(db, callerOf(c), project.id)), 201);
 });
 
 /**
  * GET /orgs/:orgId/projects
  * The org's projects within the caller's project scope (all of them for an
- * Owner, a super admin, or anyone whose scope is "all").
+ * Owner, a super admin, or anyone whose scope is "all"), each with the
+ * caller's `actions` on it, so the platform shows only the buttons they may use.
+ * Access for every project is read in one round of queries (projectsAccess).
  */
 projectsRouter.get("/", async (c) => {
   const db = c.get("db");
@@ -105,7 +129,20 @@ projectsRouter.get("/", async (c) => {
 
   const scope = await scopeOfRequest(c);
   const allowed = scope ? await allowedProjects(db, scope) : null;
-  return c.json(allowed ? orgProjects.filter((p) => allowed.has(p.id)) : orgProjects);
+  const inScope = allowed ? orgProjects.filter((p) => allowed.has(p.id)) : orgProjects;
+  const caller = callerOf(c);
+  // Only a signed-in person has actions: a service token (no scope) gets the projects without them.
+  const access = scope ? await projectsAccess(db, caller, inScope.map((p) => p.id)) : null;
+  // A deny on View hides the project outright, whatever else would show it.
+  const visible = inScope
+    .filter((p) => !access?.get(p.id)?.denied.includes("view"))
+    .map((p) => (access ? withPowers(c, p, access.get(p.id)) : p));
+
+  // Seeing every project in scope is project.view's (an Owner and Admins hold
+  // it); anyone else sees the projects something is shared with them in.
+  if (!scope || c.get("userRole") === "super_admin" || hasPermission(c, "project.view")) return c.json(visible);
+  const shared = await projectsSharedWith(db, caller);
+  return c.json(visible.filter((p) => shared.has(p.id)));
 });
 
 /**
@@ -148,11 +185,11 @@ projectsRouter.put("/:projectId", async (c) => {
   const projectId = c.req.param("projectId");
   const body = await c.req.json<{ name?: string; slug?: string; description?: string; icon?: string | null; designSystem?: Record<string, unknown>; config?: Record<string, unknown> }>();
 
-  // The design system is design.edit's; everything else here is projects.edit's,
-  // so a designer can save the design system without being able to rename the project.
+  // The design system is design.edit's; the rest needs the right to rename it.
+  const access = await accessFor(c, projectId);
   const editsProject = ["name", "slug", "description", "icon", "config"].some((k) => (body as any)[k] !== undefined);
-  if (editsProject && !hasPermission(c, "projects.edit")) {
-    return c.json({ error: "Forbidden: requires projects.edit" }, 403);
+  if (editsProject && !powersOf(c, access).canRename) {
+    return c.json({ error: "Not permitted to change this project" }, 403);
   }
   if (body.designSystem !== undefined && !hasPermission(c, "design.edit")) {
     return c.json({ error: "Forbidden: requires design.edit" }, 403);
@@ -209,17 +246,22 @@ projectsRouter.put("/:projectId", async (c) => {
     return c.json({ error: "Project not found" }, 404);
   }
 
-  return c.json(updated);
+  // Renaming changes nobody's access, so `access` still holds.
+  return c.json(withPowers(c, updated, access));
 });
 
 /**
  * DELETE /orgs/:orgId/projects/:projectId
- * Delete project (cascades to apps + permissions via FK); revokes its API keys and LLM proxy clients
+ * Delete project (cascades to apps + permissions via FK); revokes its API keys and LLM proxy clients.
+ * For project.delete or the project's owner (projectPowers).
  */
-projectsRouter.delete("/:projectId", requirePermission("projects.delete"), async (c) => {
+projectsRouter.delete("/:projectId", async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const projectId = c.req.param("projectId");
+  if (!powersOf(c, await accessFor(c, projectId)).canDelete) {
+    return c.json({ error: "Not permitted to delete this project" }, 403);
+  }
 
   // Org-scoped: an unscoped delete let an admin destroy another tenant's project.
   const result = await deleteProject(projectDeleteSteps(db, c.env, orgId, projectId));
@@ -273,9 +315,9 @@ projectsRouter.get("/:projectId/members", async (c) => {
 
 /**
  * POST /orgs/:orgId/projects/:projectId/members — { userId }
- * Add an active member of the organization to the project (projects.edit).
+ * Add an active member of the organization to the project (project.edit).
  */
-projectsRouter.post("/:projectId/members", requirePermission("projects.edit"), async (c) => {
+projectsRouter.post("/:projectId/members", requirePermission("project.edit"), async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const projectId = c.req.param("projectId");
@@ -297,15 +339,16 @@ projectsRouter.post("/:projectId/members", requirePermission("projects.edit"), a
     .onConflictDoNothing()
     .returning();
   if (!added) return c.json({ error: "Already a member of this project" }, 409);
+  await logAccess(db, { orgId, actorId: actorOf(c), action: "project.member_added", target: { type: "project", id: projectId }, subjectId: userId });
   return c.json(added, 201);
 });
 
 /**
  * DELETE /orgs/:orgId/projects/:projectId/members/:userId
- * Remove someone from the project (projects.edit). What was shared with the
+ * Remove someone from the project (project.edit). What was shared with the
  * project no longer reaches them.
  */
-projectsRouter.delete("/:projectId/members/:userId", requirePermission("projects.edit"), async (c) => {
+projectsRouter.delete("/:projectId/members/:userId", requirePermission("project.edit"), async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const projectId = c.req.param("projectId");
@@ -316,6 +359,7 @@ projectsRouter.delete("/:projectId/members/:userId", requirePermission("projects
     .where(and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, c.req.param("userId"))))
     .returning();
   if (!removed) return c.json({ error: "Not a member of this project" }, 404);
+  await logAccess(db, { orgId, actorId: actorOf(c), action: "project.member_removed", target: { type: "project", id: projectId }, subjectId: removed.userId });
   return c.json({ message: "Removed from the project" });
 });
 

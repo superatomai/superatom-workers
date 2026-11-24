@@ -3,7 +3,7 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { concepts, graphChangeHeads, graphChangeRequests, graphChanges, graphEdges, graphEngineState, graphNodes, graphReleaseEvents, graphReleases, users } from "../db/schema";
 import { withTransaction, type Tx } from "../db/tx";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, requirePermission } from "../middleware/auth";
+import { authMiddleware, requireReadWrite } from "../middleware/auth";
 import { roleAndPermissions } from "../lib/permissions";
 import { assertProjectAccess, type AppContext } from "../lib/project-access";
 import { HttpError } from "../lib/graph/errors";
@@ -37,10 +37,10 @@ import {
 import { currentRelease, diffItems, discardDraft, getRelease, notifyChanges, notifyRelease, pendingChanges, publish, releaseContent, rollback, type ReleaseItem } from "../lib/graph/release";
 import { importGraph, type ImportMode } from "../lib/graph/import";
 
-/** Composition graph routes (/projects/:projectId/graph), for whoever holds graph.manage; engines get every edit as their draft and answer from the published release. */
+/** Composition graph routes (/projects/:projectId/graph): model.view to read, model.edit to change; engines get every edit as their draft and answer from the published release. */
 
 const graphRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
-graphRouter.use("*", authMiddleware, requirePermission("graph.manage"));
+graphRouter.use("*", authMiddleware, requireReadWrite("model.view", "model.edit"));
 
 /** Resolves the project, builds the caller's scope, and turns HttpError into a JSON response. */
 function handler(fn: (c: AppContext, s: Scope) => Promise<Response>) {
@@ -101,7 +101,7 @@ async function assertAdminOfOrg(c: AppContext, s: Scope, userId: unknown): Promi
     throw new HttpError(400, "The new owner must be an active member of this organization who can manage the graph");
   }
   const { permissions } = await roleAndPermissions(db, u);
-  if (!permissions.includes("graph.manage")) {
+  if (!permissions.includes("model.edit")) {
     throw new HttpError(400, "The new owner must be an active member of this organization who can manage the graph");
   }
   return userId;

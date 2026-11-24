@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware } from "../middleware/auth";
-import { accessibleApps, appAccess, atLeast, callerOf, legacyPermission, type AppAccess } from "../lib/objects";
+import { accessibleApps, appAccess, callerOf, legacyPermission, type AppAccess } from "../lib/objects";
 
 const myApps = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -19,6 +19,7 @@ function shape(a: AppAccess) {
     status: a.object.status,
     ownerId: a.object.ownerId,
     level: a.level,
+    actions: a.actions,
     permission: legacyPermission(a.level),
   };
 }
@@ -44,7 +45,7 @@ myApps.get("/:appId", async (c) => {
   if (!access) {
     return c.json({ error: "App not found" }, 404);
   }
-  if (!atLeast(access.level, "view")) {
+  if (!access.actions.includes("view")) {
     return c.json({ error: "Forbidden" }, 403);
   }
   return c.json(shape(access));

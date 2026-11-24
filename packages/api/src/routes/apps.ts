@@ -8,13 +8,16 @@ import {
   CREATE_PERMISSION,
   accessibleApps,
   appAccess,
-  atLeast,
   callerOf,
   ensureAppObjects,
   legacyPermission,
+  projectAccess,
+  projectActionDenied,
   type AppAccess,
 } from "../lib/objects";
 import { projectAllowed, scopeOfRequest, scopeOfUser } from "../lib/project-scope";
+import { actorOf, logAccess, logRefusal } from "../lib/access-log";
+import { OBJECT_ACTIONS } from "../lib/object-policy";
 
 const appsRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -25,10 +28,8 @@ const appsRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
  * organization — without it, any authenticated user could read, and any admin
  * could modify or delete, apps belonging to any other tenant.
  *
- * What a caller may do with one app is their level on it (lib/objects.ts):
- * view to read it, edit to change its content, manage to change who sees it,
- * disable or delete it, owner to hand it over. Org Owners and Admins hold every
- * level on every app in their organization.
+ * Each route checks the specific action returned by lib/objects.ts.
+ * Explicit denies can remove an action even from an org Owner or Admin.
  */
 const DENIED_PROJECT = "Not permitted for this project";
 const DENIED_APP = "Not permitted for this app";
@@ -48,9 +49,10 @@ async function denyProjectAccess(c: any, projectId: string): Promise<string | nu
     .limit(1);
 
   if (!row || row.orgId !== callerOrgId) return DENIED_PROJECT;
-  // Project scope (lib/project-scope.ts): a project outside it is closed to them.
+  // Project scope (lib/project-scope.ts), and a deny on View: either closes the project to them.
   const scope = await scopeOfRequest(c);
   if (scope && !(await projectAllowed(db, scope, projectId))) return DENIED_PROJECT;
+  if (scope && (await projectActionDenied(db, callerOf(c), projectId, "view"))) return DENIED_PROJECT;
   return null;
 }
 
@@ -72,24 +74,27 @@ function shape(a: AppAccess) {
     createdBy: a.object.createdBy ?? a.app.createdBy,
     status: a.object.status,
     level: a.level,
+    actions: a.actions,
     // The old name for the level, read by the platform and runtime until they move to `level`.
     permission: legacyPermission(a.level),
   };
 }
 
 /**
- * The app and the caller's level, or the response to send instead: 404 when
- * there is no such app, 403 when the caller's level is below `needed` (another
- * organization's app reads as 403 too).
+ * The app and its effective actions, or a 404/403 response when the
+ * app is missing or the caller lacks the requested action.
  */
 async function requireLevel(
   c: any,
   appId: string,
-  needed: Parameters<typeof atLeast>[1]
+  needed: "view" | "edit" | "delete" | "share" | "disable" | "handover"
 ): Promise<{ ok: false; response: Response } | { ok: true; access: AppAccess }> {
   const access = await appAccess(c.get("db"), callerOf(c), appId);
   if (!access) return { ok: false, response: c.json({ error: "App not found" }, 404) };
-  if (!atLeast(access.level, needed)) return { ok: false, response: c.json({ error: DENIED_APP }, 403) };
+  if (!access.actions.includes(needed)) {
+    await logRefusal(c, `needs ${needed} on this app`, { type: "object", id: access.object.id });
+    return { ok: false, response: c.json({ error: DENIED_APP }, 403) };
+  }
   if (isSdkWrite(c)) return { ok: false, response: c.json({ error: "Not available to SDK sessions" }, 403) };
   return { ok: true, access };
 }
@@ -118,15 +123,18 @@ appsRouter.post("/projects/:projectId/apps", authMiddleware, async (c) => {
   if (!(APP_OBJECT_TYPES as readonly string[]).includes(type)) {
     return c.json({ error: "Invalid type" }, 400);
   }
-  if (!hasPermission(c, CREATE_PERMISSION[type])) {
-    return c.json({ error: `Forbidden: requires ${CREATE_PERMISSION[type]}` }, 403);
-  }
   if (isSdkWrite(c)) {
     return c.json({ error: "Not available to SDK sessions" }, 403);
   }
 
   const denied = await denyProjectAccess(c, projectId);
   if (denied) return c.json({ error: denied }, 403);
+  const caller = callerOf(c);
+  const projectRights = await projectAccess(db, caller, projectId);
+  const canCreate = projectRights?.actions.includes("create") || hasPermission(c, CREATE_PERMISSION[type]);
+  if (!canCreate || await projectActionDenied(db, caller, projectId, "create")) {
+    return c.json({ error: "Not permitted to create this app in the project" }, 403);
+  }
 
   const [project] = await db.select({ orgId: projects.orgId }).from(projects).where(eq(projects.id, projectId)).limit(1);
   if (!project) return c.json({ error: "Project not found" }, 404);
@@ -137,7 +145,7 @@ appsRouter.post("/projects/:projectId/apps", authMiddleware, async (c) => {
     .returning();
 
   const object = (await ensureAppObjects(db, [{ app, orgId: project.orgId }])).get(app.id)!;
-  return c.json({ ...app, ownerId: object.ownerId, status: object.status, level: "owner", permission: "admin" }, 201);
+  return c.json({ ...app, ownerId: object.ownerId, status: object.status, level: "owner", actions: [...OBJECT_ACTIONS], permission: "admin" }, 201);
 });
 
 /**
@@ -183,9 +191,14 @@ appsRouter.put("/apps/:appId", authMiddleware, async (c) => {
     isDefault?: boolean;
   }>();
 
-  const needsManage = body.type !== undefined || body.isActive !== undefined || body.isDefault !== undefined;
-  const checked = await requireLevel(c, appId, needsManage ? "manage" : "edit");
+  const checked = await requireLevel(c, appId, "edit");
   if (!checked.ok) return checked.response;
+  if ((body.type !== undefined || body.isDefault !== undefined) && !checked.access.actions.includes("share")) {
+    return c.json({ error: DENIED_APP }, 403);
+  }
+  if (body.isActive !== undefined && !checked.access.actions.includes("disable")) {
+    return c.json({ error: DENIED_APP }, 403);
+  }
 
   // Explicit allowlist. Spreading the body allowed setting any column —
   // including `projectId`, which would move an app into another tenant's project.
@@ -266,7 +279,7 @@ appsRouter.put("/apps/:appId/owner", authMiddleware, async (c) => {
   const appId = c.req.param("appId");
   const body = await c.req.json<{ userId?: unknown }>().catch(() => ({}) as { userId?: unknown });
 
-  const checked = await requireLevel(c, appId, "owner");
+  const checked = await requireLevel(c, appId, "handover");
   if (!checked.ok) return checked.response;
 
   const userId = typeof body.userId === "string" ? body.userId : "";
@@ -290,7 +303,15 @@ appsRouter.put("/apps/:appId/owner", authMiddleware, async (c) => {
     .set({ ownerId: userId, updatedAt: new Date() })
     .where(eq(objects.id, checked.access.object.id))
     .returning();
-  console.log(`[audit] app owner change: actor=${c.get("userId")} app=${appId} from=${checked.access.object.ownerId} to=${userId}`);
+  await logAccess(db, {
+    orgId: checked.access.orgId,
+    actorId: actorOf(c),
+    action: "object.handed_over",
+    target: { type: "object", id: object.id },
+    subjectId: userId,
+    before: { ownerId: checked.access.object.ownerId },
+    after: { ownerId: userId },
+  });
   return c.json(shape({ ...checked.access, object }));
 });
 
@@ -307,7 +328,7 @@ appsRouter.put("/apps/:appId/status", authMiddleware, async (c) => {
     return c.json({ error: "status must be active or disabled" }, 400);
   }
 
-  const checked = await requireLevel(c, appId, "manage");
+  const checked = await requireLevel(c, appId, "disable");
   if (!checked.ok) return checked.response;
 
   const [object] = await db
@@ -315,18 +336,29 @@ appsRouter.put("/apps/:appId/status", authMiddleware, async (c) => {
     .set({ status: body.status, updatedAt: new Date() })
     .where(eq(objects.id, checked.access.object.id))
     .returning();
+  if (checked.access.object.status !== body.status) {
+    await logAccess(db, {
+      orgId: checked.access.orgId,
+      actorId: actorOf(c),
+      action: "object.status_changed",
+      target: { type: "object", id: object.id },
+      before: { status: checked.access.object.status },
+      after: { status: body.status },
+    });
+  }
   return c.json(shape({ ...checked.access, object }));
 });
 
 /**
  * DELETE /apps/:appId
- * Delete app (needs manage). Its object and every grant on it go with it.
+ * Delete app (needs Editor: an editor deletes, a manager also shares and
+ * disables). Its object and every grant on it go with it.
  */
 appsRouter.delete("/apps/:appId", authMiddleware, async (c) => {
   const db = c.get("db");
   const appId = c.req.param("appId");
 
-  const checked = await requireLevel(c, appId, "manage");
+  const checked = await requireLevel(c, appId, "delete");
   if (!checked.ok) return checked.response;
 
   const [deleted] = await db

@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { apps, projects } from "../db/schema";
 import type { Env, AppVariables } from "../types";
-import { authMiddleware, requirePermission, hasPermission } from "../middleware/auth";
-import { appAccess, atLeast, callerOf } from "../lib/objects";
+import { authMiddleware, requirePermission, hasPermission, hasFixed } from "../middleware/auth";
+import { appAccess, callerOf } from "../lib/objects";
 
 /**
  * Icon upload.
@@ -89,7 +89,7 @@ async function denyEntityAccess(
   const db = c.get("db");
 
   if (entity === "org") {
-    return entityId === callerOrgId && hasPermission(c, "org.edit") ? null : DENIED;
+    return entityId === callerOrgId && hasFixed(c, "editOrg") ? null : DENIED;
   }
 
   if (entity === "project") {
@@ -98,12 +98,12 @@ async function denyEntityAccess(
       .from(projects)
       .where(eq(projects.id, entityId))
       .limit(1);
-    return row && row.orgId === callerOrgId && hasPermission(c, "projects.edit") ? null : DENIED;
+    return row && row.orgId === callerOrgId && hasPermission(c, "project.edit") ? null : DENIED;
   }
 
   // app → project → org, and the caller may edit it.
   const access = await appAccess(db, callerOf(c), entityId);
-  return access && atLeast(access.level, "edit") ? null : DENIED;
+  return access && access.actions.includes("edit") ? null : DENIED;
 }
 
 /**

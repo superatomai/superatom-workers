@@ -163,24 +163,57 @@ export const rolePermissions = pgTable(
   (table) => [primaryKey({ columns: [table.roleId, table.permission] })]
 );
 
-/** Every change of a user's organization role: who, by whom, from what, to what. */
-export const roleChanges = pgTable(
-  "role_changes",
+/**
+ * Per-person limits: permissions one person does NOT get, though their role
+ * carries them. Only ever narrows a role, never widens it. Used for Admins,
+ * whose built-in role cannot be edited: the Owner unticks what one Admin may do
+ * (for example the people powers, members.*, which a new Admin starts without).
+ */
+export const userPermissionLimits = pgTable(
+  "user_permission_limits",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    permission: varchar("permission", { length: 64 }).notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.permission] })]
+);
+
+/**
+ * The access audit log: one row for every change to who can do what, never
+ * edited or deleted (lib/access-log.ts). Like GitHub's audit log or AWS
+ * CloudTrail: one table for every kind of change, with before and after as
+ * JSON so a new kind needs no new column.
+ */
+export const accessLog = pgTable(
+  "access_log",
   {
     id: uuid("id").defaultRandom().primaryKey(),
     orgId: uuid("org_id")
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
-    userId: uuid("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    // Empty when a super admin or the system made the change.
-    changedBy: uuid("changed_by").references(() => users.id, { onDelete: "set null" }),
-    fromRole: varchar("from_role", { length: 64 }),
-    toRole: varchar("to_role", { length: 64 }),
+    // Who did it; empty for the system or a service token. Kept when they leave.
+    actorId: uuid("actor_id").references(() => users.id, { onDelete: "set null" }),
+    // What happened, as thing.verb: member.role_changed, grant.added, object.handed_over…
+    action: varchar("action", { length: 64 }).notNull(),
+    // What it was done to: user | role | project | object (an app, a shared project or data source).
+    targetType: varchar("target_type", { length: 16 }).notNull(),
+    targetId: varchar("target_id", { length: 255 }).notNull(),
+    // Who it affects, when that is a person (whose access changed), for "everything about Ravi".
+    subjectId: uuid("subject_id").references(() => users.id, { onDelete: "set null" }),
+    before: jsonb("before"),
+    after: jsonb("after"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
-  (table) => [index("role_changes_org_idx").on(table.orgId, table.createdAt)]
+  (table) => [
+    index("access_log_org_idx").on(table.orgId, table.createdAt),
+    index("access_log_target_idx").on(table.targetType, table.targetId),
+    index("access_log_subject_idx").on(table.subjectId),
+    index("access_log_actor_idx").on(table.actorId),
+  ]
 );
 
 export const usersRelations = relations(users, ({ one, many }) => ({
@@ -507,6 +540,47 @@ export const objects = pgTable(
   ]
 );
 
+/**
+ * Reusable action sets for one object. System roles are shared by every org;
+ * custom roles belong to one org. A null object type means the role works on
+ * every supported object type.
+ */
+export const objectRoles = pgTable(
+  "object_roles",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "cascade" }),
+    key: varchar("key", { length: 64 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: text("description"),
+    objectType: varchar("object_type", { length: 32 }),
+    isSystem: boolean("is_system").default(false).notNull(),
+    createdBy: uuid("created_by").references((): AnyPgColumn => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("object_roles_org_key_idx").on(table.orgId, table.key),
+    uniqueIndex("object_roles_builtin_key_idx").on(table.key).where(sql`${table.orgId} IS NULL`),
+    check(
+      "object_roles_scope_chk",
+      sql`(${table.isSystem} AND ${table.orgId} IS NULL) OR (NOT ${table.isSystem} AND ${table.orgId} IS NOT NULL)`
+    ),
+  ]
+);
+
+/** Allowed actions in an object role; the API validates action applicability. */
+export const objectRoleActions = pgTable(
+  "object_role_actions",
+  {
+    roleId: uuid("role_id")
+      .notNull()
+      .references(() => objectRoles.id, { onDelete: "cascade" }),
+    action: varchar("action", { length: 32 }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.roleId, table.action] })]
+);
+
 export const objectGrants = pgTable(
   "object_grants",
   {
@@ -517,14 +591,41 @@ export const objectGrants = pgTable(
     // user | role | project | org — whose grant this is.
     principalType: varchar("principal_type", { length: 16 }).notNull(),
     principalId: uuid("principal_id").notNull(),
-    // view | comment | edit | manage. Owner is objects.owner_id, never a grant.
-    level: varchar("level", { length: 16 }).notNull(),
+    // The sharing role given (Viewer, Editor, Manager or the org's own): its
+    // actions are what this grant allows. Owner is objects.owner_id, never a grant.
+    objectRoleId: uuid("object_role_id").notNull().references(() => objectRoles.id, { onDelete: "restrict" }),
     grantedBy: uuid("granted_by").references(() => users.id, { onDelete: "set null" }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("object_grants_principal_idx").on(table.objectId, table.principalType, table.principalId),
     index("object_grants_lookup_idx").on(table.principalType, table.principalId),
+    index("object_grants_role_idx").on(table.objectRoleId),
+  ]
+);
+
+/**
+ * Explicit action denies. A deny on a project object can also cover its
+ * descendants when the authorization evaluator implements inheritance.
+ */
+export const objectDenials = pgTable(
+  "object_denials",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    objectId: uuid("object_id")
+      .notNull()
+      .references(() => objects.id, { onDelete: "cascade" }),
+    // user | role | project | org, with the same meaning as object_grants.
+    principalType: varchar("principal_type", { length: 16 }).notNull(),
+    principalId: uuid("principal_id").notNull(),
+    action: varchar("action", { length: 32 }).notNull(),
+    reason: text("reason"),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("object_denials_rule_idx").on(table.objectId, table.principalType, table.principalId, table.action),
+    index("object_denials_lookup_idx").on(table.principalType, table.principalId),
   ]
 );
 
