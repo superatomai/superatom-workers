@@ -103,9 +103,7 @@ export async function resolveRecipients(
                         or exists (select 1 from ${objectGrants} g where g.object_id = o.id
                                      and ((g.principal_type = 'user' and g.principal_id = ${users.id})
                                        or (g.principal_type = 'role' and g.principal_id = ${users.roleId})
-                                       or (g.principal_type = 'org' and g.principal_id = ${users.orgId})
-                                       or (g.principal_type = 'project' and exists (select 1 from ${projectMembers} pm
-                                             where pm.project_id = g.principal_id and pm.user_id = ${users.id}))))))`,
+                                       or (g.principal_type = 'org' and g.principal_id = ${users.orgId})))))`,
         // A role on the project itself covers every app in it.
         sql`exists (select 1 from ${objects} po join ${objectGrants} g on g.object_id = po.id
                     where po.type = 'project' and po.ref_id = ${pid}

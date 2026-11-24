@@ -633,9 +633,9 @@ export const objectDenials = pgTable(
 );
 
 /**
- * Who belongs to a project. Today it decides one thing: a grant to the project
- * (object_grants.principal_type = 'project') reaches its members. Who may open
- * a project in the platform is unchanged (any org admin, as before).
+ * Who belongs to a project. Someone with users.project_scope = 'selected' reaches
+ * only the projects they are a member of (lib/project-scope.ts). A project is not
+ * a share recipient: sharing goes to a person, a role or the org.
  */
 export const projectMembers = pgTable(
   "project_members",

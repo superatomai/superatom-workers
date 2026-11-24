@@ -488,7 +488,7 @@ async function stopSharing(c: any, target: ShareTarget, where: SQL | undefined) 
 /**
  * Deny rules on one object. Each takes one action away, even from an Admin or
  * the owner. Two kinds share the table:
- *  - the org Owner's: on anyone (a person, a role, a project or everyone), any
+ *  - the org Owner's: on anyone (a person, a role or everyone), any
  *    action. Only an Owner adds or removes them.
  *  - a sharer's restriction: whoever can share the object narrows what one
  *    person it is shared with may do ("Editor, but not delete"), without a new
@@ -519,7 +519,7 @@ export function denialRoutes(router: Hono<any>, path: string, resolve: (c: any) 
 
   /** Why a sharer (not an Owner) may not add or remove this restriction; null when they may. */
   async function refuseSharer(c: any, target: ShareTarget, principalType: string, principalId: string, action: string): Promise<string | null> {
-    if (principalType !== "user") return "Only the Owner can deny a role, a project or everyone";
+    if (principalType !== "user") return "Only the Owner can deny a role or everyone";
     if (!(RESTRICTABLE as readonly string[]).includes(action)) return "To take away View, stop sharing with them instead";
     if (principalId === c.get("userId")) return "Cannot change your own access";
     if (principalId === target.object.ownerId) return "Cannot restrict its owner";

@@ -7,7 +7,7 @@
  * into a single level. The highest reason wins, as there.
  */
 import { and, eq, inArray } from "drizzle-orm";
-import { apps, objectDenials, objectGrants, objects, organizations, projectMembers, projects, roles, users } from "../db/schema";
+import { apps, objectDenials, objectGrants, objects, organizations, projects, roles, users } from "../db/schema";
 import type { Database } from "../db";
 import { SOURCE_OBJECT, appAccess, ensureAppObjects, ensureProjectObjects, projectAccess, sharingRolesById, sourceAccess, type Caller, type Level } from "./objects";
 import { levelForActions } from "./object-policy";
@@ -41,8 +41,7 @@ export async function explainAccess(db: Database, orgId: string, projectId: stri
   };
   const projectDecision = await projectAccess(db, caller, projectId);
 
-  // Grants that reach them, with how: directly, their role, a project they are in, or everyone.
-  const memberOf = (await db.select({ p: projectMembers.projectId }).from(projectMembers).where(eq(projectMembers.userId, u.id))).map((r) => r.p);
+  // Grants that reach them, with how: directly, their role, or everyone.
   const projectObject = (await ensureProjectObjects(db, [projectId])).get(projectId)!;
   const appRows = await db.select({ app: apps, orgId: projects.orgId }).from(apps).innerJoin(projects, eq(projects.id, apps.projectId)).where(eq(apps.projectId, projectId));
   const appObjects = await ensureAppObjects(db, appRows);
@@ -52,17 +51,15 @@ export async function explainAccess(db: Database, orgId: string, projectId: stri
     (g) =>
       (g.principalType === "user" && g.principalId === u.id) ||
       (g.principalType === "role" && g.principalId === u.roleId) ||
-      (g.principalType === "org" && g.principalId === orgId) ||
-      (g.principalType === "project" && memberOf.includes(g.principalId))
+      (g.principalType === "org" && g.principalId === orgId)
   );
   const denials = (await db.select().from(objectDenials).where(inArray(objectDenials.objectId, objectIds))).filter(
     (d) => (d.principalType === "user" && d.principalId === u.id) ||
       (d.principalType === "role" && d.principalId === u.roleId) ||
-      (d.principalType === "org" && d.principalId === orgId) ||
-      (d.principalType === "project" && memberOf.includes(d.principalId))
+      (d.principalType === "org" && d.principalId === orgId)
   );
   const names = await namesFor(db, [
-    ...grants.flatMap((g) => [g.grantedBy, g.principalType === "project" ? g.principalId : null]),
+    ...grants.map((g) => g.grantedBy),
     ...denials.map((d) => d.createdBy),
   ]);
   // A grant gives its sharing role's actions.
@@ -81,9 +78,7 @@ export async function explainAccess(db: Database, orgId: string, projectId: stri
       ? "shared with them directly"
       : g.principalType === "role"
         ? `shared with their role ${person.role}`
-        : g.principalType === "org"
-          ? "shared with everyone in the organization"
-          : `shared with the members of ${names.get(g.principalId) ?? "a project"}`;
+        : "shared with everyone in the organization";
   const by = (g: (typeof grants)[number]) => (g.grantedBy && names.get(g.grantedBy) ? ` by ${names.get(g.grantedBy)}` : "");
   const grantReasons = (objectId: string, prefix: string): Reason[] =>
     grants

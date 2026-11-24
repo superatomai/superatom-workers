@@ -10,7 +10,7 @@
  * show or which request to allow. A grant itself holds only its role.
  */
 import { and, eq, inArray, or, sql } from "drizzle-orm";
-import { apps, objectDenials, objectGrants, objectRoleActions, objectRoles, objects, organizations, projectMembers, projects } from "../db/schema";
+import { apps, objectDenials, objectGrants, objectRoleActions, objectRoles, objects, organizations, projects } from "../db/schema";
 import { OBJECT_ACTIONS, effectiveActions, isObjectAction, levelForActions, type ObjectAction } from "./object-policy";
 import type { Database } from "../db";
 import { allowedProjects, projectAllowed } from "./project-scope";
@@ -163,16 +163,11 @@ export async function ensureProjectObjects(db: Database, projectIds: string[]): 
 /** A data source lives in its project's engine, so it is known by project and id together. */
 const sourceRef = (projectId: string, sourceId: string) => `${projectId}:${sourceId}`;
 
-/** Who a grant must be for to reach this caller: them, their role, a project they are in, or their org. */
-async function principalsOf(db: Database, caller: Caller) {
+/** Who a grant must be for to reach this caller: them, their role, or their org. */
+function principalsOf(caller: Caller) {
   const principals = [and(eq(objectGrants.principalType, "user"), eq(objectGrants.principalId, caller.userId))];
   if (caller.roleId) principals.push(and(eq(objectGrants.principalType, "role"), eq(objectGrants.principalId, caller.roleId)));
   if (caller.orgId) principals.push(and(eq(objectGrants.principalType, "org"), eq(objectGrants.principalId, caller.orgId)));
-  // A grant to a project reaches the members of that project.
-  const memberOf = (
-    await db.select({ projectId: projectMembers.projectId }).from(projectMembers).where(eq(projectMembers.userId, caller.userId))
-  ).map((r) => r.projectId);
-  if (memberOf.length) principals.push(and(eq(objectGrants.principalType, "project"), inArray(objectGrants.principalId, memberOf)));
   return or(...principals)!;
 }
 
@@ -183,7 +178,7 @@ async function principalsOf(db: Database, caller: Caller) {
  */
 export async function projectsSharedWith(db: Database, caller: Caller): Promise<Set<string>> {
   if (!caller.orgId) return new Set();
-  const granted = db.select({ id: objectGrants.objectId }).from(objectGrants).where(await principalsOf(db, caller));
+  const granted = db.select({ id: objectGrants.objectId }).from(objectGrants).where(principalsOf(caller));
   const rows = await db
     .selectDistinct({ projectId: objects.projectId })
     .from(objects)
@@ -216,7 +211,7 @@ async function grantActionsFor(db: Database, caller: Caller, objectIds: string[]
   const out = new Map<string, ObjectAction[]>();
   if (!objectIds.length) return out;
   const grants = await db.select({ objectId: objectGrants.objectId, roleId: objectGrants.objectRoleId })
-    .from(objectGrants).where(and(inArray(objectGrants.objectId, objectIds), await principalsOf(db, caller)));
+    .from(objectGrants).where(and(inArray(objectGrants.objectId, objectIds), principalsOf(caller)));
   if (!grants.length) return out;
   const [roles, objectTypes] = await Promise.all([
     sharingRolesById(db, grants.map((g) => g.roleId)),
@@ -236,12 +231,9 @@ async function grantActionsFor(db: Database, caller: Caller, objectIds: string[]
 async function deniedActionsFor(db: Database, caller: Caller, objectIds: string[]): Promise<Map<string, ObjectAction[]>> {
   const out = new Map<string, ObjectAction[]>();
   if (!objectIds.length) return out;
-  const memberOf = (await db.select({ projectId: projectMembers.projectId }).from(projectMembers)
-    .where(eq(projectMembers.userId, caller.userId))).map((r) => r.projectId);
   const principals = [and(eq(objectDenials.principalType, "user"), eq(objectDenials.principalId, caller.userId))];
   if (caller.roleId) principals.push(and(eq(objectDenials.principalType, "role"), eq(objectDenials.principalId, caller.roleId)));
   if (caller.orgId) principals.push(and(eq(objectDenials.principalType, "org"), eq(objectDenials.principalId, caller.orgId)));
-  if (memberOf.length) principals.push(and(eq(objectDenials.principalType, "project"), inArray(objectDenials.principalId, memberOf)));
   const rows = await db.select({ objectId: objectDenials.objectId, action: objectDenials.action }).from(objectDenials)
     .where(and(inArray(objectDenials.objectId, objectIds), or(...principals)));
   for (const row of rows) {
