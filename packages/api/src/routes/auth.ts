@@ -4,6 +4,7 @@ import { users, organizations, appPermissions, apps, projects } from "../db/sche
 import type { Env, AppVariables } from "../types";
 import { authMiddleware } from "../middleware/auth";
 import { verifyTurnstile } from "../lib/turnstile";
+import { SSO_REQUIRED_MESSAGE, passwordLoginUsers, ssoRequiredOrgs } from "../lib/sso-required";
 import { mintAccessToken } from "../lib/access-token";
 import {
   issueRefreshToken,
@@ -180,8 +181,16 @@ auth.post("/login", async (c) => {
       );
     }
 
+    // Orgs that require SSO for this email's domain take no password logins.
+    step = "check sso";
+    const ssoOnly = await ssoRequiredOrgs(db, matchedUsers.map((u) => u.orgId).filter(Boolean) as string[], normalizedEmail);
+    const { users: passwordUsers, ssoRequired } = passwordLoginUsers(matchedUsers, ssoOnly);
+    if (ssoRequired) {
+      return c.json({ error: SSO_REQUIRED_MESSAGE, ssoRequired: true }, 403);
+    }
+
     // Filter to users whose password matches
-    const validUsers = matchedUsers.filter((u) => u.passwordHash === hashHex);
+    const validUsers = passwordUsers.filter((u) => u.passwordHash === hashHex);
 
     if (validUsers.length === 0) {
       return c.json({ error: "Invalid email or password" }, 401);

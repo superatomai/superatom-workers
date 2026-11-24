@@ -23,6 +23,12 @@ bucket_name = "sa-source-files"
 # bucket. Remove before pushing.
 # preview_bucket_name = "sa-source-files"
 
+# Parcels — large websocket payloads, kept briefly (src/lib/parcels.ts). Private,
+# reached only through this worker. Lifecycle rule on the bucket: delete 1 day after upload.
+[[r2_buckets]]
+binding = "R2_PARCELS"
+bucket_name = "sa-parcels"
+
 # Private bucket for built front-end apps (super-admin console now; platform/runtime later).
 # Create with: wrangler r2 bucket create sa-frontend-builds
 [[r2_buckets]]
@@ -47,6 +53,11 @@ bucket_name = "superatom-install"
 binding = "CHECKLIST_REPORTS"
 bucket_name = "sa-checklist-reports"
 
+# Program archives (built + source). Keys <projectId>/<name>/<version>/<hash>.tar.gz
+[[r2_buckets]]
+binding = "PROGRAMS"
+bucket_name = "sa-programs"
+
 [[kv_namespaces]]
 binding = "JWT_SECRETS"
 id = "1669d6442bf34757a223bd7d6548d14c"
@@ -58,8 +69,11 @@ crons = ["*/5 * * * *"]
 [vars]
 R2_PUBLIC_URL = "https://sa-assets.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files"
+PROGRAMS_BUCKET_NAME = "sa-programs"
 # Announcement emails: From address (Resend-verified domain). Attachments stay off until prod has R2 S3 keys + EMAIL_ATTACHMENTS_BUCKET_NAME.
 EMAIL_FROM = "alerts@superatom.ai"
+# More From addresses org admins may choose in email branding (same Resend-verified domain).
+EMAIL_SENDERS = "agent@superatom.ai,agents@superatom.ai"
 SUPERADMIN_HOST = "superadmin.superatom.ai"
 # Installer host: curl -fsSL https://install.superatom.ai | sh (src/install)
 INSTALL_HOST = "install.superatom.ai"

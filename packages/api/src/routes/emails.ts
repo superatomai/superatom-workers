@@ -1,20 +1,22 @@
 import { Hono } from "hono";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import { emailApiKeys, emailAttachments, emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
+import { emailApiKeys, emailAttachments, emailBranding, emailCampaigns, emailSends, emailUnsubscribes, organizations, projects, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
 import type { AppContext } from "../lib/project-access";
 import { checkObject, deleteObject, signObjectUrl } from "../lib/r2-objects";
-import { fromAddress, isEmailConfigured, sendEmail } from "../lib/email";
+import { fromAddress, sendEmail } from "../lib/email";
+import { RESEND_KEY_FORMAT, checkResendKey, encryptKey, orgResendKey } from "../lib/email-keys";
 import {
   ANNOUNCEMENTS,
   DAILY_ORG_LIMIT,
   REQUEST_BUDGET_MS,
   attachmentLinks,
   readyAttachments,
-  buildEmailHtml,
   dailyUsage,
+  loadBranding,
+  renderCampaign,
   parseAudience,
   processCampaign,
   resolveRecipients,
@@ -23,6 +25,8 @@ import {
 } from "../lib/email-campaigns";
 import { isRecurring, nextRun, parseSchedule, type EmailSchedule } from "../lib/email-schedule";
 import { generateEmailApiKey, hashEmailApiKey } from "../lib/email-api-keys";
+import { DEFAULT_BRANDING, HEX_COLOR, UNSUBSCRIBE_PLACEHOLDER, allowedSenders, senderAllowed, type BodyFormat, type Branding } from "../lib/email-layout";
+import { matchesMagicBytes } from "./upload";
 
 /**
  * Org announcements: an org admin writes an email and sends it, now or later,
@@ -39,13 +43,19 @@ const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const UPLOAD_URL_TTL_SECONDS = 15 * 60;
 const MAX_API_KEYS = 20;
+// HTML bodies carry inline styles, so they get more room than markdown did.
+const MAX_BODY = 200_000;
+const LOGO_TYPES: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif" };
+const MAX_LOGO_BYTES = 1024 * 1024;
+const MAX_FOOTER = 20_000;
 // Documents, spreadsheets, slides, images and archives; never executables or scripts.
 const ATTACHMENT_EXTENSIONS = [
   "pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp",
   "png", "jpg", "jpeg", "gif", "webp", "zip",
 ];
 
-type Body = { subject?: unknown; bodyMarkdown?: unknown; audience?: unknown };
+type Body = { subject?: unknown; title?: unknown; bodyMarkdown?: unknown; bodyFormat?: unknown; audience?: unknown };
+type CampaignFields = { subject?: string; title?: string | null; bodyMarkdown?: string; bodyFormat?: BodyFormat; audience?: Audience };
 
 /** Validates a create/edit body; a project audience must be a project of this org. */
 async function readCampaign(
@@ -53,8 +63,8 @@ async function readCampaign(
   orgId: string,
   body: Body,
   partial: boolean
-): Promise<{ ok: true; value: { subject?: string; bodyMarkdown?: string; audience?: Audience } } | { ok: false; error: string }> {
-  const value: { subject?: string; bodyMarkdown?: string; audience?: Audience } = {};
+): Promise<{ ok: true; value: CampaignFields } | { ok: false; error: string }> {
+  const value: CampaignFields = {};
   if (body.subject !== undefined || !partial) {
     if (typeof body.subject !== "string" || !body.subject.trim()) return { ok: false, error: "subject is required" };
     if (body.subject.length > 255) return { ok: false, error: "subject is too long (max 255)" };
@@ -62,8 +72,17 @@ async function readCampaign(
   }
   if (body.bodyMarkdown !== undefined || !partial) {
     if (typeof body.bodyMarkdown !== "string" || !body.bodyMarkdown.trim()) return { ok: false, error: "bodyMarkdown is required" };
-    if (body.bodyMarkdown.length > 50_000) return { ok: false, error: "bodyMarkdown is too long" };
+    if (body.bodyMarkdown.length > MAX_BODY) return { ok: false, error: "bodyMarkdown is too long" };
     value.bodyMarkdown = body.bodyMarkdown;
+  }
+  if (body.bodyFormat !== undefined) {
+    if (body.bodyFormat !== "markdown" && body.bodyFormat !== "html") return { ok: false, error: "bodyFormat must be markdown or html" };
+    value.bodyFormat = body.bodyFormat;
+  }
+  if (body.title !== undefined) {
+    if (body.title !== null && typeof body.title !== "string") return { ok: false, error: "title must be text" };
+    if (typeof body.title === "string" && body.title.length > 200) return { ok: false, error: "title is too long (max 200)" };
+    value.title = typeof body.title === "string" && body.title.trim() ? body.title.trim() : null;
   }
   if (body.audience !== undefined || !partial) {
     const audience = parseAudience(body.audience);
@@ -110,6 +129,12 @@ async function checkLimit(
   return { ok: true as const, count };
 }
 
+/** A key to send with: the org's own (that decrypts) or the platform's. */
+async function orgCanSend(c: AppContext, orgId: string): Promise<boolean> {
+  const key = await orgResendKey(c.env, await loadBranding(c.get("db"), orgId));
+  return key.ok && Boolean(key.apiKey);
+}
+
 /** GET /orgs/:orgId/emails — campaigns, newest first; a recurring email's runs are nested under it. */
 emails.get("/", async (c) => {
   const orgId = c.req.param("orgId")!;
@@ -144,7 +169,7 @@ emails.get("/usage", async (c) => {
   return c.json({
     used: await dailyUsage(c.get("db"), orgId),
     limit: DAILY_ORG_LIMIT,
-    configured: isEmailConfigured(c.env),
+    configured: await orgCanSend(c, orgId),
   });
 });
 
@@ -196,6 +221,204 @@ emails.put("/subscribers/:userId", async (c) => {
   if (!user) return c.json({ error: "User not found" }, 404);
   await setSubscription(db, { userId, category: ANNOUNCEMENTS, subscribed, source: "admin", changedBy: c.get("userId") });
   return c.json({ userId, subscribed });
+});
+
+// ─── Branding ────────────────────────────────────────────
+// Before "/:id" so these paths aren't read as email ids.
+
+const EMAIL = /^[^\s@<>",]+@[^\s@<>",]+\.[^\s@<>",]+$/;
+
+type BrandingRow = typeof emailBranding.$inferSelect;
+type KeyFields = Pick<BrandingRow, "resendKeyEnc" | "senderDomains">;
+
+/** What the UI sees: never the key itself, only its last 4 characters and the account's domains. */
+function brandingView(env: Env, orgId: string, row: BrandingRow | null) {
+  const b: Branding = row ?? DEFAULT_BRANDING;
+  return {
+    senderName: b.senderName,
+    senderEmail: b.senderEmail,
+    buttonColor: b.buttonColor,
+    footerMode: b.footerMode,
+    footerHtml: b.footerHtml,
+    whyText: b.whyText,
+    footerNote: b.footerNote,
+    updatedAt: row?.updatedAt ?? null,
+    resendKey: row?.resendKeyEnc
+      ? { last4: row.resendKeyLast4, domains: Array.isArray(row.senderDomains) ? (row.senderDomains as string[]) : null }
+      : null,
+    allowedSenders: row?.resendKeyEnc ? [] : allowedSenders(env),
+  };
+}
+
+/** GET /orgs/:orgId/emails/branding — sender, footer, button colour and Resend account; refreshes that account's domains. */
+emails.get("/branding", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const db = c.get("db");
+  let row = await loadBranding(db, orgId);
+  if (row?.resendKeyEnc) {
+    // Domains verified since the key was saved show up here; a failed check keeps the stored list.
+    const key = await orgResendKey(c.env, row);
+    const check = key.ok && key.apiKey ? await checkResendKey(key.apiKey) : null;
+    if (check?.ok && JSON.stringify(check.domains) !== JSON.stringify(row.senderDomains)) {
+      [row] = await db.update(emailBranding).set({ senderDomains: check.domains }).where(eq(emailBranding.orgId, orgId)).returning();
+    }
+  }
+  return c.json(brandingView(c.env, orgId, row));
+});
+
+type BrandingBody = Partial<Record<"senderName" | "senderEmail" | "buttonColor" | "footerMode" | "footerHtml" | "whyText" | "footerNote", unknown>>;
+
+/** Which addresses a sender may be, for the error message. */
+function senderRule(env: Env, key?: KeyFields | null): string {
+  if (!key?.resendKeyEnc) return `one of: ${allowedSenders(env).join(", ")}`;
+  const domains = Array.isArray(key.senderDomains) ? (key.senderDomains as string[]) : null;
+  if (!domains) return "an address on a domain verified in your Resend account";
+  return domains.length ? `an address @${domains.join(", @")}` : "an address on a verified domain (your Resend account has none yet)";
+}
+
+/** Validates a whole branding setting; empty strings clear a field. `key` = the org's own Resend account, if any. */
+export function readBranding(env: Env, b: BrandingBody, key?: KeyFields | null): { ok: true; value: Branding } | { ok: false; error: string } {
+  const fields: Record<string, string | null> = {};
+  const limits = { senderName: 100, senderEmail: 255, buttonColor: 7, footerHtml: MAX_FOOTER, whyText: 500, footerNote: 300 } as const;
+  for (const [field, max] of Object.entries(limits)) {
+    const v = b[field as keyof typeof limits];
+    if (v === undefined || v === null || v === "") fields[field] = null;
+    else if (typeof v !== "string") return { ok: false, error: `${field} must be text` };
+    else if (v.length > max) return { ok: false, error: `${field} is too long (max ${max})` };
+    else fields[field] = v.trim() || null;
+  }
+  const f = fields as Record<keyof typeof limits, string | null>;
+  if (f.buttonColor && !HEX_COLOR.test(f.buttonColor)) return { ok: false, error: "buttonColor must be a hex colour like #152435" };
+  if (f.senderName && /["<>\r\n]/.test(f.senderName)) return { ok: false, error: "senderName can't contain quotes, < or >" };
+  if (f.senderEmail) {
+    f.senderEmail = f.senderEmail.toLowerCase();
+    if (!EMAIL.test(f.senderEmail) || !senderAllowed(env, f.senderEmail, key)) {
+      return { ok: false, error: `senderEmail must be ${senderRule(env, key)}` };
+    }
+  }
+  const footerMode = b.footerMode === undefined || b.footerMode === null || b.footerMode === "" ? "default" : b.footerMode;
+  if (footerMode !== "default" && footerMode !== "custom") return { ok: false, error: "footerMode must be default or custom" };
+  if (footerMode === "custom") {
+    if (!f.footerHtml) return { ok: false, error: "A custom footer needs its HTML" };
+    // People must always be able to opt out; the link goes wherever the footer puts it.
+    if (!UNSUBSCRIBE_PLACEHOLDER.test(f.footerHtml)) {
+      return { ok: false, error: "A custom footer must include the unsubscribe link: {{unsubscribeUrl}}" };
+    }
+  }
+  return { ok: true, value: { ...f, buttonColor: f.buttonColor?.toLowerCase() ?? null, footerMode } };
+}
+
+/** PUT /orgs/:orgId/emails/branding — replace the whole setting (the Resend key has its own route). */
+emails.put("/branding", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const db = c.get("db");
+  const current = await loadBranding(db, orgId);
+  const parsed = readBranding(c.env, await c.req.json<BrandingBody>().catch(() => ({}) as BrandingBody), current);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const values = { ...parsed.value, updatedBy: c.get("userId"), updatedAt: new Date() };
+  const [row] = await db
+    .insert(emailBranding)
+    .values({ orgId, ...values })
+    .onConflictDoUpdate({ target: emailBranding.orgId, set: values })
+    .returning();
+  return c.json(brandingView(c.env, orgId, row));
+});
+
+/**
+ * PUT /orgs/:orgId/emails/branding/resend-key { apiKey } — send this org's emails through its own Resend
+ * account. Checked with Resend first; a sender address that account can't use is cleared.
+ */
+emails.put("/branding/resend-key", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const { apiKey } = await c.req.json<{ apiKey?: unknown }>().catch(() => ({}) as { apiKey?: unknown });
+  if (typeof apiKey !== "string" || !RESEND_KEY_FORMAT.test(apiKey.trim())) {
+    return c.json({ error: "That doesn't look like a Resend API key (they start with re_)" }, 400);
+  }
+  if (!c.env.EMAIL_KEYS_SECRET) return c.json({ error: "Storing organization keys is not configured on this server" }, 503);
+  const check = await checkResendKey(apiKey.trim());
+  if (!check.ok) return c.json({ error: check.error }, 400);
+  const db = c.get("db");
+  const current = await loadBranding(db, orgId);
+  const keyFields = { resendKeyEnc: await encryptKey(c.env, apiKey.trim()), resendKeyLast4: apiKey.trim().slice(-4), senderDomains: check.domains };
+  const sender = current?.senderEmail;
+  const senderCleared = Boolean(sender && !senderAllowed(c.env, sender, keyFields));
+  const values = { ...keyFields, ...(senderCleared ? { senderEmail: null } : {}), updatedBy: c.get("userId"), updatedAt: new Date() };
+  const [row] = await db
+    .insert(emailBranding)
+    .values({ orgId, ...values })
+    .onConflictDoUpdate({ target: emailBranding.orgId, set: values })
+    .returning();
+  return c.json({ ...brandingView(c.env, orgId, row), senderCleared });
+});
+
+/** DELETE /orgs/:orgId/emails/branding/resend-key — back to the platform account; an own-domain sender is cleared. */
+emails.delete("/branding/resend-key", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const db = c.get("db");
+  const current = await loadBranding(db, orgId);
+  if (!current?.resendKeyEnc) return c.json(brandingView(c.env, orgId, current));
+  const senderCleared = Boolean(current.senderEmail && !senderAllowed(c.env, current.senderEmail, null));
+  const [row] = await db
+    .update(emailBranding)
+    .set({
+      resendKeyEnc: null,
+      resendKeyLast4: null,
+      senderDomains: null,
+      ...(senderCleared ? { senderEmail: null } : {}),
+      updatedBy: c.get("userId"),
+      updatedAt: new Date(),
+    })
+    .where(eq(emailBranding.orgId, orgId))
+    .returning();
+  return c.json({ ...brandingView(c.env, orgId, row), senderCleared });
+});
+
+/**
+ * POST /orgs/:orgId/emails/images (body = the image, Content-Type its type) — stored in the public assets
+ * bucket, since email apps only load images from a public link; returns that URL for the email's HTML.
+ */
+emails.post("/images", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const type = (c.req.header("Content-Type") ?? "").split(";")[0].trim().toLowerCase();
+  const ext = LOGO_TYPES[type];
+  if (!ext) return c.json({ error: "Images must be PNG, JPEG or GIF (email apps don't show SVG or WebP)" }, 400);
+  if (Number(c.req.header("Content-Length") ?? 0) > MAX_LOGO_BYTES) return c.json({ error: "Image is too large (max 1 MB)" }, 400);
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  if (!bytes.length) return c.json({ error: "The image is empty" }, 400);
+  if (bytes.length > MAX_LOGO_BYTES) return c.json({ error: "Image is too large (max 1 MB)" }, 400);
+  if (!matchesMagicBytes(type, bytes)) return c.json({ error: "File content does not match its image type" }, 400);
+  // A content-hashed key: sent emails keep showing the image they went out with.
+  const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)).slice(0, 8), (x) => x.toString(16).padStart(2, "0")).join("");
+  const key = `email-images/${orgId}/${hash}.${ext}`;
+  await c.env.R2_BUCKET.put(key, bytes, { httpMetadata: { contentType: type, cacheControl: "public, max-age=31536000, immutable" } });
+  return c.json({ url: `${(c.env.R2_PUBLIC_URL || "https://sa-assets.superatom.ai").replace(/\/+$/, "")}/${key}` }, 201);
+});
+
+/**
+ * POST /orgs/:orgId/emails/preview { bodyMarkdown, bodyFormat?, branding? } — the email as the caller would get
+ * it; `branding` previews unsaved settings.
+ */
+emails.post("/preview", async (c) => {
+  const orgId = c.req.param("orgId")!;
+  const body = await c.req.json<Body & { branding?: BrandingBody }>().catch(() => ({}) as Body & { branding?: BrandingBody });
+  const db = c.get("db");
+  const saved = await loadBranding(db, orgId);
+  let override: Branding | undefined;
+  if (body.branding !== undefined) {
+    const parsed = readBranding(c.env, body.branding ?? {}, saved);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    override = parsed.value;
+  }
+  if (typeof body.bodyMarkdown !== "string" || body.bodyMarkdown.length > MAX_BODY) return c.json({ error: "bodyMarkdown is required" }, 400);
+  const [me] = await db.select({ name: users.name }).from(users).where(eq(users.id, c.get("userId")));
+  const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
+  const html = renderCampaign({
+    orgName: org?.name ?? "Your organization",
+    branding: override ?? saved,
+    campaign: { bodyMarkdown: body.bodyMarkdown, bodyFormat: body.bodyFormat === "html" ? "html" : "markdown" },
+    recipientName: me?.name,
+  });
+  return c.json({ html });
 });
 
 // ─── API keys ────────────────────────────────────────────
@@ -286,7 +509,9 @@ emails.post("/", async (c) => {
       orgId,
       category: ANNOUNCEMENTS,
       subject: parsed.value.subject!,
+      title: parsed.value.title ?? null,
       bodyMarkdown: parsed.value.bodyMarkdown!,
+      bodyFormat: parsed.value.bodyFormat ?? "markdown",
       audience: parsed.value.audience!,
       createdBy: c.get("userId"),
     })
@@ -340,17 +565,25 @@ emails.post("/:id/test", async (c) => {
   if (!campaign) return c.json({ error: "Email not found" }, 404);
   if (campaign.source === "api") return c.json({ error: "An API send keeps no content to test" }, 409);
   const db = c.get("db");
-  const [me] = await db.select({ email: users.email }).from(users).where(eq(users.id, c.get("userId")));
+  const [me] = await db.select({ email: users.email, name: users.name }).from(users).where(eq(users.id, c.get("userId")));
   if (!me) return c.json({ error: "Your account has no email address" }, 400);
   const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
   const orgName = org?.name ?? "Your organization";
-  const result = await sendEmail(c.env, {
-    from: fromAddress(c.env, orgName),
-    to: [me.email],
-    subject: `[Test] ${campaign.subject}`,
-    html: buildEmailHtml({ orgName, bodyMarkdown: campaign.bodyMarkdown }),
-    attachments: await attachmentLinks(c.env, await readyAttachments(db, campaign.parentId ?? campaign.id)),
-  });
+  const branding = await loadBranding(db, orgId);
+  const key = await orgResendKey(c.env, branding);
+  if (!key.ok) return c.json({ error: key.error }, 503);
+  const result = await sendEmail(
+    c.env,
+    {
+      from: fromAddress(c.env, orgName, branding),
+      to: [me.email],
+      subject: `[Test] ${campaign.subject}`,
+      html: renderCampaign({ orgName, branding, campaign, recipientName: me.name }),
+      attachments: await attachmentLinks(c.env, await readyAttachments(db, campaign.parentId ?? campaign.id)),
+    },
+    undefined,
+    key.apiKey
+  );
   if (!result.success) return c.json({ error: result.error }, result.notConfigured ? 503 : 502);
   return c.json({ message: `Test sent to ${me.email}` });
 });
@@ -363,7 +596,7 @@ emails.post("/:id/send", async (c) => {
   if (campaign.status !== "draft" && campaign.status !== "scheduled") {
     return c.json({ error: `A ${campaign.status} email can't be sent` }, 409);
   }
-  if (!isEmailConfigured(c.env)) return c.json({ error: "Email sending is not configured" }, 503);
+  if (!(await orgCanSend(c, orgId))) return c.json({ error: "Email sending is not configured" }, 503);
   const limit = await checkLimit(c, orgId, campaign);
   if (!limit.ok) return c.json({ error: limit.error }, 400);
 

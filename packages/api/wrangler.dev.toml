@@ -15,6 +15,12 @@ bucket_name = "sa-assets-dev"
 binding = "R2_SOURCE_FILES"
 bucket_name = "sa-source-files-dev"
 
+# Parcels — large websocket payloads, kept briefly (src/lib/parcels.ts). Private,
+# reached only through this worker. Lifecycle rule on the bucket: delete 1 day after upload.
+[[r2_buckets]]
+binding = "R2_PARCELS"
+bucket_name = "sa-parcels-dev"
+
 # Per-org access-token signing secrets — see packages/api/PER-ORG-JWT-SECRETS-DESIGN.md.
 # MUST be the same namespace in sa-api-dev and sa-websocket-dev: sa-api-dev signs
 # with it, sa-websocket-dev verifies with it. Keys: org:<orgId>, org:__global.
@@ -44,6 +50,11 @@ bucket_name = "sa-frontend-builds-dev"
 binding = "CHECKLIST_REPORTS"
 bucket_name = "sa-checklist-reports-dev"
 
+# Program archives (built + source). Keys <projectId>/<name>/<version>/<hash>.tar.gz
+[[r2_buckets]]
+binding = "PROGRAMS"
+bucket_name = "sa-programs-dev"
+
 # Sends scheduled announcement emails and resumes stalled ones (src/lib/email-campaigns.ts).
 [triggers]
 crons = ["*/5 * * * *"]
@@ -51,6 +62,7 @@ crons = ["*/5 * * * *"]
 [vars]
 R2_PUBLIC_URL = "https://sa-assets-dev.superatom.ai"
 R2_SOURCE_FILES_BUCKET_NAME = "sa-source-files-dev"
+PROGRAMS_BUCKET_NAME = "sa-programs-dev"
 SUPERADMIN_HOST = "dev.superadmin.superatom.ai"
 # Installer host. Dev installs the dev branch, a dummy LLM key and the dev websocket.
 INSTALL_HOST = "dev.install.superatom.ai"
@@ -68,6 +80,8 @@ INSTALL_USER_UI_URL = "https://dev.live.superatom.ai"
 INSTALL_LLM_PROXY_MODE = "dummy"
 # Sender of org announcement emails; must be on a domain verified in Resend.
 EMAIL_FROM = "alerts@superatom.ai"
+# More From addresses org admins may choose in email branding (same Resend-verified domain).
+EMAIL_SENDERS = "agent@superatom.ai,agents@superatom.ai"
 # Private bucket for email attachments (S3 API, like source files). CORS: any origin, PUT/GET.
 EMAIL_ATTACHMENTS_BUCKET_NAME = "sa-email-attachments-dev"
 

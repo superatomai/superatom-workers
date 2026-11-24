@@ -121,4 +121,40 @@ releaseRouter.post("/target", async (c) => {
   return c.json({ installName, target: version, status: "updating" });
 });
 
+/** An install that checked in this recently is alive: removed, its next check-in would re-create it. */
+export const REMOVE_AFTER_SILENT_MS = 10 * 60 * 1000;
+
+/** Why an install may not be removed yet, or null when it may. */
+export function removalBlockedReason(lastSeenAt: Date | string | null, now = Date.now()): string | null {
+  if (!lastSeenAt) return null;
+  const silentFor = now - new Date(lastSeenAt).getTime();
+  return silentFor < REMOVE_AFTER_SILENT_MS
+    ? "This install checked in within the last 10 minutes, so it is still running and would reappear. Stop its update agent first."
+    : null;
+}
+
+/**
+ * DELETE /projects/:projectId/release/installs/:installName — forget an install that stopped reporting
+ * (a decommissioned VM, a test). Check-ins upsert the row, so a live one could never be lost this way.
+ */
+releaseRouter.delete("/installs/:installName", async (c) => {
+  const projectId = c.req.param("projectId")!;
+  const installName = c.req.param("installName")!;
+  const access = await assertProjectAccess(c, projectId);
+  if (!access.ok) return c.json({ error: access.error }, access.status);
+
+  const db = c.get("db");
+  const [row] = await db.select({ lastSeenAt: projectInstalls.lastSeenAt })
+    .from(projectInstalls)
+    .where(and(eq(projectInstalls.projectId, projectId), eq(projectInstalls.installName, installName)))
+    .limit(1);
+  if (!row) return c.json({ error: `No install named "${installName}" for this project` }, 404);
+  const blocked = removalBlockedReason(row.lastSeenAt);
+  if (blocked) return c.json({ error: blocked }, 409);
+
+  await db.delete(projectInstalls)
+    .where(and(eq(projectInstalls.projectId, projectId), eq(projectInstalls.installName, installName)));
+  return c.json({ removed: installName });
+});
+
 export default releaseRouter;

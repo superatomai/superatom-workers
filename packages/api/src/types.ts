@@ -22,6 +22,9 @@ export type Env = {
   // getSignedUrl(), so presigned URLs are built by hand against the S3-compatible
   // endpoint and need the bucket name as a plain string.
   R2_SOURCE_FILES_BUCKET_NAME: string;
+  // Parcels: large websocket payloads, stored briefly (lib/parcels.ts). Its own
+  // bucket, emptied by an R2 lifecycle rule (delete 1 day after upload).
+  R2_PARCELS: R2Bucket;
   // R2 S3-compatible API credentials — used by aws4fetch to presign URLs
   // that the worker binding API can't generate natively.
   R2_ACCOUNT_ID: string;
@@ -49,6 +52,9 @@ export type Env = {
   // Full report JSON for checklist runs (deploy checklists, later a
   // dev->prod merge-gate checklist). checklist_runs (Postgres) indexes these.
   CHECKLIST_REPORTS: R2Bucket;
+  /** Program archives (built + source), one bucket per environment; presigned through the S3 API like source files. */
+  PROGRAMS: R2Bucket;
+  PROGRAMS_BUCKET_NAME: string;
   // Hostname that serves the super-admin console (UI + /api/*) instead of sa-api.
   SUPERADMIN_HOST: string;
   // Signs super-admin console sessions. Must differ from JWT_SECRET (min 32 chars).
@@ -77,6 +83,10 @@ export type Env = {
   RESEND_API_KEY?: string;
   // Announcement emails: sending address (a var) and the unsubscribe-link signing key (a secret).
   EMAIL_FROM?: string;
+  /** More From addresses org admins may pick (comma-separated, same verified domain). */
+  EMAIL_SENDERS?: string;
+  /** Encrypts orgs' own Resend keys at rest (lib/email-keys.ts). */
+  EMAIL_KEYS_SECRET?: string;
   EMAIL_UNSUBSCRIBE_SECRET?: string;
   /** Private R2 bucket for email attachments, reached through the S3 API like source files. */
   EMAIL_ATTACHMENTS_BUCKET_NAME?: string;

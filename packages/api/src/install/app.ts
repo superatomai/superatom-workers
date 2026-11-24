@@ -11,6 +11,7 @@ import {
   fetchTarball,
   installScript,
   issueProxyKey,
+  approvedVersion,
   latestCommit,
   sha256Hex,
   signBundle,
@@ -339,6 +340,8 @@ install.post("/api/update", async (c) => {
   return c.text(
     envLines({
       ...(release ? await releaseLines(c, release) : { CODE_COMMIT: sha.slice(0, 12) }),
+      // Only a chosen version is applied unattended; newest alone is an offer, not a deploy.
+      TARGET_VERSION: release ? approvedVersion(key.pinnedVersion, row?.targetVersion) : null,
       // Transitional, as in redeem.
       CODE_URL: await codeUrl(c, sha, projectId),
     })

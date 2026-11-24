@@ -19,6 +19,14 @@ export function envLines(values: Record<string, string | null | undefined>): str
     .join("\n") + "\n";
 }
 
+/**
+ * The version a person chose for an install: a super-admin pin, else the admin's
+ * target. Null means nobody chose one, and the update agent then leaves the VM alone.
+ */
+export function approvedVersion(pinned: string | null | undefined, target: string | null | undefined): string | null {
+  return pinned || target || null;
+}
+
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -168,6 +176,18 @@ async function proxyAdmin(env: Env, path: string, body: unknown): Promise<Respon
     headers: { "x-admin-secret": env.LLM_PROXY_ADMIN_SECRET, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+/** Disables a proxy client so its key stops working. True when disabled or already gone. */
+export async function disableProxyClient(env: Env, clientId: string): Promise<boolean> {
+  if (env.INSTALL_LLM_PROXY_MODE === "dummy") return true;
+  try {
+    const res = await proxyAdmin(env, `/${encodeURIComponent(clientId)}/disable`, {});
+    return res.ok || res.status === 404;
+  } catch (err) {
+    console.error(`[install] llm-proxy disable failed for ${clientId}:`, err);
+    return false;
+  }
 }
 
 /**

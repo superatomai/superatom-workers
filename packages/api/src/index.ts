@@ -12,6 +12,7 @@ import authRoutes from "./routes/auth";
 import ssoRoutes from "./routes/sso";
 import samlRoutes from "./routes/saml";
 import bootstrapRoutes from "./routes/bootstrap";
+import superAdminUsersRoutes from "./routes/super-admin-users";
 import orgRoutes from "./routes/orgs";
 import usersRoutes from "./routes/users";
 import projectsRoutes from "./routes/projects";
@@ -23,17 +24,20 @@ import sourceUploadRoutes from "./routes/source-upload";
 import chatAttachmentUploadRoutes from "./routes/chat-attachment-upload";
 import filesRoutes from "./routes/files";
 import analyticsRoutes from "./routes/analytics";
+import analyticsExportRoutes from "./routes/analytics-export";
 import speechRoutes from "./routes/speech";
 import answerFeedbackRoutes from "./routes/answer-feedback";
 import feedbackRoutes from "./routes/product-feedback";
 import sdkAuthRoutes from "./routes/sdk-auth";
 import graphRoutes from "./routes/graph";
 import releaseRoutes from "./routes/releases";
+import programsRoutes from "./routes/programs";
 import checklistReportsRoutes from "./routes/checklist-reports";
 import emailsRoutes from "./routes/emails";
 import emailMessagesRoutes from "./routes/email-messages";
 import emailUnsubscribeRoutes from "./routes/email-unsubscribe";
 import { processDueCampaigns } from "./lib/email-campaigns";
+import parcelsRoutes from "./routes/parcels";
 
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -134,6 +138,7 @@ app.route("/auth/sso", ssoRoutes);
 app.route("/auth/sso/saml", samlRoutes);
 app.route("/auth/sdk", sdkAuthRoutes);
 app.route("/auth", bootstrapRoutes);
+app.route("/admin/super-admins", superAdminUsersRoutes); // super admin only: add another super admin
 app.route("/orgs", orgRoutes);
 app.route("/orgs/:orgId/users", usersRoutes);
 app.route("/orgs/:orgId/projects", projectsRoutes);
@@ -145,13 +150,16 @@ app.route("/upload/source-file", sourceUploadRoutes);
 app.route("/upload/chat-attachment", chatAttachmentUploadRoutes);
 app.route("/upload", uploadRoutes);
 app.route("/files", filesRoutes); // agent output files (service token) and downloads (user)
+app.route("/parcels", parcelsRoutes); // large websocket payloads: engine project key or user token
 app.route("/my/apps", myAppsRoutes); // must be before appsRoutes (mounted at /) to avoid adminOnly middleware
 app.route("/apps", permissionsRoutes); // handles /apps/:appId/permissions
 app.route("/projects/:projectId/graph", graphRoutes); // composition graph (org admins only)
 app.route("/projects/:projectId/release", releaseRoutes); // release status + the Update button (org admins)
+app.route("/projects/:projectId/programs", programsRoutes); // program catalogue: engines (service token) and admins
 app.route("/", appsRoutes); // handles /projects/:projectId/apps and /apps/:appId
 app.route("/answer-feedback", answerFeedbackRoutes); // feedback 1: server-to-server (service token auth)
 app.route("/feedback", feedbackRoutes); // feedback 2: product feedback (public + superadmin list)
+app.route("/analytics/export", analyticsExportRoutes); // lean rows for the Excel export (admins only)
 app.route("/", analyticsRoutes); // handles /analytics/chat
 app.route("/", checklistReportsRoutes); // handles /checklist-reports
 app.route("/speech", speechRoutes);

@@ -280,3 +280,13 @@ export const orgScopeGuard = createMiddleware<{
   }
   await next();
 });
+
+/**
+ * The org a read may cover: super admins may pick one with ?orgId= (none = every org);
+ * everyone else always gets their own, whatever ?orgId= says.
+ */
+export function scopedOrgId(c: { req: { query(name: string): string | undefined }; get(key: "userRole" | "orgId"): unknown }): string | undefined {
+  const own = (c.get("orgId") as string | undefined) || undefined;
+  if (c.get("userRole") === "super_admin") return c.req.query("orgId") || own;
+  return own;
+}

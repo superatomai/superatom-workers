@@ -1,7 +1,7 @@
 import type { BroadcastMessage, ClientInfo } from '../types';
 import { handleChangesNotice, handleDraftAck, handleDraftPull } from './draft';
 import { handleHistoryPull } from './history';
-import { handleAck, handleHello, handleReleaseNotice } from './replication';
+import { handleAck, handleHello, handleProgramsNotice, handleReleaseNotice } from './replication';
 import type { GraphContext, GraphVersion } from './types';
 import { GraphVersions } from './versions';
 
@@ -26,6 +26,7 @@ export class KnowledgeGraph {
 	handleRequest(pathname: string, request: Request): Promise<Response> | null {
 		if (pathname === '/graph-release') return handleReleaseNotice(this.ctx, request);
 		if (pathname === '/graph-changes') return handleChangesNotice(this.ctx, request);
+		if (pathname === '/programs-changed') return handleProgramsNotice(this.ctx, request);
 		return null;
 	}
 

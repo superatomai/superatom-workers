@@ -223,6 +223,20 @@ export const projectPrograms = pgTable(
     publishedBy: varchar("published_by", { length: 255 }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
     notes: text("notes"),
+    // Who registered the build; drafts are served only to this user's dev engine.
+    creatorId: uuid("creator_id").references(() => users.id, { onDelete: "set null" }),
+    // program.json, so lists and the engine prompt need not open the archive.
+    manifest: jsonb("manifest").$type<Record<string, unknown>>(),
+    // pending until the archive is in R2 and its size checked; then ready. unpublished = retracted after a publish.
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    // The build the project's engines run (one per project + name). `pinned` freezes it against newer publishes.
+    current: boolean("current").notNull().default(false),
+    pinned: boolean("pinned").notNull().default(false),
+    // R2 keys in the programs bucket: the built archive and the source archive.
+    key: varchar("key", { length: 512 }),
+    sourceKey: varchar("source_key", { length: 512 }),
+    sourceHash: varchar("source_hash", { length: 64 }),
+    sourceBytes: integer("source_bytes"),
   },
   (table) => [
     uniqueIndex("project_programs_version_idx").on(table.projectId, table.name, table.version),
@@ -455,6 +469,8 @@ export const ssoConfigs = pgTable("sso_configs", {
   samlIdpEntityId: varchar("saml_idp_entity_id", { length: 1000 }),
   samlIdpSsoUrl: varchar("saml_idp_sso_url", { length: 1000 }),
   samlIdpCertificates: jsonb("saml_idp_certificates"),
+  // Email domains that must sign in through this SSO (no password login); null/empty = off.
+  ssoRequiredDomains: jsonb("sso_required_domains").$type<string[]>(),
   isActive: boolean("is_active").default(true).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -482,6 +498,15 @@ export const analyticsStatusEnum = pgEnum("analytics_status", [
 // ingest/query path rather than per-type tables so all three can be
 // queried/filtered together via a single `type` param instead of juggling
 // separate endpoints.
+export const accessSourceEnum = pgEnum("access_source", [
+  // The customer's own backend signed the access into the token.
+  "token",
+  // Nothing in the token, so the platform's `users.config` applied.
+  "stored",
+  // Neither — the user was unrestricted.
+  "none",
+]);
+
 export const analyticsTypeEnum = pgEnum("analytics_type", [
   "chat_agent",
   "dashboard",
@@ -534,6 +559,15 @@ export const chatAnalytics = pgTable(
     status: analyticsStatusEnum("status").notNull(),
     errorMessage: text("error_message"),
     feedback: varchar("feedback", { length: 50 }), // 'thumbs_up' | 'thumbs_down' | null
+    // Where this answer's access came from, and what it was. Read together:
+    //   'token' | 'stored' + a hash  → restricted; the hash resolves in access_configs
+    //   'none'              + NULL   → no restriction, and we know that
+    //   NULL                + NULL   → never recorded (older SDK, or the write
+    //                                  never arrived) — the one case worth chasing
+    // The source is stated rather than inferred, so a NULL never has to mean two
+    // things at once.
+    accessSource: accessSourceEnum("access_source"),
+    accessHash: varchar("access_hash", { length: 64 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
@@ -546,6 +580,7 @@ export const chatAnalytics = pgTable(
     index("chat_analytics_created_at_idx").on(table.createdAt),
     index("chat_analytics_model_idx").on(table.model),
     index("chat_analytics_status_idx").on(table.status),
+    index("chat_analytics_access_hash_idx").on(table.accessHash),
   ]
 );
 
@@ -563,6 +598,49 @@ export const chatAnalyticsRelations = relations(chatAnalytics, ({ one }) => ({
     references: [projects.id],
   }),
 }));
+
+// ─── Access Configs ──────────────────────────────────────
+//
+// What a user was allowed to see, kept so a question answered last week can say
+// what it was answered under. Access is decided per connection and otherwise
+// thrown away (sdk-auth.ts never writes it to the user), so this is the only
+// record.
+//
+// Only ever holds real restrictions. A user with no restriction gets no row —
+// chat_analytics.access_source says 'none' and that is the whole answer.
+//
+// Keyed by a sha256 of the canonical config, per user. Written once per user per
+// distinct config and never updated — the relay keeps the hashes it has already
+// written, so a returning config costs nothing.
+//
+// A DICTIONARY, not a log: a user going A → B → A leaves two rows, and the
+// sequence lives in the analytics rows, which carry the hash and a timestamp.
+// Neither `effective_from` nor `last_seen_at` belongs here; both would read as a
+// timeline this table cannot give.
+
+export const accessConfigs = pgTable(
+  "access_configs",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    // Canonical form is a contract shared with the engine (access-hash.ts in the
+    // websocket package, mirrored in sdk-nodejs). Change the rules in both or
+    // every lookup silently misses.
+    accessHash: varchar("access_hash", { length: 64 }).notNull(),
+    orgId: uuid("org_id").references(() => organizations.id, { onDelete: "set null" }),
+    // Holds real customer values, as chat_analytics.question and .sql_generated
+    // already do. Whatever clears a user's analytics rows should clear these.
+    config: jsonb("config").notNull(),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.accessHash] }),
+    // Who else is on this exact access?
+    index("access_configs_access_hash_idx").on(table.accessHash),
+    index("access_configs_org_id_idx").on(table.orgId),
+  ]
+);
 
 // ─── Speech (voice input) Usage ──────────────────────────
 //
@@ -640,6 +718,25 @@ export const refreshTokens = pgTable(
 
 export const feedbackStatus = pgEnum('feedback_status', ['correct', 'incorrect', 'partial'])
 
+/**
+ * Where a piece of feedback GOT TO, which is not what it SAID.
+ *
+ * `status` is the reader's verdict on the answer. This is the triage outcome,
+ * set afterwards by whoever worked through it. Two different questions, so two
+ * columns — and the reason this one is not also called `status`.
+ *
+ * Short codes: the wording on screen is the UI's to change. "Won't fix / Not an
+ * issue" is a label; `not_an_issue` is the value.
+ */
+export const feedbackResolution = pgEnum('feedback_resolution', [
+  'open',
+  'resolved',
+  'later_scope',
+  'not_an_issue',
+  'duplicate',
+  'needs_info',
+])
+
 export const answerFeedback = pgTable("answer_feedback", {
   id: uuid("id").defaultRandom().primaryKey(),
   orgId: varchar("org_id", { length: 255 }),
@@ -651,6 +748,13 @@ export const answerFeedback = pgTable("answer_feedback", {
   status: feedbackStatus(),
   feedbackText: text("feedback_text"),
   answerSnapshot: jsonb("answer_snapshot"),
+  /* Every row that exists already becomes `open`, which is what it is. */
+  resolution: feedbackResolution("resolution").default('open').notNull(),
+  /* Why it was closed. Kept on the row rather than in a thread: one reason is
+     what a closure has. A conversation about it would be a second table. */
+  resolutionNote: text("resolution_note"),
+  resolvedBy: varchar("resolved_by", { length: 255 }),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   // Unique constraint for UPSERT: (userId, uiBlockId) — mirrors the local
@@ -663,6 +767,7 @@ export const answerFeedback = pgTable("answer_feedback", {
   index("answer_feedback_thread_id_idx").on(table.threadId),
   index("answer_feedback_ui_block_id_idx").on(table.uiBlockId),
   index("answer_feedback_created_at_idx").on(table.createdAt),
+  index("answer_feedback_resolution_idx").on(table.resolution),
 ]);
 
 // ─── Product Feedback (Feedback 2) ──────────────────────
@@ -1193,7 +1298,11 @@ export const emailCampaigns = pgTable(
     // Unsubscribe category, e.g. "announcements" or "usage".
     category: varchar("category", { length: 32 }).notNull().default("announcements"),
     subject: varchar("subject", { length: 255 }).notNull(),
+    // The body as written: markdown, or HTML when bodyFormat is "html".
     bodyMarkdown: text("body_markdown").notNull(),
+    bodyFormat: varchar("body_format", { length: 8 }).notNull().default("markdown"),
+    // Heading in the email's header band; null = the subject.
+    title: varchar("title", { length: 200 }),
     status: varchar("status", { length: 16 }).notNull().default("draft"),
     // EmailSchedule (lib/email-schedule.ts); null = send now. Recurring ones stay "scheduled",
     // scheduledAt is the next run, and each run is a child row (parentId) holding its own sends.
@@ -1225,8 +1334,36 @@ export const emailCampaigns = pgTable(
       "email_campaigns_status_check",
       sql`${table.status} in ('draft', 'scheduled', 'sending', 'sent', 'cancelled', 'failed')`
     ),
+    check("email_campaigns_body_format_check", sql`${table.bodyFormat} in ('markdown', 'html')`),
   ]
 );
+
+// An org's look and sender for its emails (lib/email-layout.ts); no row = the defaults.
+export const emailBranding = pgTable("email_branding", {
+  orgId: uuid("org_id")
+    .primaryKey()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  // Unused since headers moved into the HTML body; kept until a cleanup migration drops them.
+  headerColor: varchar("header_color", { length: 7 }),
+  logoUrl: text("logo_url"),
+  showSuperatomLogo: boolean("show_superatom_logo").notNull().default(true),
+  // Sender: the address must be in the worker's allowed list (EMAIL_FROM + EMAIL_SENDERS).
+  senderName: varchar("sender_name", { length: 100 }),
+  senderEmail: varchar("sender_email", { length: 255 }),
+  whyText: varchar("why_text", { length: 500 }),
+  footerNote: varchar("footer_note", { length: 300 }),
+  // "default" = why-you-got-this + unsubscribe; "custom" = footerHtml, which must hold {{unsubscribeUrl}}.
+  footerMode: varchar("footer_mode", { length: 8 }).notNull().default("default"),
+  footerHtml: text("footer_html"),
+  buttonColor: varchar("button_color", { length: 7 }),
+  // The org's own Resend key (encrypted, lib/email-keys.ts): its emails are sent and billed there.
+  resendKeyEnc: text("resend_key_enc"),
+  resendKeyLast4: varchar("resend_key_last4", { length: 4 }),
+  // Domains verified in that account; null = unknown (a sending-only key can't list them).
+  senderDomains: jsonb("sender_domains"),
+  updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
 
 export const emailSends = pgTable(
   "email_sends",

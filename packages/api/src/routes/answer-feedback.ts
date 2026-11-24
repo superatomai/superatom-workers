@@ -1,5 +1,7 @@
 import { Hono } from "hono";
-import { answerFeedback } from "../db/schema";
+import { eq, and, sql } from "drizzle-orm";
+import { answerFeedback, chatAnalytics } from "../db/schema";
+import { resolutionUpdate } from "../lib/feedback-resolution";
 import type { Env, AppVariables } from "../types";
 
 const answerFeedbackRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -36,6 +38,11 @@ answerFeedbackRouter.post("/", async (c) => {
     status?: string;
     feedbackText?: string;
     answerSnapshot?: unknown;
+    // Triage, forwarded by the engine when someone closes or reopens a row.
+    resolution?: string;
+    resolutionNote?: string | null;
+    resolvedBy?: string | null;
+    resolvedAt?: string | null;
   }>();
 
   if (!payload.uiBlockId || !payload.userPrompt) {
@@ -59,6 +66,18 @@ answerFeedbackRouter.post("/", async (c) => {
     status = payload.status;
   }
 
+  /**
+   * Triage, and only when the engine sent it.
+   *
+   * Absent means "this forward is not about triage" — a feedback write carries
+   * no resolution, and defaulting it to `open` here would reopen a closed row
+   * every time its text was edited.
+   */
+  /* The rule itself lives in `lib/feedback-resolution.ts`, pure and tested. */
+  const triage = resolutionUpdate(payload);
+  if (!triage.ok) return c.json({ error: triage.error }, 400);
+  const resolutionFields = triage.fields;
+
   // UPSERT: Insert or update if (userId, uiBlockId) exists
   const [inserted] = await db
     .insert(answerFeedback)
@@ -72,6 +91,7 @@ answerFeedbackRouter.post("/", async (c) => {
       status: status as any,
       feedbackText: payload.feedbackText || null,
       answerSnapshot: payload.answerSnapshot || null,
+      ...resolutionFields,
     } as any)
     .onConflictDoUpdate({
       target: [
@@ -83,9 +103,34 @@ answerFeedbackRouter.post("/", async (c) => {
         feedbackText: payload.feedbackText || null,
         userPrompt: payload.userPrompt,
         answerSnapshot: payload.answerSnapshot || null,
+        /* Spread last, and empty unless the forward was about triage. Without
+           it here a resolution would only ever land on a row that did not yet
+           exist — the mirror's rows almost always do. */
+        ...resolutionFields,
       } as any,
     })
     .returning();
+
+  // Mirror the verdict onto the event row so the analytics list/export can show
+  // it without joining answer_feedback on every read. The event is found the same
+  // way the feedback is keyed: same user, and the event's saved response id is the
+  // feedback's uiBlockId. Best-effort — must never fail the feedback write itself.
+  if (payload.userId) {
+    try {
+      await db
+        .update(chatAnalytics)
+        .set({ feedback: status ?? (payload.feedbackText ? "comment" : null) })
+        .where(
+          and(
+            sql`${chatAnalytics.userId}::text = ${payload.userId}`,
+            sql`${chatAnalytics.response}->>'id' = ${payload.uiBlockId}`,
+            eq(chatAnalytics.type, "chat_agent"),
+          ),
+        );
+    } catch (err) {
+      console.error("[answer-feedback] failed to mirror feedback onto chat_analytics:", err);
+    }
+  }
 
   // Format timestamp to ISO string to preserve timezone info
   const formattedInserted = {

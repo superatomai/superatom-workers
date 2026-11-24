@@ -31,8 +31,8 @@ importers:
         specifier: ^0.45.2
         version: 0.45.2(@cloudflare/workers-types@4.20260329.1)(@neondatabase/serverless@0.10.4)(@types/pg@8.11.6)(gel@2.2.0)
       hono:
-        specifier: ^4.13.11
-        version: 4.13.14
+        specifier: ^4.13.16
+        version: 4.13.18
       jose:
         specifier: ^5.9.0
         version: 5.10.0
@@ -652,8 +652,8 @@ packages:
   get-tsconfig@4.13.7:
     resolution: {integrity: sha512-7tN6rFgBlMgpBML5j8typ92BKFi2sFQvIdpAqLA2beia5avZDrMs0FLZiM5etShWq5irVyGcGMEA1jcDaK7A/Q==}
 
-  hono@4.13.14:
-    resolution: {integrity: sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==}
+  hono@4.13.18:
+    resolution: {integrity: sha512-H9q/E1XizaWstJxUW881dmLxEj+t/TrGGnyxINkm4+sK0qUwsMtFdo2BWI9Vs3cIS19MU6b6iCijoUoEf4f3DA==}
     engines: {node: '>=16.9.0'}
 
   isexe@3.1.5:
@@ -1178,7 +1178,7 @@ snapshots:
     dependencies:
       resolve-pkg-maps: 1.0.0
 
-  hono@4.13.14: {}
+  hono@4.13.18: {}
 
   isexe@3.1.5:
     optional: true

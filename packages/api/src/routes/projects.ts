@@ -3,6 +3,7 @@ import { eq, and } from "drizzle-orm";
 import { projects, apps } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, adminOnly, orgScopeGuard } from "../middleware/auth";
+import { deleteProject, projectDeleteSteps } from "../lib/project-delete";
 
 export const DEFAULT_DESIGN_SYSTEM = {
   colors: {
@@ -177,22 +178,20 @@ projectsRouter.put("/:projectId", async (c) => {
 
 /**
  * DELETE /orgs/:orgId/projects/:projectId
- * Delete project (cascades to apps + permissions via FK)
+ * Delete project (cascades to apps + permissions via FK); revokes its API keys and LLM proxy clients
  */
 projectsRouter.delete("/:projectId", async (c) => {
   const db = c.get("db");
   const orgId = c.req.param("orgId")!;
   const projectId = c.req.param("projectId");
 
-  // Org-scoped: this cascades to apps and permissions, so an unscoped delete let
-  // an admin destroy another tenant's project outright.
-  const [deleted] = await db
-    .delete(projects)
-    .where(and(eq(projects.id, projectId), eq(projects.orgId, orgId)))
-    .returning({ id: projects.id });
-
-  if (!deleted) {
+  // Org-scoped: an unscoped delete let an admin destroy another tenant's project.
+  const result = await deleteProject(projectDeleteSteps(db, c.env, orgId, projectId));
+  if (result.status === "not_found") {
     return c.json({ error: "Project not found" }, 404);
+  }
+  if (result.status === "proxy_failed") {
+    return c.json({ error: `Could not disable LLM proxy client '${result.clientId}'; the project was not deleted. Retry.` }, 502);
   }
 
   return c.json({ message: "Project deleted" });

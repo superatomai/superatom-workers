@@ -6,13 +6,14 @@ import { authenticateEmailKey } from "../lib/email-api-keys";
 import {
   RESEND_BATCH_LIMIT,
   fromAddress,
-  isEmailConfigured,
-  sendEmailBatch,
+  sendEmailsEach,
   signUnsubscribeToken,
   unsubscribeHeaders,
   type EmailMessage,
 } from "../lib/email";
-import { ANNOUNCEMENTS, DAILY_ORG_LIMIT, buildEmailHtml, dailyUsage, unsubscribeUrl } from "../lib/email-campaigns";
+import { ANNOUNCEMENTS, DAILY_ORG_LIMIT, dailyUsage, loadBranding, unsubscribeUrl } from "../lib/email-campaigns";
+import { buildEmailHtml } from "../lib/email-layout";
+import { orgResendKey } from "../lib/email-keys";
 
 /**
  * Script/agent sending: each message has its own recipient and content. Authenticated by an
@@ -90,7 +91,10 @@ emailMessages.post("/", async (c) => {
     messages.push(m);
   });
   if (errors.length) return c.json({ error: "Some messages are invalid; nothing was sent", errors }, 400);
-  if (!isEmailConfigured(c.env) || !c.env.EMAIL_UNSUBSCRIBE_SECRET) {
+  const branding = await loadBranding(db, orgId);
+  const key = await orgResendKey(c.env, branding);
+  if (!key.ok) return c.json({ error: key.error }, 503);
+  if (!key.apiKey || !c.env.EMAIL_UNSUBSCRIBE_SECRET) {
     return c.json({ error: "Email sending is not configured" }, 503);
   }
 
@@ -99,6 +103,7 @@ emailMessages.post("/", async (c) => {
     .select({
       userId: users.id,
       email: users.email,
+      name: users.name,
       unsubscribed: sql<boolean>`${emailUnsubscribes.userId} is not null`,
     })
     .from(users)
@@ -149,12 +154,12 @@ emailMessages.post("/", async (c) => {
   }
 
   const results: Result[] = [];
-  const outgoing: Array<{ index: number; message: Message; userId: string }> = [];
+  const outgoing: Array<{ index: number; message: Message; userId: string; name: string | null }> = [];
   messages.forEach((m, index) => {
     const person = byEmail.get(m.to.toLowerCase());
     if (!person) results.push({ index, to: m.to, status: "rejected", error: "Not an active user of this organization" });
     else if (person.unsubscribed) results.push({ index, to: m.to, status: "skipped", error: "Unsubscribed" });
-    else outgoing.push({ index, message: m, userId: person.userId });
+    else outgoing.push({ index, message: m, userId: person.userId, name: person.name });
   });
   const skipped = results.filter((r) => r.status === "skipped");
   const rows = [
@@ -173,43 +178,48 @@ emailMessages.post("/", async (c) => {
   if (outgoing.length) {
     const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
     const orgName = org?.name ?? "Your organization";
-    const from = fromAddress(c.env, orgName);
+    const from = fromAddress(c.env, orgName, branding);
+    const html = (m: Message, url: string, recipientName: string | null) =>
+      buildEmailHtml({
+        orgName,
+        body: m.html ?? m.markdown!,
+        format: m.html !== undefined ? "html" : "markdown",
+        branding,
+        recipientName,
+        unsubscribeUrl: url,
+      });
     const batch: EmailMessage[] = await Promise.all(
-      outgoing.map(async ({ message: m, userId }) => {
+      outgoing.map(async ({ message: m, userId, name }) => {
         const url = unsubscribeUrl(c.env, await signUnsubscribeToken(c.env, userId, ANNOUNCEMENTS));
         return {
           from,
           to: [m.to],
           subject: m.subject,
-          html: buildEmailHtml(m.html !== undefined ? { orgName, bodyHtml: m.html, unsubscribeUrl: url } : { orgName, bodyMarkdown: m.markdown, unsubscribeUrl: url }),
+          html: html(m, url, name),
           ...(m.text ? { text: m.text } : {}),
-          replyTo: m.replyTo ?? auth.creatorEmail,
+          replyTo: m.replyTo ?? (branding?.senderEmail ? undefined : auth.creatorEmail),
           headers: unsubscribeHeaders(url),
           tags: [{ name: "campaign", value: campaign.id }],
         };
       })
     );
-    const sent = await sendEmailBatch(c.env, batch, `api-${campaign.id}`);
+    const each = await sendEmailsEach(c.env, batch, `api-${campaign.id}`, key.apiKey);
     outgoing.forEach((o, i) =>
       results.push(
-        sent.success
-          ? { index: o.index, to: o.message.to, status: "sent", id: sent.ids?.[i] }
-          : { index: o.index, to: o.message.to, status: "failed", error: sent.error ?? "Send failed" }
+        each[i].error
+          ? { index: o.index, to: o.message.to, status: "failed", error: each[i].error }
+          : { index: o.index, to: o.message.to, status: "sent", id: each[i].id }
       )
     );
-    await db
-      .update(emailSends)
-      .set(sent.success ? { status: "sent", sentAt: new Date() } : { status: "failed", error: sent.error ?? "Send failed" })
-      .where(and(eq(emailSends.campaignId, campaign.id), eq(emailSends.status, "pending")));
-    if (sent.success && sent.ids?.length) {
-      const values = sql.join(
-        outgoing.map((o, i) => sql`(${o.message.to}, ${sent.ids![i] ?? null})`),
-        sql`, `
-      );
-      await db.execute(sql`
-        update ${emailSends} set resend_id = v.rid from (values ${values}) as v(email, rid)
-        where ${emailSends.campaignId} = ${campaign.id} and ${emailSends.email} = v.email`);
-    }
+    const values = sql.join(
+      outgoing.map((o, i) => sql`(${o.message.to}, ${each[i].error ? "failed" : "sent"}, ${each[i].id ?? null}, ${each[i].error ?? null})`),
+      sql`, `
+    );
+    await db.execute(sql`
+      update ${emailSends} set status = v.status, resend_id = v.rid, error = v.err,
+        sent_at = case when v.status = 'sent' then now() else null end
+      from (values ${values}) as v(email, status, rid, err)
+      where ${emailSends.campaignId} = ${campaign.id} and ${emailSends.email} = v.email and ${emailSends.status} = 'pending'`);
   }
 
   const sentCount = results.filter((r) => r.status === "sent").length;
