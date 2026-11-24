@@ -5,6 +5,7 @@ import type { Env } from "../../types";
 import type { SuperAdminVariables } from "../types";
 import { validatePassword } from "../../lib/password-policy";
 import { createOrgSecret } from "../../lib/org-secrets";
+import { builtInRoleId, recordRoleChange } from "../../lib/permissions";
 import {
   cleanEmail,
   cleanName,
@@ -79,13 +80,18 @@ orgs.post("/", async (c) => {
       const [org] = await insertOrg;
       return c.json({ organization: org, admin: null, secret }, 201);
     }
+    // The organization's first admin is its Owner (as in org-admins.ts): someone
+    // has to be able to manage admins, and only an Owner can.
+    const roleId = await builtInRoleId(db, "owner");
     const [[org], [orgAdmin]] = await db.batch([
       insertOrg,
       db
         .insert(users)
-        .values({ orgId, email: admin.email, name: admin.name, passwordHash: admin.passwordHash, role: "org_admin" })
+        .values({ orgId, email: admin.email, name: admin.name, passwordHash: admin.passwordHash, role: "org_admin", roleId })
         .returning({ id: users.id, email: users.email, name: users.name, role: users.role }),
     ]);
+    // No changedBy: a super admin is not a user of this organization.
+    await recordRoleChange(db, { orgId, userId: orgAdmin.id, changedBy: null, fromRole: null, toRole: "owner" });
     // Shown once — KV keeps the only copy. It is what the customer signs their
     // SDK tokens with.
     return c.json({ organization: org, admin: orgAdmin, secret }, 201);
