@@ -47,7 +47,7 @@ export const PERMISSION_CATALOGUE = [
     module: "members",
     label: "Members",
     permissions: [
-      { key: "members.view", label: "See members, their data rules and access history" },
+      { key: "members.view", label: "See members' details: data rules, external roles and access history" },
       { key: "members.history", label: "See the access log: who gave or took away whose access, and when" },
       { key: "members.create", label: "Add members" },
       { key: "members.edit", label: "Change members' name and email, deactivate and reactivate them" },
@@ -163,6 +163,42 @@ export const BUILT_IN_ROLES: Record<BuiltInRole, readonly Permission[]> = {
 /** The people powers: what a new Admin starts WITHOUT, until the Owner ticks them. */
 export const PEOPLE_PERMISSIONS = PERMISSIONS.filter((p) => p.startsWith("members.")) as Permission[];
 
+/**
+ * Members actions that need "See members" (members.view): nobody adds, changes,
+ * deactivates, gives roles to, sets data rules for or resets the password of
+ * people whose details they cannot see. The access log (members.history) stands
+ * on its own.
+ */
+export const NEEDS_MEMBERS_VIEW: readonly Permission[] = [
+  "members.create", "members.edit", "members.assign", "members.data_rules", "members.reset_password",
+];
+
+/**
+ * Why a set of permissions is incomplete, or null:
+ * - anything without platform.access: without signing in to the platform, a
+ *   person only uses the apps shared with them, so no other permission means anything;
+ * - a Members action without members.view.
+ */
+export function missingDependency(held: readonly string[]): string | null {
+  if (!held.includes("platform.access")) {
+    const orphans = held.filter((p) => p !== "platform.access");
+    if (orphans.length) return `${orphans.join(", ")} need platform.access (Sign in to the platform)`;
+  }
+  if (held.includes("members.view")) return null;
+  const orphans = NEEDS_MEMBERS_VIEW.filter((p) => held.includes(p));
+  return orphans.length ? `${orphans.join(", ")} need members.view (See members)` : null;
+}
+
+/**
+ * Drops what a missing dependency makes meaningless (a role or limits saved
+ * before the rules): everything without platform.access, Members actions
+ * without members.view.
+ */
+function withDependencies(held: Permission[]): Permission[] {
+  if (!held.includes("platform.access")) return [];
+  return held.includes("members.view") ? held : held.filter((p) => !NEEDS_MEMBERS_VIEW.includes(p));
+}
+
 /** Roles that manage other members; only the Owner gives, changes or removes them. */
 export const ADMIN_ROLES: readonly string[] = ["owner", "admin"];
 
@@ -219,11 +255,11 @@ export function permissionsOf(user: {
   if (!user.roleKey || user.roleIsSystem) {
     const builtIn = [...(BUILT_IN_ROLES[key as BuiltInRole] ?? [])];
     // Limits only narrow an Admin; an Owner always holds everything.
-    return key === "admin" && user.limits?.length ? builtIn.filter((p) => !user.limits!.includes(p)) : builtIn;
+    return key === "admin" && user.limits?.length ? withDependencies(builtIn.filter((p) => !user.limits!.includes(p))) : builtIn;
   }
   // Only what is still in the catalogue: a permission renamed or retired since
   // the role was saved grants nothing.
-  return (user.customPermissions ?? []).filter((p): p is Permission => (PERMISSIONS as readonly string[]).includes(p));
+  return withDependencies((user.customPermissions ?? []).filter((p): p is Permission => (PERMISSIONS as readonly string[]).includes(p)));
 }
 
 /** The `users.role` value an organization role is stored with. */

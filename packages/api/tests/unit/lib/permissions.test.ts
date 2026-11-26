@@ -7,8 +7,10 @@ import {
   PEOPLE_PERMISSIONS,
   PERMISSIONS,
   PERMISSION_CATALOGUE,
+  NEEDS_MEMBERS_VIEW,
   hasFixedPower,
   mayGrantRole,
+  missingDependency,
   orgRoleOf,
   parseOrgRole,
   permissionsOf,
@@ -75,12 +77,72 @@ describe("per-person limits", () => {
 
   it("never touch an Owner, a custom role or the super admin", () => {
     assert.deepEqual(permissionsOf({ role: "org_admin", roleKey: "owner", roleIsSystem: true, limits: ["members.view"] }).sort(), [...PERMISSIONS].sort());
-    assert.deepEqual(permissionsOf({ role: "member", roleKey: "analyst", roleIsSystem: false, customPermissions: ["members.view"], limits: ["members.view"] }), ["members.view"]);
+    assert.deepEqual(
+      permissionsOf({ role: "member", roleKey: "analyst", roleIsSystem: false, customPermissions: ["platform.access", "members.view"], limits: ["members.view"] }).sort(),
+      ["members.view", "platform.access"]
+    );
     assert.ok(permissionsOf({ role: "super_admin", limits: ["members.view"] }).includes("members.view"));
   });
 
   it("an Admin with no limits keeps everything the Admin role carries", () => {
     assert.deepEqual(permissionsOf(admin).sort(), [...BUILT_IN_ROLES.admin].sort());
+  });
+});
+
+describe("Everything needs Sign in to the platform", () => {
+  it("names what is held without platform access", () => {
+    assert.match(missingDependency(["dashboard.view", "analytics.export"]) ?? "", /dashboard\.view, analytics\.export need platform\.access/);
+    assert.match(missingDependency(["members.view"]) ?? "", /need platform\.access/);
+  });
+
+  it("accepts nothing at all (a runtime-only role), and platform access alone", () => {
+    assert.equal(missingDependency([]), null);
+    assert.equal(missingDependency(["platform.access"]), null);
+  });
+
+  it("a custom role saved without platform access grants nothing, closing the routes that skip that check", () => {
+    const got = permissionsOf({
+      role: "member",
+      roleKey: "reports",
+      roleIsSystem: false,
+      customPermissions: ["analytics.view", "analytics.export", "app.create", "members.history"],
+    });
+    assert.deepEqual(got, []);
+  });
+
+  it("an Admin limited out of platform access holds nothing", () => {
+    assert.deepEqual(permissionsOf({ role: "org_admin", roleKey: "admin", roleIsSystem: true, limits: ["platform.access"] }), []);
+  });
+
+  it("never touches the Owner or the super admin", () => {
+    assert.ok(permissionsOf({ role: "org_admin", roleKey: "owner", roleIsSystem: true }).includes("analytics.view"));
+    assert.ok(permissionsOf({ role: "super_admin" }).includes("analytics.view"));
+  });
+});
+
+describe("Members actions need See members", () => {
+  it("names what is missing, or nothing when the set is whole", () => {
+    assert.equal(missingDependency(["platform.access", "members.view", "members.edit"]), null);
+    assert.equal(missingDependency(["platform.access", "members.history", "project.view"]), null);
+    assert.match(
+      missingDependency(["platform.access", "members.edit", "members.data_rules"]) ?? "",
+      /members\.edit, members\.data_rules need members\.view/
+    );
+  });
+
+  it("covers every Members action except See members and the access log", () => {
+    assert.deepEqual(
+      [...NEEDS_MEMBERS_VIEW].sort(),
+      PEOPLE_PERMISSIONS.filter((p) => p !== "members.view" && p !== "members.history").sort()
+    );
+  });
+
+  it("a role or limits saved before the rule grant no Members action without See members", () => {
+    const custom = permissionsOf({ role: "member", roleKey: "lead", roleIsSystem: false, customPermissions: ["platform.access", "members.edit", "members.history"] });
+    assert.deepEqual(custom.sort(), ["members.history", "platform.access"]);
+    const admin = permissionsOf({ role: "org_admin", roleKey: "admin", roleIsSystem: true, limits: ["members.view"] });
+    for (const p of NEEDS_MEMBERS_VIEW) assert.ok(!admin.includes(p), p);
+    assert.ok(admin.includes("members.history") && admin.includes("project.create"));
   });
 });
 
@@ -166,9 +228,9 @@ describe("permissionsOf", () => {
       role: "member",
       roleKey: "analyst",
       roleIsSystem: false,
-      customPermissions: ["analytics.view", "dashboard.create", "made.up", "members.manage", "sources.manage"],
+      customPermissions: ["platform.access", "analytics.view", "dashboard.create", "made.up", "members.manage", "sources.manage"],
     });
-    assert.deepEqual(got.sort(), ["analytics.view", "dashboard.create"]);
+    assert.deepEqual(got.sort(), ["analytics.view", "dashboard.create", "platform.access"]);
   });
 
   it("gives a custom role with no rows nothing", () => {

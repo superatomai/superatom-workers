@@ -3,7 +3,7 @@ import { and, count, eq, inArray, isNull, or } from "drizzle-orm";
 import { rolePermissions, roles, users } from "../db/schema";
 import type { Env, AppVariables } from "../types";
 import { authMiddleware, orgScopeGuard, requireFixed, requirePermission } from "../middleware/auth";
-import { BUILT_IN_ROLES, PERMISSIONS, PERMISSION_CATALOGUE, type BuiltInRole } from "../lib/permissions";
+import { BUILT_IN_ROLES, PERMISSIONS, PERMISSION_CATALOGUE, missingDependency, type BuiltInRole } from "../lib/permissions";
 import { actorOf, logAccess } from "../lib/access-log";
 import { writeTogether } from "../lib/write-together";
 
@@ -41,6 +41,8 @@ export function checkedPermissions(value: unknown): { ok: true; permissions: str
   const list = [...new Set(value.map(String))];
   const unknown = list.filter((p) => !(PERMISSIONS as readonly string[]).includes(p));
   if (unknown.length) return { ok: false, error: `Unknown permissions: ${unknown.join(", ")}` };
+  const missing = missingDependency(list);
+  if (missing) return { ok: false, error: missing };
   return { ok: true, permissions: list };
 }
 

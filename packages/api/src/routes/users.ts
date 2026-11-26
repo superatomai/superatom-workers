@@ -17,6 +17,7 @@ import {
   activeOwnersExcept,
   limitsOf,
   mayGrantRole,
+  missingDependency,
   orgRoleOf,
   recordRoleChange,
   resolveRole,
@@ -41,12 +42,17 @@ async function loadMember(db: Database, orgId: string, userId: string) {
 }
 
 /**
- * Admins and Owners are managed only by the Owner (FIXED.manageAdmins).
- * Everyone else may act on them only when acting on themselves.
+ * Admins are managed only by the Owner (FIXED.manageAdmins). Another Owner is
+ * managed only by the platform super admin: an Owner cannot demote, deactivate,
+ * edit or reset the password of another Owner. Anyone may act on themselves.
  */
-function mayActOn(c: { get: (k: "orgRole") => string }, target: { orgRole: string }, isSelf: boolean): boolean {
-  return isSelf || !ADMIN_ROLES.includes(target.orgRole) || hasFixed(c, "manageAdmins");
+function mayActOn(c: { get: (k: "orgRole") => string }, target: { orgRole: string }, isSelf: boolean, actorRole: string): boolean {
+  if (isSelf) return true;
+  if (target.orgRole === "owner") return actorRole === "super_admin";
+  return !ADMIN_ROLES.includes(target.orgRole) || hasFixed(c, "manageAdmins");
 }
+
+const OWNERS_ARE_SUPER_ADMINS = "Only the SuperAtom super admin can make, change or remove an Owner";
 
 /**
  * Sets someone's project scope (lib/project-scope.ts): `all`, or `selected` with
@@ -133,8 +139,10 @@ async function applyProjectScope(
 const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
 /**
- * Everything a member owns (objects: today every kind of app), with each one's
- * name and project, so whoever removes them can see what will be handed over.
+ * Everything a member owns (apps, projects and data sources), with each one's
+ * name, so whoever deactivates them can see what will be handed over. An app's
+ * name is in apps, a project's in projects; a data source's is the id after
+ * "<projectId>:" in its ref (sources live in the engine, not here).
  */
 async function ownedBy(db: Database, userId: string) {
   return db
@@ -143,11 +151,12 @@ async function ownedBy(db: Database, userId: string) {
       type: objects.type,
       refId: objects.refId,
       projectId: objects.projectId,
-      name: apps.name,
+      name: sql<string | null>`coalesce(${apps.name}, ${projects.name}, case when ${objects.type} = 'source' then split_part(${objects.refId}, ':', 2) end)`,
       status: objects.status,
     })
     .from(objects)
     .leftJoin(apps, sql`${apps.id}::text = ${objects.refId}`)
+    .leftJoin(projects, sql`${objects.type} = 'project' and ${projects.id}::text = ${objects.refId}`)
     .where(eq(objects.ownerId, userId));
 }
 
@@ -248,6 +257,8 @@ function checkedLimits(value: unknown): { ok: true; limits: string[] } | { ok: f
   const limits = [...new Set(value as string[])];
   const unknown = limits.filter((p) => !(BUILT_IN_ROLES.admin as readonly string[]).includes(p));
   if (unknown.length) return { ok: false, error: `Unknown permissions in limits: ${unknown.join(", ")}` };
+  const missing = missingDependency(BUILT_IN_ROLES.admin.filter((p) => !limits.includes(p)));
+  if (missing) return { ok: false, error: missing };
   return { ok: true, limits };
 }
 
@@ -323,7 +334,11 @@ usersRouter.post("/", async (c) => {
   const orgRole = resolved.key;
   const roleId = resolved.id;
 
-  // Admins and Owners are added only by the Owner: an admin cannot make another admin.
+  // Owners are made only by the super admin, never from inside the organization.
+  if (orgRole === "owner" && c.get("userRole") !== "super_admin") {
+    return c.json({ error: OWNERS_ARE_SUPER_ADMINS }, 403);
+  }
+  // Admins are added only by the Owner: an admin cannot make another admin.
   if (ADMIN_ROLES.includes(orgRole) && !hasFixed(c, "manageAdmins")) {
     return c.json({ error: "Only an Owner can add admins" }, 403);
   }
@@ -637,9 +652,10 @@ usersRouter.put("/:userId", async (c) => {
   }
   const isSelf = userId === actorId;
 
-  // Admins and Owners are changed only by the Owner, except a person editing themselves.
-  if (!mayActOn(c, target, isSelf)) {
-    return c.json({ error: "Only an Owner can change an admin or Owner" }, 403);
+  // Admins are changed only by the Owner, another Owner only by the super admin;
+  // anyone may edit themselves.
+  if (!mayActOn(c, target, isSelf, actorRole)) {
+    return c.json({ error: target.orgRole === "owner" ? OWNERS_ARE_SUPER_ADMINS : "Only an Owner can change an admin" }, 403);
   }
 
   // Each kind of change needs its own people power. Your own name and email are yours.
@@ -681,7 +697,12 @@ usersRouter.put("/:userId", async (c) => {
     }
 
     if (requested.key !== target.orgRole) {
-      // Making or unmaking an admin or Owner is the Owner's alone.
+      // Making someone an Owner is the super admin's alone (unmaking one is
+      // refused above: only the super admin acts on another Owner).
+      if (requested.key === "owner" && actorRole !== "super_admin") {
+        return c.json({ error: OWNERS_ARE_SUPER_ADMINS }, 403);
+      }
+      // Making or unmaking an admin is the Owner's alone.
       if ((ADMIN_ROLES.includes(requested.key) || ADMIN_ROLES.includes(target.orgRole)) && !hasFixed(c, "manageAdmins")) {
         return c.json({ error: "Only an Owner can make or change an admin" }, 403);
       }
@@ -906,9 +927,10 @@ usersRouter.post("/:userId/password", async (c) => {
   if (userId !== c.get("userId") && !hasPermission(c, "members.reset_password")) {
     return c.json({ error: "Forbidden: requires members.reset_password" }, 403);
   }
-  // An admin's or Owner's password is reset only by the Owner, or by themselves.
-  if (!mayActOn(c, target, userId === c.get("userId"))) {
-    return c.json({ error: "Only an Owner can set an admin's or Owner's password" }, 403);
+  // An admin's password is reset only by the Owner, another Owner's only by the
+  // super admin; anyone may set their own.
+  if (!mayActOn(c, target, userId === c.get("userId"), c.get("userRole"))) {
+    return c.json({ error: target.orgRole === "owner" ? OWNERS_ARE_SUPER_ADMINS : "Only an Owner can set an admin's password" }, 403);
   }
 
   const body = await c.req.json<{ password?: unknown }>().catch(() => ({}) as { password?: unknown });
@@ -971,8 +993,8 @@ usersRouter.delete("/:userId", requirePermission("members.edit"), async (c) => {
   if (userId === c.get("userId")) {
     return c.json({ error: "Cannot remove yourself" }, 403);
   }
-  if (!mayActOn(c, target, false)) {
-    return c.json({ error: "Only an Owner can remove an admin or Owner" }, 403);
+  if (!mayActOn(c, target, false, c.get("userRole"))) {
+    return c.json({ error: target.orgRole === "owner" ? OWNERS_ARE_SUPER_ADMINS : "Only an Owner can deactivate an admin" }, 403);
   }
   if (target.orgRole === "owner" && target.isActive && (await activeOwnersExcept(db, orgId, userId)) === 0) {
     return c.json({ error: "This is the only Owner. Make someone else Owner first." }, 409);

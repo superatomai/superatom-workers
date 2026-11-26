@@ -96,7 +96,9 @@ const newApp = async (name, projectId = A) => {
 };
 
 const analystRole = await newRole("Analyst", ["platform.access", "dashboard.view"]);
-const noPlatformRole = await newRole("No Platform", ["dashboard.view"]);
+// Runtime only: no platform access, so no other permission either (a role holding
+// one without platform access is refused; see "Dependent permissions" below).
+const noPlatformRole = await newRole("No Platform", []);
 // A new Admin starts without the people powers (members.*); the Owner ticks
 // them all for admin1 and the limited Admin (limits: []), and leaves admin2 as created.
 const admin1 = await newUser("admin1", "admin", { limits: [] });
@@ -126,6 +128,20 @@ await attack("The Owner", "removes themselves", () => call("DELETE", `/orgs/${OR
 console.log("\nThe hierarchy: Owner > Admin > everyone else");
 await attack("An Admin", "makes a Member an Admin", () => call("PUT", `/orgs/${ORG}/users/${member.id}`, admin1.token, { role: "admin" }), refused);
 await attack("An Admin", "makes a Member the Owner", () => call("PUT", `/orgs/${ORG}/users/${member.id}`, admin1.token, { role: "owner" }), refused);
+
+console.log("\nOnly the super admin makes Owners");
+await attack("The Owner", "makes a Member an Owner", () => call("PUT", `/orgs/${ORG}/users/${member.id}`, owner.token, { role: "owner" }), refused);
+await attack("The Owner", "makes an Admin an Owner", () => call("PUT", `/orgs/${ORG}/users/${admin2.id}`, owner.token, { role: "owner" }), refused);
+await attack(
+  "The Owner",
+  "adds a new member straight in as Owner",
+  async () => {
+    const r = await call("POST", `/orgs/${ORG}/users`, owner.token, { email: `sim.own.${stamp}@example.com`, name: "Sim own", password: PASSWORD, role: "owner" });
+    if (r.b?.id) made.users.push(r.b.id);
+    return r;
+  },
+  refused
+);
 await attack("An Admin", "adds a new Admin", () => call("POST", `/orgs/${ORG}/users`, admin1.token, { email: `sim.x.${stamp}@example.com`, name: "X", password: PASSWORD, role: "admin" }), refused);
 await attack("An Admin", "demotes another Admin", () => call("PUT", `/orgs/${ORG}/users/${admin2.id}`, admin1.token, { role: "member" }), refused);
 await attack("An Admin", "removes another Admin", () => call("DELETE", `/orgs/${ORG}/users/${admin2.id}`, admin1.token), refused);
@@ -157,6 +173,32 @@ await attack(
   async () => (await call("GET", `/orgs/${ORG}/users/${member.id}`, owner.token)).b?.orgRole === "member",
   { note: "the extra fields were ignored: still a Member" }
 );
+
+console.log("\nDependent permissions: nothing without platform access, no Members action without See members");
+// A role the API wrongly accepts is still cleaned up at the end.
+const tryRole = async (name, permissions) => {
+  const r = await call("POST", `/orgs/${ORG}/roles`, owner.token, { name: `${name} ${stamp}`, permissions });
+  if (r.s === 201) made.roles.push(r.b.id);
+  return r;
+};
+await attack("The Owner", "creates a role with dashboards but no platform access", () => tryRole("NoSignIn", ["dashboard.view"]), refused);
+await attack("The Owner", "creates a role with analytics export but no platform access", () => tryRole("NoSignIn2", ["analytics.view", "analytics.export"]), refused);
+await attack("The Owner", "creates a role that edits members without seeing them", () => tryRole("BlindEdit", ["platform.access", "members.edit"]), refused);
+await attack("The Owner", "creates a role that sets data rules without seeing members", () => tryRole("BlindRules", ["platform.access", "members.data_rules"]), refused);
+await attack("The Owner", "takes platform access out of the analyst role, keeping dashboards", () => call("PUT", `/orgs/${ORG}/roles/${analystRole.id}`, owner.token, { permissions: ["dashboard.view"] }), refused);
+await attack(
+  "The Owner",
+  "lets an Admin edit members without seeing them (limits: members.view)",
+  () => call("PUT", `/orgs/${ORG}/users/${admin2.id}`, owner.token, { limits: ["members.view"] }),
+  refused
+);
+await attack(
+  "The Owner",
+  "takes platform access from an Admin but leaves the rest",
+  () => call("PUT", `/orgs/${ORG}/users/${admin2.id}`, owner.token, { limits: ["platform.access"] }),
+  refused
+);
+await attack("A role without platform access", "reads the access log", () => call("GET", `/orgs/${ORG}/access-log`, noPlatform.token), refused);
 
 console.log("\nSharing never reaches further than the sharer's own role");
 await attack("A Viewer", "edits the dashboard", () => call("PUT", `/apps/${X}`, analyst.token, { description: "changed" }), refused);
@@ -261,6 +303,22 @@ await attack(
     return r;
   },
   (r) => r.s === 201,
+  { allowed: true }
+);
+await attack(
+  "The Owner",
+  "creates a role that sees and edits members, with platform access",
+  () => tryRole("PeopleLead", ["platform.access", "members.view", "members.edit"]),
+  (r) => r.s === 201,
+  { allowed: true }
+);
+await attack(
+  "The Owner",
+  "lets an Admin see members but change nothing (every Members action limited but View and the log)",
+  () => call("PUT", `/orgs/${ORG}/users/${admin2.id}`, owner.token, {
+    limits: ["members.create", "members.edit", "members.assign", "members.data_rules", "members.reset_password"],
+  }),
+  (r) => r.s === 200,
   { allowed: true }
 );
 await attack("A platform user made Manager of a dashboard", "shares it onward as Manager", async () => {
