@@ -84,6 +84,7 @@ export const PERMISSION_CATALOGUE = [
     permissions: [
       { key: "program.view", label: "View dashboard programs" },
       { key: "program.publish", label: "Publish, unpublish and pin dashboard programs" },
+      { key: "program.access", label: "Decide which program tools and screens the assistant and each member may use" },
       { key: "update.view", label: "View the project's engine updates" },
       { key: "update.apply", label: "Update the project's engine servers" },
     ],
@@ -138,7 +139,7 @@ const ADMIN_PERMISSIONS: readonly Permission[] = [
   "app.view", "app.create", "app.edit", "app.delete",
   "model.view", "model.edit",
   "design.view", "design.edit",
-  "program.view", "program.publish",
+  "program.view", "program.publish", "program.access",
   "update.view", "update.apply",
   "feedback.view", "feedback.triage",
   "analytics.view", "analytics.export",
