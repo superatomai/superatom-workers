@@ -91,10 +91,12 @@ export type Env = {
   EMAIL_UNSUBSCRIBE_SECRET?: string;
   /** Private R2 bucket for email attachments, reached through the S3 API like source files. */
   EMAIL_ATTACHMENTS_BUCKET_NAME?: string;
-  // Per-project LLM proxy keys via the llm-proxy worker's admin API; "dummy" skips it (dev).
+  // Per-project LLM proxy keys via the llm-proxy worker's admin API; "dummy" skips it (tests only:
+  // a dummy key fails every coding-agent answer). The prefix keeps dev client names apart from prod's.
   LLM_PROXY?: Fetcher;
   LLM_PROXY_ADMIN_SECRET?: string;
   INSTALL_LLM_PROXY_MODE?: string;
+  INSTALL_LLM_CLIENT_PREFIX?: string;
   /** Optional: sa-websocket's Broadcaster DO, notified on composition graph publish/rollback. */
   BROADCASTER?: DurableObjectNamespace;
 };

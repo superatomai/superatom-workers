@@ -178,6 +178,11 @@ async function proxyAdmin(env: Env, path: string, body: unknown): Promise<Respon
   });
 }
 
+/** The install's proxy client. Dev and prod share one llm-proxy, so dev names carry a prefix. */
+export function proxyClientId(env: Pick<Env, "INSTALL_LLM_CLIENT_PREFIX">, installName: string): string {
+  return `${env.INSTALL_LLM_CLIENT_PREFIX ?? ""}${installName}`;
+}
+
 /** Disables a proxy client so its key stops working. True when disabled or already gone. */
 export async function disableProxyClient(env: Env, clientId: string): Promise<boolean> {
   if (env.INSTALL_LLM_PROXY_MODE === "dummy") return true;

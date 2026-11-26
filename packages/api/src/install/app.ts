@@ -11,6 +11,7 @@ import {
   fetchTarball,
   installScript,
   issueProxyKey,
+  proxyClientId,
   approvedVersion,
   latestCommit,
   sha256Hex,
@@ -256,18 +257,19 @@ install.post("/api/redeem", async (c) => {
 
   // An existing LLM proxy client may be reused only if this project's own install tokens created it
   // (e.g. an earlier redeem whose install then failed); anyone else's client is never touched.
+  const clientId = proxyClientId(c.env, row.installName);
   const [ownClient] = await db
     .select({ id: installTokens.id })
     .from(installTokens)
-    .where(and(eq(installTokens.projectId, row.projectId), eq(installTokens.llmClientId, row.installName)))
+    .where(and(eq(installTokens.projectId, row.projectId), eq(installTokens.llmClientId, clientId)))
     .limit(1);
 
   // Before any mutation: a project with nothing published must not consume the token.
   const release = await currentRelease(db, row.projectId, row.pinnedVersion);
   const sha = await latestCommit(c.env);
-  const { proxyKey, created } = await issueProxyKey(c.env, row.installName, row.llmBudgetCents, !!ownClient);
+  const { proxyKey, created } = await issueProxyKey(c.env, clientId, row.llmBudgetCents, !!ownClient);
   if (created) {
-    await db.update(installTokens).set({ llmClientId: row.installName }).where(eq(installTokens.id, row.id));
+    await db.update(installTokens).set({ llmClientId: clientId }).where(eq(installTokens.id, row.id));
   }
 
   const apiKey = generateApiKey();
